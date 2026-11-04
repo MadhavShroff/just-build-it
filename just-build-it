@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Entry point: `./just-build-it` or `python3 -m jbi`."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from jbi.cli import main  # noqa: E402
+
+raise SystemExit(main())

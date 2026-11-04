@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>just-build-it</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/tokens.css">
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/components.css">
+  <link rel="stylesheet" href="css/phases.css">
+  <link rel="stylesheet" href="css/board.css">
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#stage">Skip to content</a>
+
+  <header class="app-header" id="header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div class="brand-text">
+        <span class="brand-product">just-build-it</span>
+        <span class="brand-run" id="run-name">Loading</span>
+      </div>
+    </div>
+    <nav class="stepper" id="stepper" aria-label="Run phases"></nav>
+    <div class="header-actions" id="header-actions"></div>
+  </header>
+
+  <main class="stage" id="stage" tabindex="-1">
+    <div class="splash" id="splash" role="status">
+      <span class="splash-mark" aria-hidden="true"></span>
+      <p class="splash-text" id="splash-text">Connecting to the run</p>
+    </div>
+    <section class="phase" data-phase="intake" id="phase-intake" aria-label="Plan the project" hidden></section>
+    <section class="phase" data-phase="stack" id="phase-stack" aria-label="Choose the tech stack" hidden></section>
+    <section class="phase" data-phase="bootstrap" id="phase-bootstrap" aria-label="Bootstrap the repository" hidden></section>
+    <section class="phase" data-phase="configure" id="phase-configure" aria-label="Configure the build" hidden></section>
+    <section class="phase phase-board" data-phase="execute complete" id="phase-board" aria-label="Build board" hidden></section>
+  </main>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="accounts-drawer" role="dialog" aria-modal="true" aria-labelledby="accounts-title" hidden></aside>
+  <aside class="drawer drawer-wide" id="task-drawer" role="dialog" aria-modal="true" aria-labelledby="task-title" hidden></aside>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>
