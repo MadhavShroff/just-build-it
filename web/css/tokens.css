@@ -1,0 +1,141 @@
+/* Design tokens. Light is the default; dark applies by system preference or by the toggle. */
+
+:root {
+  --font-sans: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", "Ubuntu Sans", "Cantarell", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Ubuntu Sans Mono", "DejaVu Sans Mono", monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12.5px;
+  --text-md: 13.5px;
+  --text-lg: 15px;
+  --text-xl: 19px;
+  --text-2xl: 26px;
+  --text-3xl: 34px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-full: 999px;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur-press: 120ms;
+  --dur-fast: 160ms;
+  --dur-base: 220ms;
+  --dur-slow: 320ms;
+
+  --header-h: 60px;
+
+  /* light palette */
+  --bg: #f7f7f8;
+  --bg-grad-1: rgba(124, 108, 255, 0.07);
+  --bg-grad-2: rgba(56, 189, 248, 0.05);
+  --surface: #ffffff;
+  --surface-2: #fbfbfc;
+  --surface-sunken: #f2f2f4;
+  --surface-hover: #f4f4f6;
+  --surface-glass: rgba(255, 255, 255, 0.78);
+  --text: #18181b;
+  --text-2: #52525b;
+  --text-3: #8a8a93;
+  --text-inverse: #ffffff;
+  --line: rgba(9, 9, 11, 0.08);
+  --line-strong: rgba(9, 9, 11, 0.14);
+  --ring: rgba(99, 91, 255, 0.45);
+
+  --accent: #635bff;
+  --accent-2: #4f7cff;
+  --accent-soft: rgba(99, 91, 255, 0.1);
+  --accent-text: #5148e5;
+  --accent-grad: linear-gradient(135deg, #7c6cff 0%, #4f7cff 100%);
+
+  --green: #16a34a;
+  --green-soft: rgba(22, 163, 74, 0.1);
+  --blue: #2563eb;
+  --blue-soft: rgba(37, 99, 235, 0.1);
+  --amber: #c27803;
+  --amber-soft: rgba(217, 119, 6, 0.12);
+  --red: #dc2626;
+  --red-soft: rgba(220, 38, 38, 0.09);
+  --teal: #0d9488;
+  --teal-soft: rgba(13, 148, 136, 0.1);
+  --violet: #7c3aed;
+  --violet-soft: rgba(124, 58, 237, 0.1);
+  --gray: #71717a;
+  --gray-soft: rgba(113, 113, 122, 0.1);
+
+  --shadow-xs: 0 1px 2px rgba(9, 9, 11, 0.05);
+  --shadow-card: 0 0 0 1px rgba(9, 9, 11, 0.06), 0 1px 2px rgba(9, 9, 11, 0.04), 0 2px 6px rgba(9, 9, 11, 0.03);
+  --shadow-raised: 0 0 0 1px rgba(9, 9, 11, 0.06), 0 4px 10px rgba(9, 9, 11, 0.05), 0 14px 32px rgba(9, 9, 11, 0.07);
+  --shadow-pop: 0 0 0 1px rgba(9, 9, 11, 0.07), 0 12px 28px rgba(9, 9, 11, 0.12), 0 32px 64px rgba(9, 9, 11, 0.12);
+  --shadow-inset: inset 0 0 0 1px rgba(9, 9, 11, 0.08);
+  --shadow-primary: 0 1px 0 rgba(255, 255, 255, 0.25) inset, 0 0 0 1px rgba(79, 70, 229, 0.6), 0 4px 14px rgba(99, 91, 255, 0.3);
+
+  --grid-dot: rgba(9, 9, 11, 0.07);
+  --edge: rgba(9, 9, 11, 0.22);
+  --scrim: rgba(24, 24, 27, 0.22);
+  color-scheme: light;
+}
+
+/* main.js resolves the theme (system preference or the saved toggle) into data-theme. */
+:root[data-theme="dark"] {
+  --bg: #09090b;
+  --bg-grad-1: rgba(124, 108, 255, 0.11);
+  --bg-grad-2: rgba(56, 189, 248, 0.05);
+  --surface: #121215;
+  --surface-2: #151519;
+  --surface-sunken: #0d0d10;
+  --surface-hover: #1b1b20;
+  --surface-glass: rgba(14, 14, 17, 0.74);
+  --text: #f4f4f5;
+  --text-2: #a8a8b3;
+  --text-3: #6f6f7a;
+  --text-inverse: #0b0b0d;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.13);
+  --ring: rgba(139, 128, 255, 0.6);
+
+  --accent: #8b80ff;
+  --accent-2: #6b8cff;
+  --accent-soft: rgba(139, 128, 255, 0.14);
+  --accent-text: #a79fff;
+
+  --green: #4ade80;
+  --green-soft: rgba(74, 222, 128, 0.12);
+  --blue: #60a5fa;
+  --blue-soft: rgba(96, 165, 250, 0.13);
+  --amber: #fbbf24;
+  --amber-soft: rgba(251, 191, 36, 0.12);
+  --red: #f87171;
+  --red-soft: rgba(248, 113, 113, 0.12);
+  --teal: #2dd4bf;
+  --teal-soft: rgba(45, 212, 191, 0.12);
+  --violet: #a78bfa;
+  --violet-soft: rgba(167, 139, 250, 0.13);
+  --gray: #8b8b96;
+  --gray-soft: rgba(139, 139, 150, 0.12);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-raised: 0 0 0 1px rgba(255, 255, 255, 0.07), 0 6px 16px rgba(0, 0, 0, 0.35), 0 18px 40px rgba(0, 0, 0, 0.3);
+  --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.09), 0 16px 36px rgba(0, 0, 0, 0.5), 0 40px 80px rgba(0, 0, 0, 0.45);
+  --shadow-inset: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  --shadow-primary: 0 1px 0 rgba(255, 255, 255, 0.2) inset, 0 0 0 1px rgba(139, 128, 255, 0.55), 0 6px 20px rgba(99, 91, 255, 0.35);
+
+  --grid-dot: rgba(255, 255, 255, 0.06);
+  --edge: rgba(255, 255, 255, 0.22);
+  --scrim: rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}

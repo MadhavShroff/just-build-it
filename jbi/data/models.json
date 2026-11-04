@@ -1,0 +1,41 @@
+{
+  "_comment": "Model tiers per provider. Edit this file to change the catalog. Model ids verified 2026-11-04 with each provider CLI.",
+  "tiers": {
+    "XL": "Largest model, strongest reasoning",
+    "L": "Large model, strong reasoning",
+    "S": "Small model, fast and cheap",
+    "XS": "Very small model, cheapest"
+  },
+  "providers": {
+    "claude": {
+      "label": "Claude",
+      "cli": "claude",
+      "auth": "claude auth status",
+      "models": {"XL": "claude-opus-5-5", "L": "claude-opus-5-5", "S": "claude-sonnet-5-5", "XS": "claude-haiku-5-5"}
+    },
+    "codex": {
+      "label": "Codex (OpenAI)",
+      "cli": "codex",
+      "auth": "codex login status",
+      "models": {"XL": "gpt-6.1-sol", "L": "gpt-6.1-terra", "S": "gpt-5.6-luna", "XS": "gpt-5.6-luna"}
+    },
+    "agy": {
+      "label": "Google Antigravity",
+      "cli": "agy",
+      "auth": "agy models",
+      "models": {"XL": "gemini-4-argon-high", "L": "gemini-4-argon-medium", "S": "gemini-3.8-flash-medium", "XS": "gemini-3.8-flash-low"}
+    },
+    "openai-compatible": {
+      "label": "Local or OpenAI-compatible endpoint",
+      "cli": null,
+      "auth": "GET <base_url>/models",
+      "models": {"XL": "local", "L": "local", "S": "local", "XS": "local"}
+    },
+    "simulator": {
+      "label": "Offline simulator",
+      "cli": null,
+      "auth": "always available",
+      "models": {"XL": "sim-xl", "L": "sim-l", "S": "sim-s", "XS": "sim-xs"}
+    }
+  }
+}
