@@ -25,17 +25,33 @@ STAGE_ETA_SECONDS: dict[str, int] = {
     "merge": 60,
 }
 OWNS_FILE_ETA_SECONDS = 15
+EFFORT_ETA_SECONDS: dict[str, int] = {
+    "XS": 180,
+    "S": 300,
+    "M": 600,
+    "L": 900,
+    "XL": 1200,
+}
+OPTIONAL_TASK_META = (
+    "node", "batch", "owner", "path", "spec", "deliverable",
+    "effort", "eta_s", "estimated_seconds", "consumers", "prTag", "prTitle", "number",
+    "upstream_deps",
+)
 
 
 def normalize(task: dict) -> dict:
     """Return a task with every field the state document expects."""
-    return {
+    out = {
         "id": task["id"], "title": task["title"].strip(), "goal": task["goal"].strip(),
         "deps": list(task.get("deps", [])), "acceptance": task["acceptance"].strip(),
         "owns": list(task.get("owns", [])), "components": list(task.get("components", [])),
         "wave": 0, "status": "blocked", "stage": None, "attempts": 0,
         "override": {}, "branch": f"jbi/{task['id']}", "commit": None, "receipt": None,
     }
+    for key in OPTIONAL_TASK_META:
+        if key in task and task[key] is not None:
+            out[key] = task[key]
+    return out
 
 
 def validate(tasks: list[dict]) -> None:
@@ -167,8 +183,11 @@ def estimate_task_seconds(task: dict[str, Any], config: dict[str, Any] | None = 
     owns_bonus = min(120, len(task.get("owns") or ()) * OWNS_FILE_ETA_SECONDS)
 
     explicit = task.get("eta_s") or task.get("estimated_seconds")
+    effort = str(task.get("effort") or "").upper()
     if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit > 0:
         total = int(round(float(explicit)))
+    elif effort in EFFORT_ETA_SECONDS:
+        total = EFFORT_ETA_SECONDS[effort]
     else:
         total = sum(_stage_wall_seconds(s) for s in stages) + owns_bonus
 

@@ -945,5 +945,131 @@ class InstallAndResumeTest(unittest.TestCase):
             self.assertFalse((fake_home / ".just-build-it").exists())
 
 
+class DagSubtasksAndToolTest(unittest.TestCase):
+    def test_expand_d03_six_batches_into_six_tasks_in_right_waves(self):
+        dag_doc = {
+            "project": "tangram-v1",
+            "repo": ".",
+            "mode": "existing",
+            "nodes": [
+                {"id": "D01", "title": "Native table", "deps": [], "acceptance": "true"},
+                {"id": "P01", "title": "Project scope", "deps": [], "acceptance": "true"},
+                {"id": "D02", "title": "Native storage", "deps": ["D01", "P01"], "acceptance": "true"},
+                {"id": "E01", "title": "Outbox", "deps": ["D01", "P01"], "acceptance": "true"},
+                {
+                    "id": "D03",
+                    "title": "Shared Artifact core and Library identity",
+                    "deps": ["D01", "P01", "E01", "D02"],
+                    "owner": "work13",
+                    "acceptance": "node scripts/verify-launch-artifact-core.mjs --require-cases 16",
+                    "subtasks": [
+                        {"id": "D03-B1", "batch": "B1", "title": "D01 imports and pure record validation", "deps": [], "owns": ["src/a1.ts"]},
+                        {"id": "D03-B2", "batch": "B2", "title": "Atomic source publication and Library pointer", "deps": ["D03-B1"], "owns": ["src/a2.ts"]},
+                        {"id": "D03-B3", "batch": "B3", "title": "Render job fencing and proxy outputs", "deps": ["D03-B2"], "owns": ["src/a3.ts"]},
+                        {"id": "D03-B4", "batch": "B4", "title": "Lease takeover and anchors", "deps": ["D03-B3"], "owns": ["src/a4.ts"]},
+                        {"id": "D03-B5", "batch": "B5", "title": "Privacy integration and orphan sweep", "deps": ["D03-B4"], "owns": ["src/a5.ts"]},
+                        {"id": "D03-B6", "batch": "B6", "title": "Two review rounds and verification evidence", "deps": ["D03-B5"], "owns": ["src/a6.ts"]},
+                    ],
+                },
+                {"id": "L01", "title": "Library upload", "deps": ["D03"], "acceptance": "true"},
+            ],
+        }
+        plan = dag_loader.load(json.dumps(dag_doc))
+        self.assertEqual(
+            plan["waves"],
+            [
+                ["D01", "P01"],
+                ["D02", "E01"],
+                ["D03-B1"],
+                ["D03-B2"],
+                ["D03-B3"],
+                ["D03-B4"],
+                ["D03-B5"],
+                ["D03-B6"],
+                ["L01"],
+            ],
+        )
+        self.assertEqual(plan["tasks"]["D03-B1"]["deps"], ["D01", "P01", "E01", "D02"])
+        self.assertEqual(plan["tasks"]["D03-B2"]["deps"], ["D01", "P01", "E01", "D02", "D03-B1"])
+        self.assertEqual(plan["tasks"]["D03-B6"]["node"], "D03")
+        self.assertEqual(plan["tasks"]["D03-B6"]["batch"], "B6")
+        self.assertIn("D03-B6", plan["tasks"]["L01"]["deps"])
+
+    def test_dag_tool_subcommands_and_refusal_of_invalid_edits(self):
+        from jbi import dag_tool
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "work.json"
+            self.assertEqual(
+                dag_tool.main(["new", str(json_path), "--project", "demo", "--id", "A01", "--title", "Auth base"]),
+                0,
+            )
+            self.assertEqual(
+                dag_tool.main([
+                    "add-task", str(json_path),
+                    "--id", "D03", "--title", "Artifact core",
+                    "--deps", "A01", "--owns", "src/artifacts/core.ts",
+                ]),
+                0,
+            )
+            self.assertEqual(
+                dag_tool.main(["add-Task" if False else "add-task", str(json_path), "--id", "I01", "--title", "Connectors"]),
+                0,
+            )
+            self.assertEqual(
+                dag_tool.main(["add-dep", str(json_path), "--task", "I01", "--dep", "A01"]),
+                0,
+            )
+
+            # Refuse a cycle without mutating the file on disk.
+            before_cycle = json_path.read_text()
+            self.assertEqual(
+                dag_tool.main(["add-dep", str(json_path), "--task", "A01", "--dep", "D03"]),
+                1,
+            )
+            self.assertEqual(json_path.read_text(), before_cycle)
+
+            # Refuse an invalid owned path without mutating the file on disk.
+            self.assertEqual(
+                dag_tool.main([
+                    "add-task", str(json_path),
+                    "--id", "BAD", "--title", "Bad owns", "--owns", "../escape.ts",
+                ]),
+                1,
+            )
+            self.assertEqual(json_path.read_text(), before_cycle)
+
+            # Set explicit wave and validate.
+            self.assertEqual(
+                dag_tool.main(["set-wave", str(json_path), "--wave", "2", "--tasks", "D03,I01"]),
+                0,
+            )
+            self.assertEqual(dag_tool.main(["validate", str(json_path)]), 0)
+            self.assertEqual(dag_tool.main(["show", str(json_path)]), 0)
+
+            # Remove I01 and verify D03 remains valid.
+            self.assertEqual(dag_tool.main(["remove-task", str(json_path), "--id", "I01"]), 0)
+
+            # Add subtasks to D03 and list them.
+            self.assertEqual(
+                dag_tool.main([
+                    "add-subtask", str(json_path),
+                    "--node", "D03", "--id", "D03-B1", "--batch", "B1",
+                    "--title", "Batch 1", "--owns", "src/b1.ts",
+                ]),
+                0,
+            )
+            self.assertEqual(
+                dag_tool.main([
+                    "add-subtask", str(json_path),
+                    "--node", "D03", "--id", "D03-B2", "--batch", "B2",
+                    "--title", "Batch 2", "--deps", "D03-B1", "--owns", "src/b2.ts",
+                ]),
+                0,
+            )
+            self.assertEqual(dag_tool.main(["list-subtasks", str(json_path), "--node", "D03", "--json"]), 0)
+            expanded_plan = dag_loader.load(json_path)
+            self.assertEqual(expanded_plan["waves"], [["A01"], ["D03-B1"], ["D03-B2"]])
+
+
 if __name__ == "__main__":
     unittest.main()

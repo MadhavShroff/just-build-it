@@ -2,8 +2,8 @@
 
 Imports the canonical `wave-compiler` module as a library instead of duplicating its
 restricted-YAML parser, schema validator, or Kahn cycle detector, and also normalizes
-`.planning/.../dag.json` files through the same validator before emitting a `jbi.waves`
-plan dictionary.
+`.planning/.../dag.json` files (including per-node `subtasks` / `batches` expansion)
+through the same validator before emitting a `jbi.waves` plan dictionary.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def _normalize_json_node(node: Any) -> dict[str, Any]:
     if not isinstance(node, dict):
         raise Invalid("each DAG node must be a JSON object")
     out = dict(node)
-    if "goal" not in out:
+    if "goal" not in out or not isinstance(out.get("goal"), str) or not out["goal"].strip():
         title = out.get("title") if isinstance(out.get("title"), str) else ""
         plan_path = out.get("path") if isinstance(out.get("path"), str) else ""
         spec_path = out.get("spec") if isinstance(out.get("spec"), str) else ""
@@ -100,15 +100,116 @@ def _normalize_json_node(node: Any) -> dict[str, Any]:
             out["goal"] = f"Implement {title} ({plan_path})."
         elif title:
             out["goal"] = title
-    if "acceptance" not in out:
+    if "acceptance" not in out or not isinstance(out.get("acceptance"), str) or not out["acceptance"].strip():
         out["acceptance"] = "true"
+    out.setdefault("deps", [])
     out.setdefault("owns", [])
     out.setdefault("components", [])
     return out
 
 
+def expand_node_subtasks(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """Expand any node with `subtasks` or `batches` into child tasks that inherit parent `deps`."""
+    raw_sub_counts: dict[str, int] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise Invalid("each DAG node must be a JSON object")
+        subs = node.get("subtasks") if "subtasks" in node else node.get("batches")
+        if subs is None:
+            continue
+        if not isinstance(subs, list) or not subs:
+            raise Invalid(f"node '{node.get('id', '?')}' subtasks/batches must be a non-empty list")
+        for sub in subs:
+            if not isinstance(sub, dict):
+                raise Invalid(f"node '{node.get('id', '?')}' subtask must be an object")
+            sid = str(sub.get("id") or "").strip()
+            if sid:
+                raw_sub_counts[sid] = raw_sub_counts.get(sid, 0) + 1
+
+    expanded_by_parent: dict[str, list[str]] = {}
+    prepared: list[tuple[dict[str, Any], list[dict[str, Any]] | None]] = []
+
+    for node in nodes:
+        norm_parent = _normalize_json_node(node)
+        pid = str(norm_parent.get("id") or "")
+        subs = node.get("subtasks") if "subtasks" in node else node.get("batches")
+        if not subs:
+            prepared.append((norm_parent, None))
+            continue
+
+        alias_map: dict[str, str] = {}
+        child_specs: list[tuple[dict[str, Any], str, str]] = []
+        for sub in subs:
+            raw_id = str(sub.get("id") or "").strip()
+            if not raw_id:
+                raise Invalid(f"node '{pid}' has a subtask missing 'id'")
+            batch_code = str(sub.get("batch") or raw_id).strip()
+            if raw_sub_counts.get(raw_id, 0) > 1 and not raw_id.startswith((f"{pid}-", f"{pid}_")):
+                full_id = f"{pid}-{raw_id}"
+            else:
+                full_id = raw_id
+            alias_map[raw_id] = full_id
+            alias_map[batch_code] = full_id
+            alias_map[f"{pid}-{batch_code}"] = full_id
+            child_specs.append((sub, full_id, batch_code))
+
+        parent_deps = [str(d) for d in (norm_parent.get("deps") or ())]
+        children: list[dict[str, Any]] = []
+        child_ids: list[str] = []
+
+        for sub, full_id, batch_code in child_specs:
+            raw_deps = sub.get("deps")
+            if raw_deps is None:
+                raise Invalid(f"subtask '{full_id}' is missing field 'deps'")
+            if not isinstance(raw_deps, list) or not all(isinstance(d, str) for d in raw_deps):
+                raise Invalid(f"subtask '{full_id}' field 'deps' must be a list of strings")
+            resolved_sub_deps = [alias_map.get(d, d) for d in raw_deps]
+            combined_deps: list[str] = list(parent_deps)
+            for dep in resolved_sub_deps:
+                if dep not in combined_deps:
+                    combined_deps.append(dep)
+
+            child_raw = {
+                **{k: v for k, v in norm_parent.items() if k not in ("subtasks", "batches", "wave")},
+                **sub,
+                "id": full_id,
+                "node": sub.get("node") or pid,
+                "batch": batch_code,
+                "deps": combined_deps,
+                "owns": list(sub.get("owns") if "owns" in sub else (norm_parent.get("owns") or ())),
+                "acceptance": sub.get("acceptance") or norm_parent.get("acceptance") or "true",
+            }
+            if "goal" not in sub or not str(sub.get("goal") or "").strip():
+                child_raw["goal"] = str(sub.get("title") or norm_parent.get("goal") or full_id)
+            children.append(_normalize_json_node(child_raw))
+            child_ids.append(full_id)
+
+        expanded_by_parent[pid] = child_ids
+        prepared.append((norm_parent, children))
+
+    if not expanded_by_parent:
+        return [parent for parent, _ in prepared], False
+
+    out_tasks: list[dict[str, Any]] = []
+    for parent, children in prepared:
+        items_to_emit = children if children is not None else [parent]
+        for item in items_to_emit:
+            rewritten_deps: list[str] = []
+            for dep in item.get("deps") or ():
+                if dep in expanded_by_parent:
+                    for expanded_id in expanded_by_parent[dep]:
+                        if expanded_id not in rewritten_deps:
+                            rewritten_deps.append(expanded_id)
+                elif dep not in rewritten_deps:
+                    rewritten_deps.append(dep)
+            item["deps"] = rewritten_deps
+            out_tasks.append(item)
+
+    return out_tasks, True
+
+
 def parse_dag_json(text: str) -> dict[str, Any]:
-    """Parse a `.planning/.../dag.json` document and validate it with `wave_compiler`."""
+    """Parse a `.planning/.../dag.json` document, expand subtasks/batches, and validate it."""
     try:
         raw = json.loads(text)
     except ValueError as error:
@@ -123,9 +224,26 @@ def parse_dag_json(text: str) -> dict[str, Any]:
         items = raw_items
     else:
         raise Invalid("DAG JSON must contain a 'nodes' or 'tasks' list")
-    tasks = [_normalize_json_node(item) for item in items]
+    tasks, expanded = expand_node_subtasks(items)
+    raw_completed = raw.get("completed_deps") if "completed_deps" in raw else raw.get("satisfied_deps")
+    if raw_completed is not None:
+        if not isinstance(raw_completed, list) or not all(isinstance(d, str) for d in raw_completed):
+            raise Invalid("field 'completed_deps' must be a list of strings")
+        completed_set = set(raw_completed)
+        active_ids = {str(t.get("id") or "") for t in tasks if isinstance(t, dict)}
+        for task in tasks:
+            deps = task.get("deps")
+            if isinstance(deps, list):
+                upstream = [d for d in deps if d in completed_set and d not in active_ids]
+                if upstream:
+                    existing_upstream = list(task.get("upstream_deps") or ())
+                    for dep in upstream:
+                        if dep not in existing_upstream:
+                            existing_upstream.append(dep)
+                    task["upstream_deps"] = existing_upstream
+                    task["deps"] = [d for d in deps if d not in completed_set or d in active_ids]
     explicit_waves = raw.get("wave_groups") if "wave_groups" in raw else raw.get("waves")
-    waves_mode = "explicit" if isinstance(explicit_waves, list) else "auto"
+    waves_mode = "explicit" if (isinstance(explicit_waves, list) and not expanded) else "auto"
     doc: dict[str, Any] = {
         "project": str(raw.get("project") or raw.get("name") or "dag"),
         "repo": str(raw.get("repo") or raw.get("target") or "."),
