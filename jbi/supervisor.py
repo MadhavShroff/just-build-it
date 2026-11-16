@@ -38,6 +38,7 @@ class Tmux:
         self.parent_pid = parent_pid or os.getpid()
         self.available = shutil.which("tmux") is not None
         self._started = False
+        self._start_lock = threading.Lock()
 
     def _run(self, *args: str) -> subprocess.CompletedProcess:
         env = {**agents.runtime_env(), "PYTHONPATH": str(agents.PACKAGE_ROOT)}
@@ -45,17 +46,23 @@ class Tmux:
                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
     def window(self, name: str, argv: list[str]) -> str | None:
-        """Open a detached window running `argv`. Returns the window name, or None without tmux."""
+        """Open a detached window running `argv`. Returns the window name, or None without tmux.
+
+        The four reviews of one task call this at the same time (founder rule
+        2026-11-16), so the first-window setup is guarded: two threads that both
+        saw `_started` false would both run `new-session`, and the second fails.
+        """
         if not self.available:
             return None
-        if not self._started:
-            # The control window keeps the server open while the CLI lives, then ends the
-            # server, so a CLI that dies without cleanup still leaves no tmux server behind.
-            watch = (f"while kill -0 {self.parent_pid} 2>/dev/null; do sleep 1; done; "
-                     f"tmux -L {self.socket} kill-server; rm -f {self._socket_path()}")
-            self._run("new-session", "-d", "-s", "jbi", "-n", "control", "-x", "200", "-y", "50",
-                      "--", "sh", "-c", watch)
-            self._started = True
+        with self._start_lock:
+            if not self._started:
+                # The control window keeps the server open while the CLI lives, then ends the
+                # server, so a CLI that dies without cleanup still leaves no tmux server behind.
+                watch = (f"while kill -0 {self.parent_pid} 2>/dev/null; do sleep 1; done; "
+                         f"tmux -L {self.socket} kill-server; rm -f {self._socket_path()}")
+                self._run("new-session", "-d", "-s", "jbi", "-n", "control", "-x", "200", "-y", "50",
+                          "--", "sh", "-c", watch)
+                self._started = True
         result = self._run("new-window", "-d", "-t", "jbi:", "-n", name, "--", *argv)
         return name if result.returncode == 0 else None
 
@@ -315,15 +322,20 @@ class Supervisor:
             ok, detail, model = self._run_stage(task, stage, level, worktree, findings)
             if self._stopping in ("quit", "kill", "standdown"):
                 return
-            self.store.commit("task.stage", Changes()
-                              .set("plan", "tasks", tid, "stages", {**(task.get("stages") or {}),
-                                   stage.name: {"status": "passed" if ok else "failed",
-                                                "detail": detail[:2000], "model": model}}), {"task": tid})
+            if stage.name != rigor.REVIEW_CASCADE_STAGE:
+                self.store.commit("task.stage", Changes()
+                                  .set("plan", "tasks", tid, "stages", {**(task.get("stages") or {}),
+                                       stage.name: {"status": "passed" if ok else "failed",
+                                                    "detail": detail[:2000], "model": model}}), {"task": tid})
             if ok:
                 if stage.role == "merge":
                     self._progress()
                     return
+                # The four reviews run together inside the cascade stage, so the
+                # loop must skip past the three DeepSeek stages it already ran.
                 stage_name, findings = stage.name, []
+                if stage.name == rigor.REVIEW_CASCADE_STAGE:
+                    stage_name = rigor.REVIEW_DEEPSEEK_STAGES[-1]
                 if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
                     self._task_update(tid, resume_after=stage_name)
                     return
@@ -358,7 +370,57 @@ class Supervisor:
             ok = self._merge(tid, level, worktree)
             notes = self._merge_notes.pop(tid, None)
             return ok, "merged" if ok else ("\n".join(notes) if notes else "merge failed"), None
+        if stage.name == rigor.REVIEW_CASCADE_STAGE:
+            return self._review_fanout(task, worktree, findings)
         return self._agent_stage(task, stage, worktree, findings)
+
+    def _review_fanout(self, task: dict, worktree: Path,
+                       findings: list[str]) -> tuple[bool, str, str | None]:
+        """FOUNDER RULE 2026-11-16: run the four reviews at the same time.
+
+        One review on the model the cascade service names as active, and three
+        independent DeepSeek agents. The three are not coordinated with each
+        other or with the first. Every review must pass; the findings of every
+        failing review are returned together, so the implementer sees all four
+        reads at once.
+        """
+        stages = rigor.review_stages()
+        results: dict[str, tuple[bool, str, str | None]] = {}
+        lock = threading.Lock()
+
+        def one(stage: rigor.Stage) -> None:
+            try:
+                got = self._agent_stage(task, stage, worktree, findings)
+            except Exception as error:          # one review failing never hides the others
+                got = (False, f"{type(error).__name__}: {error}", None)
+            with lock:
+                results[stage.name] = got
+
+        threads = [threading.Thread(target=one, args=(s,), name=f"jbi-{task['id']}-{s.name}",
+                                    daemon=True) for s in stages]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wt.discard_changes(worktree)
+        ordered = [results.get(s.name, (False, "review did not report", None)) for s in stages]
+        if self._stopping not in ("quit", "kill", "standdown"):
+            tid = task["id"]
+            recorded = dict(self.store.read(f"/plan/tasks/{tid}/stages") or {})
+            for s, (s_ok, s_detail, s_model) in zip(stages, ordered):
+                recorded[s.name] = {
+                    "status": "passed" if s_ok else "failed",
+                    "detail": s_detail[:2000],
+                    "model": s_model,
+                }
+            self.store.commit("task.stage", Changes().set("plan", "tasks", tid, "stages", recorded),
+                              {"task": tid})
+        passed = all(ok for ok, _detail, _model in ordered)
+        detail = "\n".join(
+            "%s: %s" % (s.name, d) for s, (ok, d, _m) in zip(stages, ordered) if not ok
+        ) or "all four reviews passed"
+        models = ",".join(sorted({m for _ok, _d, m in ordered if m}))
+        return passed, detail, models or None
 
     def _agent_stage(self, task: dict, stage: rigor.Stage, worktree: Path,
                      findings: list[str]) -> tuple[bool, str, str | None]:
@@ -383,7 +445,7 @@ class Supervisor:
                     return False, f"modified unowned path {', '.join(unowned)}", choice.model
             sha = wt.commit_all(worktree, f"{tid}: implement attempt {attempt + 1}")
             self._task_update(tid, commit=sha or wt.head(worktree, "HEAD"), receipt=str(receipt))
-        else:
+        elif stage.role != "review":
             wt.discard_changes(worktree)        # verifiers and reviewers never edit code
         if result is None:
             return False, f"no valid receipt (exit {session.status.get('exit_code')})", choice.model

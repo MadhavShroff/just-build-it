@@ -24,19 +24,6 @@ def _stages(*spec: tuple[str, str, str]) -> tuple[Stage, ...]:
     return tuple(Stage(*s) for s in spec)
 
 
-PIPELINES: dict[str, tuple[Stage, ...]] = {
-    "vibe": _stages(("implement", "implement", "Implement"), ("merge", "merge", "Merge")),
-    "medium": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
-                      ("review", "review", "Review"), ("merge", "merge", "Train merge")),
-    "high": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
-                    ("verify", "verify", "Verify"), ("review", "review", "Review"),
-                    ("security", "security", "Security scan"), ("merge", "merge", "Train merge")),
-    "xhigh": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
-                     ("verify", "verify", "Verify"), ("review-1", "review", "Review 1"),
-                     ("review-2", "review", "Review 2"), ("security", "security", "Security audit"),
-                     ("merge", "merge", "Train merge")),
-}
-
 # FOUNDER RULE 2026-11-16: every review step runs FOUR reviews in parallel.
 # One on the model the cascade service names as active, and three independent
 # DeepSeek agents. The three are not coordinated with each other or with the
@@ -53,6 +40,23 @@ def review_stages() -> tuple[Stage, ...]:
     return (Stage(REVIEW_CASCADE_STAGE, "review", "Review (cascade model)"),
             *(Stage(name, "review", f"Review (DeepSeek {i})")
               for i, name in enumerate(REVIEW_DEEPSEEK_STAGES, start=1)))
+
+
+PIPELINES: dict[str, tuple[Stage, ...]] = {
+    "vibe": _stages(("implement", "implement", "Implement"), ("merge", "merge", "Merge")),
+    "medium": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
+                      *((s.name, s.role, s.label) for s in review_stages()),
+                      ("merge", "merge", "Train merge")),
+    "high": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
+                    ("verify", "verify", "Verify"),
+                    *((s.name, s.role, s.label) for s in review_stages()),
+                    ("security", "security", "Security scan"), ("merge", "merge", "Train merge")),
+    "xhigh": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
+                     ("verify", "verify", "Verify"),
+                     *((s.name, s.role, s.label) for s in review_stages()),
+                     ("security", "security", "Security audit"),
+                     ("merge", "merge", "Train merge")),
+}
 
 LEVELS: dict[str, dict] = {
     "vibe": {"label": "Vibe coder", "summary": "Builds the features. No tests, reviews or scans.",

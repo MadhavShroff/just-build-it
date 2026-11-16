@@ -228,9 +228,13 @@ class DagLoaderTest(unittest.TestCase):
 
 
 class RigorTest(unittest.TestCase):
-    def test_vibe_has_no_checks_and_xhigh_has_two_reviews(self):
+    def test_vibe_has_no_checks_and_xhigh_has_four_reviews(self):
         self.assertEqual([s.role for s in rigor.pipeline("vibe")], ["implement", "merge"])
-        self.assertEqual([s.role for s in rigor.pipeline("xhigh")].count("review"), 2)
+        # FOUNDER RULE 2026-11-16: every review step runs four reviews, one on the
+        # cascade-active model and three independent DeepSeek agents.
+        self.assertEqual([s.role for s in rigor.pipeline("xhigh")].count("review"), 4)
+        self.assertEqual([s.name for s in rigor.pipeline("xhigh") if s.role == "review"],
+                         ["review-cascade", "review-ds-1", "review-ds-2", "review-ds-3"])
         self.assertEqual(rigor.LEVELS["vibe"]["lane_checks"], ())
 
     def test_escalation_moves_the_implementer_up(self):

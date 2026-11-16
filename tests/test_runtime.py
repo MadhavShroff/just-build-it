@@ -143,8 +143,13 @@ class Runs(RunFixture):
         sup.start_execution()
         self.assertTrue(self.hooks.merged_event.wait(90), self.store.read("/timeline"))
         stages = self.store.read("/plan/tasks/a/stages")
-        self.assertEqual(list(stages), ["implement", "acceptance", "verify", "review", "security", "merge"])
+        # FOUNDER RULE 2026-11-16: the review step is four reviews, run together.
+        self.assertEqual(list(stages), ["implement", "acceptance", "verify",
+                                        "review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
+                                        "security", "merge"])
         self.assertTrue(all(s["status"] == "passed" for s in stages.values()))
+        for rname in ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3"):
+            self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result", "model": "sim-l"})
 
 
 class Failures(RunFixture):
