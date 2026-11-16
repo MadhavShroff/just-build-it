@@ -123,6 +123,7 @@ POST /api/v1/commands
 
 | Type | Phase | Payload |
 |---|---|---|
+| `plan.load` | intake, stack, bootstrap, configure | optional `path`: string, optional `text`: string, optional `target`: string, optional `start`: bool |
 | `intake.import` | intake | `text`: string |
 | `intake.say` | intake | `text`: string |
 | `intake.detail` | intake | `level`: `user` \| `guided` \| `delegate` |

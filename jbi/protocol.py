@@ -19,7 +19,7 @@ DETAIL_LEVELS = ("user", "guided", "delegate")
 STOP_MODES = ("quit", "standdown", "finish", "kill")
 TASK_STATUSES = ("blocked", "ready", "running", "verifying", "queued",
                  "merging", "merged", "failed", "paused", "decision", "skipped")
-TASK_ID = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+TASK_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 COMMAND_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 ANY_PHASE = PHASES
 
@@ -81,6 +81,12 @@ _TEXT = Field("string", max_length=20000)
 _TASK = Field("task")
 
 COMMANDS: dict[str, Command] = {c.type: c for c in (
+    Command("plan.load", ("intake", "stack", "bootstrap", "configure"),
+            "Load a typed task DAG and move the run to execute.",
+            {"path": Field("string", required=False, max_length=1024),
+             "text": Field("string", required=False, max_length=200000),
+             "target": Field("string", required=False, max_length=1024),
+             "start": Field("bool", required=False)}),
     Command("intake.import", ("intake",), "Import a task list in any format.", {"text": _TEXT}),
     Command("intake.say", ("intake",), "Send one message to the planning chat.", {"text": _TEXT}),
     Command("intake.detail", ("intake",), "Choose how much detail the user gives.",

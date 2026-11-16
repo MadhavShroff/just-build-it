@@ -48,6 +48,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     start = parser
     start.add_argument("--repo", type=Path, help="an existing git repository to add features to")
+    start.add_argument("--dag", type=Path, help="a typed task DAG file (.json or restricted YAML)")
+    start.add_argument("--start", action="store_true", help="start execution immediately after loading the DAG")
     start.add_argument("--name", default="new-app", help="the working name of a new project")
     start.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
     start.add_argument("--max-sessions", type=int, default=3, help="agents that run at the same time")
@@ -119,6 +121,10 @@ class Run:
         self.engine = Engine(self.store, completer)
         self.runtime = self._runtime()
         self.engine.runtime = self.runtime
+        if getattr(args, "dag", None):
+            self.engine.submit({"id": "cli-dag", "type": "plan.load",
+                                "payload": {"path": str(args.dag.expanduser().resolve()),
+                                            "start": bool(getattr(args, "start", False))}})
 
         tailnet = None if args.no_tailscale else netinfo.detect_tailscale()
         self.auth = Auth()

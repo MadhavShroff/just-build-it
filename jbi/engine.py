@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from . import architecture, planner, providers, protocol, stack, waves
+from . import architecture, dag_loader, planner, providers, protocol, stack, waves
 from .contracts import Runtime
 from .llm import Completer, CompletionError
 from .protocol import ProtocolError
@@ -30,6 +30,7 @@ class Engine:
         self._lock = threading.RLock()
         self.debug_log = Path(store.path).parent / providers.DEBUG_LOG
         self._handlers: dict[str, Handler] = {
+            "plan.load": self._plan_load,
             "intake.import": self._intake_import, "intake.say": self._intake_say,
             "intake.detail": self._intake_detail, "intake.finish": self._intake_finish,
             "stack.revise": self._stack_revise, "stack.accept": self._stack_accept,
@@ -102,6 +103,37 @@ class Engine:
         return self.runtime
 
     # ---- intake ----------------------------------------------------------------------
+
+    def _plan_load(self, ctype: str, payload: dict) -> None:
+        if not payload.get("path") and not payload.get("text"):
+            raise ProtocolError("payload_invalid", "plan.load needs 'path' or 'text'.")
+        if payload.get("text"):
+            text = payload["text"]
+            is_json = (payload.get("path") or "").lower().endswith(".json") or text.lstrip().startswith(("{", "["))
+            doc = dag_loader.parse_dag_json(text) if is_json else dag_loader.validate(dag_loader.parse(text))
+        else:
+            doc = dag_loader.load_document(Path(payload["path"]))
+        revision = self.store.read("/plan/revision", 0) + 1
+        plan = waves.compile_plan(doc, revision)
+        name = doc.get("project") or self.store.read("/run/name")
+        prd = {"name": name or "", "components": []}
+        plan.update(rough_prd="", prd=prd)
+        graph = architecture.initial(prd, plan)
+        changes = (Changes().replace("plan", plan).replace("architecture", graph)
+                   .replace("bootstrap", "status", "passed"))
+        if name:
+            changes.replace("run", "name", name)
+        if payload.get("target"):
+            changes.replace("run", "target", str(Path(payload["target"]).expanduser()))
+        elif doc.get("repo") and not self.store.read("/run/target"):
+            changes.replace("run", "target", str(Path(doc["repo"]).expanduser()))
+        if doc.get("mode") in ("new", "existing"):
+            changes.replace("run", "mode", doc["mode"])
+        self.store.log("plan", f"Plan ready: {len(plan['order'])} tasks in {len(plan['waves'])} waves",
+                       extra=changes, etype="plan.updated", revision=plan["revision"])
+        self._phase("execute", "Plan loaded")
+        if payload.get("start", True) and self.runtime is not None:
+            self.runtime.start_execution()
 
     def _intake_say(self, ctype: str, payload: dict) -> None:
         self._say("user", payload["text"])

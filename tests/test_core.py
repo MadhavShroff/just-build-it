@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from jbi import cli, planner
+from jbi import cli, dag_loader, planner
 from jbi import jsonpatch as jp
 from jbi import protocol, rigor, waves
 from jbi.engine import Engine
@@ -128,6 +128,103 @@ class WavesTest(unittest.TestCase):
     def test_deep_plan_has_no_recursion_limit(self):
         chain = [task("t0")] + [task(f"t{i}", f"t{i - 1}") for i in range(1, 1500)]
         self.assertEqual(len(waves.compile_plan(chain, 1)["waves"]), 1500)
+
+
+class DagLoaderTest(unittest.TestCase):
+    YAML_SAMPLE = (
+        'project: "demo"\n'
+        'repo: "./demo"\n'
+        'mode: "existing"\n'
+        'waves: "auto"\n'
+        'tasks:\n'
+        '  - id: "D01"\n'
+        '    title: "Build core"\n'
+        '    goal: "Provide core"\n'
+        '    deps: []\n'
+        '    acceptance: "python3 -m unittest"\n'
+        '    owns: ["src/core.py"]\n'
+        '  - id: "cli_1"\n'
+        '    title: "Build CLI"\n'
+        '    goal: "Expose core"\n'
+        '    deps: ["D01"]\n'
+        '    acceptance: "python3 -m unittest"\n'
+        '    owns: ["src/cli.py"]\n'
+    )
+
+    def test_loads_restricted_yaml_and_explicit_waves(self):
+        plan = dag_loader.load(self.YAML_SAMPLE, revision=2)
+        self.assertEqual(plan["revision"], 2)
+        self.assertEqual(plan["order"], ["D01", "cli_1"])
+        self.assertEqual(plan["waves"], [["D01"], ["cli_1"]])
+        self.assertEqual(plan["tasks"]["D01"]["status"], "ready")
+        self.assertEqual(plan["tasks"]["cli_1"]["status"], "blocked")
+        explicit = (
+            'project: "demo"\nrepo: "./demo"\nmode: "new"\nwaves: "explicit"\n'
+            'wave_groups: [["D01"], ["docs"], ["cli_1"]]\n'
+            'tasks:\n'
+            '  - id: "D01"\n    title: "Core"\n    goal: "G"\n    deps: []\n    acceptance: "true"\n'
+            '  - id: "docs"\n    title: "Docs"\n    goal: "G"\n    deps: []\n    acceptance: "true"\n'
+            '  - id: "cli_1"\n    title: "CLI"\n    goal: "G"\n    deps: ["D01"]\n    acceptance: "true"\n'
+        )
+        plan2 = dag_loader.load(explicit)
+        self.assertEqual(plan2["waves"], [["D01"], ["docs"], ["cli_1"]])
+        self.assertEqual(plan2["tasks"]["docs"]["wave"], 2)
+        self.assertEqual(plan2["tasks"]["cli_1"]["wave"], 3)
+
+    def test_loads_planning_dag_json_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dag_path = Path(tmp) / "dag.json"
+            dag_path.write_text(json.dumps({
+                "schemaVersion": 1,
+                "nodes": [
+                    {"id": "D01", "title": "Native data contracts", "deps": [],
+                     "path": "04/D01-PLAN.md", "spec": "04/D01-SPEC.md", "owns": ["src/d01.py"]},
+                    {"id": "A01", "title": "Account authority", "deps": [],
+                     "path": "01/A01-PLAN.md", "owns": ["src/a01.py"]},
+                    {"id": "P01", "title": "Project authority", "deps": ["D01", "A01"],
+                     "path": "08/P01-PLAN.md", "acceptance": "pytest", "owns": ["src/p01.py"]},
+                ],
+                "waves": [["D01", "A01"], ["P01"]],
+            }))
+            plan = dag_loader.load(dag_path)
+            self.assertEqual(plan["order"], ["D01", "A01", "P01"])
+            self.assertEqual(plan["waves"], [["D01", "A01"], ["P01"]])
+            self.assertEqual(plan["tasks"]["D01"]["status"], "ready")
+            self.assertEqual(plan["tasks"]["P01"]["status"], "blocked")
+            self.assertEqual(plan["tasks"]["P01"]["acceptance"], "pytest")
+            self.assertIn("04/D01-PLAN.md", plan["tasks"]["D01"]["goal"])
+
+    def test_rejects_cycles_and_malformed_yaml(self):
+        cycle_yaml = (
+            'project: "t"\nrepo: "./t"\nmode: "new"\nwaves: "auto"\ntasks:\n'
+            '  - id: "a"\n    title: "A"\n    goal: "G"\n    deps: ["b"]\n    acceptance: "true"\n'
+            '  - id: "b"\n    title: "B"\n    goal: "G"\n    deps: ["a"]\n    acceptance: "true"\n'
+        )
+        with self.assertRaises(dag_loader.Invalid) as caught:
+            dag_loader.load(cycle_yaml)
+        self.assertIn("a -> b -> a", str(caught.exception))
+        with self.assertRaises(dag_loader.Invalid):
+            dag_loader.load(self.YAML_SAMPLE + "# comment\n")
+
+    def test_engine_plan_load_and_cli_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dag_path = Path(tmp) / "sample.yaml"
+            dag_path.write_text(self.YAML_SAMPLE)
+            store = new_store(Path(tmp))
+            started = []
+
+            class FakeRuntime:
+                def start_execution(self):
+                    started.append(True)
+
+            engine = Engine(store, completer=None, runtime=FakeRuntime())
+            engine.submit({"id": "load-1", "type": "plan.load", "payload": {"path": str(dag_path)}})
+            self.assertEqual(store.read("/run/phase"), "execute")
+            self.assertEqual(store.read("/plan/order"), ["D01", "cli_1"])
+            self.assertEqual(started, [True])
+            store.close()
+            args = cli.parse_args(["--dag", str(dag_path), "--start"])
+            self.assertEqual((args.dag, args.start), (dag_path, True))
 
 
 class RigorTest(unittest.TestCase):

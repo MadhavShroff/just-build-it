@@ -100,10 +100,22 @@ def levels(tasks: list[dict]) -> list[list[str]]:
     return result
 
 
-def compile_plan(tasks: list[dict], revision: int) -> dict:
+def compile_plan(tasks: list[dict] | dict, revision: int = 1) -> dict:
+    explicit_waves: list[list[str]] | None = None
+    if isinstance(tasks, dict):
+        if isinstance(tasks.get("wave_groups"), list) and tasks.get("waves") == "explicit":
+            explicit_waves = [list(g) for g in tasks["wave_groups"]]
+        raw_tasks = tasks.get("tasks")
+        if isinstance(raw_tasks, dict):
+            order = tasks.get("order") or list(raw_tasks)
+            tasks = [raw_tasks[tid] for tid in order]
+        elif isinstance(raw_tasks, list):
+            tasks = raw_tasks
+        else:
+            tasks = []
     validate(tasks)
     normalized = {t["id"]: normalize(t) for t in tasks}
-    waves = levels(tasks)
+    waves = explicit_waves if explicit_waves is not None else levels(tasks)
     for number, wave in enumerate(waves, start=1):
         for tid in wave:
             normalized[tid]["wave"] = number
