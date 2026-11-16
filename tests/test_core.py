@@ -1129,6 +1129,34 @@ class DagSubtasksAndToolTest(unittest.TestCase):
             expanded_plan = dag_loader.load(json_path)
             self.assertEqual(expanded_plan["waves"], [["A01"], ["D03-B1"], ["D03-B2"]])
 
+    def test_brief_renders_rich_spec_fields_for_smaller_models(self):
+        from jbi import briefs
+        rich_task = waves.normalize({
+            "id": "D03-B1",
+            "title": "D03 B1: Core ports",
+            "goal": "Implement D03 Batch B1 core ports and entities.",
+            "deps": [],
+            "owns": ["src/a.ts"],
+            "acceptance": "npx tsc --noEmit",
+            "path": "04-tables-docs-slides-charts/D03-PLAN.md",
+            "spec": "04-tables-docs-slides-charts/D03-SPEC.md",
+            "spec_details": ["Extend D02 artifact_heads without creating local grant stores."],
+            "contracts": ["ArtifactSourcePolicyPort", "ArtifactOutputPolicyPort"],
+            "invariants": ["All content queries include trusted tenantId and projectId."],
+            "test_cases": ["D03-T01: preserve D01 identities"],
+            "done_criteria": ["tsc --noEmit exits 0"],
+        })
+        rendered = briefs.render(task=rich_task, role="implement", stage="implement", attempt=0, receipt=Path("/tmp/r"))
+        for heading in (
+            "## Source Docs",
+            "## Specification Details",
+            "## Contracts & Interfaces",
+            "## Invariants",
+            "## Required Test Cases",
+            "## Done Criteria",
+        ):
+            self.assertIn(heading, rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
