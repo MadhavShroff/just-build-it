@@ -3,12 +3,19 @@
 `Supervisor` implements `jbi.contracts.Runtime`. Every agent runs under `jbi.shim` in
 its own window of a private tmux server (`tmux -L jbi-<run-id>`). The scheduler admits
 a task as soon as its own dependencies are merged, never by wave.
+
+One step, one window: REQUIREMENT 1.1 to 1.6 in
+`~/.tangram-dev/evidence/jbi-run/REQUIREMENT-executor.md`. The window name is
+`<dagName>-wave<n>-task<n>-<provider>` (1.2); the window is closed and its process
+tree and temp files are reclaimed when the step ends (1.5); only the receipt
+survives (1.6). The close is VERIFIED, never merely requested.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -27,7 +34,20 @@ from .store import Changes, Store, now
 ACCEPTANCE_TIMEOUT = 900.0
 STANDDOWN_WAIT = 20.0
 TICK = 1.0
+CLOSE_WAIT = 10.0                 # a window close is verified within this time, not assumed
 STAGE_STATUS = {"implement": "running", "merge": "queued"}
+WINDOW_NAME = re.compile(r"^[a-z0-9-]+-wave\d+-task\d+-[a-z-]+$")    # REQUIREMENT 1.2
+
+
+@dataclass(frozen=True)
+class Window:
+    """One tmux window: the name it shows and the id that stays unique.
+
+    REQUIREMENT 1.2 fixes the name. The id is what a close targets, because two
+    steps of one task can share a name when they share a provider.
+    """
+    name: str
+    wid: str | None
 
 
 class Tmux:
@@ -45,12 +65,14 @@ class Tmux:
         return subprocess.run(["tmux", "-L", self.socket, "-f", "/dev/null", *args], env=env, cwd=self.cwd,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
-    def window(self, name: str, argv: list[str]) -> str | None:
-        """Open a detached window running `argv`. Returns the window name, or None without tmux.
+    def open(self, name: str, argv: list[str]) -> "Window | None":
+        """Open a detached window running `argv`. Returns its name and id, or None without tmux.
 
         The four reviews of one task call this at the same time (founder rule
         2026-11-16), so the first-window setup is guarded: two threads that both
         saw `_started` false would both run `new-session`, and the second fails.
+        Two concurrent steps can carry the same name, because the name holds the
+        provider and not the stage; the WINDOW ID is what stays unique.
         """
         if not self.available:
             return None
@@ -63,11 +85,58 @@ class Tmux:
                 self._run("new-session", "-d", "-s", "jbi", "-n", "control", "-x", "200", "-y", "50",
                           "--", "sh", "-c", watch)
                 self._started = True
-        result = self._run("new-window", "-d", "-t", "jbi:", "-n", name, "--", *argv)
-        return name if result.returncode == 0 else None
+        result = self._run("new-window", "-d", "-t", "jbi:", "-n", name, "-P", "-F", "#{window_id}",
+                           "--", *argv)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return Window(name, result.stdout.strip())
+
+    def window(self, name: str, argv: list[str]) -> str | None:
+        """Open a window and return only its name, for a caller that names no window of its own."""
+        opened = self.open(name, argv)
+        return opened.name if opened else None
 
     def _socket_path(self) -> Path:
         return Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / self.socket
+
+    def _windows(self) -> dict[str, str]:
+        """The live windows as `{window id: window name}`. Empty without tmux."""
+        if not self.available:
+            return {}
+        result = self._run("list-windows", "-t", "jbi:", "-F", "#{window_id} #{window_name}")
+        if result.returncode != 0:
+            return {}
+        found: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                found[parts[0].strip()] = parts[1].strip()
+        return found
+
+    def close(self, window: "Window") -> bool:
+        """Close `window` and PROVE it is gone (REQUIREMENT 1.5). True means gone.
+
+        A request to close is not a close: the window is asked to close, then its id
+        is read back from the server. A window that survives the wait is killed by
+        id and read back again. The answer is what is true, never what was asked.
+        """
+        if not self.available or window.wid is None:
+            return True
+        for _attempt in (1, 2):
+            if window.wid not in self._windows():
+                return True
+            self._run("kill-window", "-t", window.wid)
+            if self._await_gone(window.wid, CLOSE_WAIT):
+                return True
+        return window.wid not in self._windows()
+
+    def _await_gone(self, wid: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if wid not in self._windows():
+                return True
+            time.sleep(0.05)
+        return wid not in self._windows()
 
     def kill_server(self) -> None:
         if self.available:
@@ -83,8 +152,10 @@ class Session:
     role: str
     status_path: Path
     window: str | None
+    window_id: str | None = None
     direct: subprocess.Popen | None = None
     status: dict = field(default_factory=dict)
+    finished: bool = False
 
     def read(self) -> dict:
         try:
@@ -94,7 +165,9 @@ class Session:
         return self.status
 
     def done(self) -> bool:
-        return self.read().get("ended") is not None
+        # Reclaim removes the status file (REQUIREMENT 1.6), so an ended step must
+        # remember that it ended; a missing file is not a running step.
+        return self.finished or self.read().get("ended") is not None
 
 
 class Supervisor:
@@ -140,9 +213,43 @@ class Supervisor:
     def _lane_window(self, name: str, log: Path) -> str | None:
         return self.tmux.window(name, ["tail", "-n", "+1", "-F", str(log)])
 
+    # REQUIREMENT 1.2 and 1.3: the name is
+    # `<dagName>-wave<n>-task<n>-<provider>`. The wave is the task's compiled wave
+    # index and the task number is its ordinal in that wave; both count from 1.
+
+    @staticmethod
+    def _slug(text: str, fallback: str = "dag") -> str:
+        words = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+        return words or fallback
+
+    def dag_name(self) -> str:
+        """The plan's name, lowercased with hyphens. `dag` when the plan names none."""
+        name = self.store.read("/plan/prd/name") or self.store.read("/run/name") or "dag"
+        return self._slug(name)
+
+    def placement(self, task: str) -> tuple[int, int]:
+        """(wave, task ordinal within that wave), both 1-based. (1, 1) for no plan task."""
+        plan = self.store.read("/plan") or {}
+        task_doc = (plan.get("tasks") or {}).get(task) or {}
+        waves_of_plan = plan.get("waves") or []
+        wave = int(task_doc.get("wave") or 1)
+        group = waves_of_plan[wave - 1] if 0 < wave <= len(waves_of_plan) else []
+        return wave, (list(group).index(task) + 1 if task in group else 1)
+
+    def window_name(self, task: str, provider: str) -> str:
+        """The window name for one step of `task` on `provider` (REQUIREMENT 1.2)."""
+        wave, ordinal = self.placement(task)
+        return f"{self.dag_name()}-wave{wave}-task{ordinal}-{self._slug(provider, 'none')}"
+
     def run_session(self, task: str, role: str, cmd: list[str], cwd: Path, provider: str,
                     model: str, attempt: int) -> Session:
-        """Start one agent under the shim and wait until it ends."""
+        """Start one agent under the shim, wait until it ends, then reclaim its window.
+
+        REQUIREMENT 1.1 to 1.6: the step owns a window of its own, named by
+        `window_name`. The window is closed and its process tree and temp files are
+        reclaimed before this call returns; the close is verified, not requested.
+        Only the stage receipt survives.
+        """
         sid = f"s-{task}-{role}-{attempt + 1}"
         base = self.run_dir / "sessions" / sid
         base.parent.mkdir(parents=True, exist_ok=True)
@@ -151,8 +258,10 @@ class Supervisor:
                 "status": f"{base}.status.json", "log": f"{base}.log"}
         Path(f"{base}.spec.json").write_text(json.dumps(spec))
         argv = [sys.executable, "-m", "jbi.shim", f"{base}.spec.json"]
-        window = self.tmux.window(f"{task}:{role}", argv)
-        session = Session(sid, task, role, Path(spec["status"]), window)
+        opened = self.tmux.open(self.window_name(task, provider), argv)
+        window = opened.name if opened else None
+        session = Session(sid, task, role, Path(spec["status"]), window,
+                          opened.wid if opened else None)
         if window is None:
             session.direct = subprocess.Popen(argv, cwd=self.run_dir, start_new_session=True,
                                               env={**agents.runtime_env(), **agents.extra_env("simulator")},
@@ -160,17 +269,47 @@ class Supervisor:
         with self._lock:
             self.sessions[sid] = session
         self.store.commit("session.status", Changes().set("sessions", sid, {
-            "task": task, "role": role, "model": model, "window": window, "status": "running",
-            "started": now(), "note": None if window else "tmux is missing; the shim runs as a direct child"}),
+            "task": task, "role": role, "model": model, "window": window, "window_id": session.window_id,
+            "status": "running", "started": now(),
+            "note": None if window else "tmux is missing; the shim runs as a direct child"}),
             {"session": sid, "task": task})
         while not session.done():
             self._record(session)
             time.sleep(0.1)
         self._record(session)
         with self._lock:
-            self.identities.pop(sid, None)              # an ended session leaves the kill set
+            ident = self.identities.pop(sid, {})            # an ended session leaves the kill set
         self._end_session(session)
+        session.finished = True
+        self._reclaim_window(session)
+        self._stop_tree(ident)
+        self._remove_session_files(base)
         return session
+
+    def _reclaim_window(self, session: Session) -> None:
+        """Close the step's window and prove it is gone (REQUIREMENT 1.5)."""
+        if session.window_id is None:
+            return
+        if not self.tmux.close(Window(session.window or "", session.window_id)):
+            self.store.log("session", f"{session.task}/{session.role}: window {session.window_id} "
+                                      f"did not close within {CLOSE_WAIT:.0f}s", task=session.task)
+
+    def _stop_tree(self, ident: dict[int, str]) -> None:
+        """Stop every process recorded for the step, group first (REQUIREMENT 1.5)."""
+        for pid, start in ident.items():
+            self._verified_signal(pid, start, signal.SIGTERM, group=True)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and any(alive(pid, start) for pid, start in ident.items()):
+            time.sleep(0.05)
+        for pid, start in ident.items():
+            self._verified_signal(pid, start, signal.SIGKILL, group=True)
+            self._verified_signal(pid, start, signal.SIGKILL, group=False)
+
+    @staticmethod
+    def _remove_session_files(base: Path) -> None:
+        """Drop the step's scratch files (REQUIREMENT 1.6). The receipt is not here: it lives in `receipts/`."""
+        for suffix in (".spec.json", ".status.json", ".log"):
+            Path(f"{base}{suffix}").unlink(missing_ok=True)
 
     def _record(self, session: Session) -> None:
         ident = self.identities.setdefault(session.sid, {})
@@ -318,6 +457,7 @@ class Supervisor:
             level, profile = rigor.effective(task, self.store.read("/config"))
             stage = rigor.next_stage(level, stage_name)
             if stage is None:
+                self._reclaim_worktree(tid, worktree)
                 return
             ok, detail, model = self._run_stage(task, stage, level, worktree, findings)
             if self._stopping in ("quit", "kill", "standdown"):
@@ -329,6 +469,7 @@ class Supervisor:
                                                     "detail": detail[:2000], "model": model}}), {"task": tid})
             if ok:
                 if stage.role == "merge":
+                    self._reclaim_worktree(tid, worktree)
                     self._progress()
                     return
                 # The four reviews run together inside the cascade stage, so the
@@ -352,6 +493,18 @@ class Supervisor:
             if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
                 self._task_update(tid, resume_after=None)
                 return
+
+    def _reclaim_worktree(self, tid: str, worktree: Path) -> None:
+        """Remove the task worktree once the task has ended (REQUIREMENT 1.5).
+
+        The worktree spans every step of one task, so it is reclaimed at the end of
+        the task and not between steps. A paused or failed task keeps its worktree
+        for the resume.
+        """
+        try:
+            wt.remove_worktree(self.repo, worktree)
+        except wt.GitError as error:
+            self.store.log("task", f"{tid}: cannot remove {worktree}: {error}", task=tid)
 
     def _run_stage(self, task: dict, stage: rigor.Stage, level: str, worktree: Path,
                    findings: list[str]) -> tuple[bool, str, str | None]:

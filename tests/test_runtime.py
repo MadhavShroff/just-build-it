@@ -14,11 +14,11 @@ import unittest
 import uuid
 from pathlib import Path
 
-from jbi import protocol, waves, worktrees as wt
+from jbi import briefs, protocol, waves, worktrees as wt
 from jbi.lanes import Lanes, MergeJob
 from jbi.shim import Groups
 from jbi.store import Changes, Store
-from jbi.supervisor import Supervisor
+from jbi.supervisor import WINDOW_NAME, Supervisor
 
 HAS_TMUX = shutil.which("tmux") is not None
 
@@ -124,6 +124,148 @@ class Admission(RunFixture):
         self.assertTrue(self.hooks.stopped_event.wait(20))
 
 
+class StepWindows(RunFixture):
+    """REQUIREMENT 1.1 to 1.6: one step, one window, closed and verified gone.
+
+    Every assertion here reads the tmux server, not the runtime's own record. A
+    runtime that only SAYS it closed a window passes no test in this class.
+    """
+
+    def record_opens(self, sup):
+        """Wrap `tmux.open` to note the live step-window ids when each window opens."""
+        opened, live_before = [], []
+        original = sup.tmux.open
+        step_ids = lambda: {wid for wid, name in sup.tmux._windows().items()
+                            if WINDOW_NAME.match(name)}
+
+        def recording_open(name, argv):
+            live_before.append(step_ids())
+            window = original(name, argv)
+            opened.append(window)
+            return window
+
+        sup.tmux.open = recording_open
+        return opened, live_before
+
+    def test_two_serial_stages_use_two_windows_and_the_first_is_gone_before_the_second(self):
+        """One task, two SEQUENTIAL steps: the second window opens after the first is gone.
+
+        The four review steps of one task run at the same time by founder rule
+        2026-11-16, so a test over a whole high-rigor run cannot assert "no earlier
+        window is live". This test drives two steps one after the other and reads
+        the tmux server between them.
+        """
+        if not HAS_TMUX:
+            self.skipTest("tmux is not installed")
+        sup = self.make([task("a")], rigor="vibe")
+        opened, live_before = self.record_opens(sup)
+        cmd = ["true"]
+        cwd = self.tmp
+        sup.run_session("a", "implement", cmd, cwd, "simulator", "sim-s", 0)
+        sup.run_session("a", "verify", cmd, cwd, "simulator", "sim-s", 0)
+        ids = [w.wid for w in opened if w is not None]
+        self.assertEqual(len(ids), 2, "two steps must open two windows")
+        self.assertNotEqual(ids[0], ids[1], "each step needs its own window")
+        self.assertNotIn(ids[0], live_before[1],
+                         f"window {ids[0]} was still live when the second step started")
+        self.assertNotIn(ids[0], sup.tmux._windows(), "the first window must be gone")
+
+    def test_two_stages_use_two_windows(self):
+        if not HAS_TMUX:
+            self.skipTest("tmux is not installed")
+        sup = self.make([task("a")], rigor="medium")
+        opened, _live = self.record_opens(sup)
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
+        ids = [w.wid for w in opened if w is not None]
+        self.assertGreaterEqual(len(ids), 2, "one task with agent stages must open two windows")
+        self.assertEqual(len(set(ids)), len(ids), "each step needs its own window")
+        names = [w.name for w in opened if w is not None and WINDOW_NAME.match(w.name)]
+        self.assertEqual(names[0], names[1], "one task and one provider keep one name pattern")
+
+    def test_every_step_window_is_closed_when_the_task_ends(self):
+        if not HAS_TMUX:
+            self.skipTest("tmux is not installed")
+        sup = self.make([task("a")], rigor="medium")
+        opened, _live = self.record_opens(sup)
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
+        leftover = [w for w in opened
+                    if w is not None and WINDOW_NAME.match(w.name) and w.wid in sup.tmux._windows()]
+        self.assertEqual(leftover, [], "a step window must not outlive its step")
+        # REQUIREMENT 1.6: only the receipt survives. The step scratch files are gone.
+        self.assertEqual(sorted(p.name for p in (sup.run_dir / "sessions").glob("*")), [],
+                         "session scratch files must be reclaimed")
+        self.assertTrue(briefs.receipt_path(sup.run_dir, "a", "implement", 0).exists(),
+                        "the receipt is the one thing that survives")
+
+    def test_window_name_matches_the_required_pattern(self):
+        sup = self.make([task("a"), task("b"), task("c", deps=["a", "b"])], rigor="vibe")
+        for tid in ("a", "b", "c"):
+            name = sup.window_name(tid, "agy")
+            self.assertRegex(name, r"^[a-z0-9-]+-wave\d+-task\d+-[a-z-]+$")
+        # wave 1 holds a and b; c is task 1 of wave 2.
+        self.assertEqual(sup.window_name("b", "agy"), "t-wave1-task2-agy")
+        self.assertEqual(sup.window_name("c", "agy"), "t-wave2-task1-agy")
+
+    def test_dag_name_is_lowercased_with_hyphens(self):
+        sup = self.make([task("a")], rigor="vibe")
+        self.store.commit("run.name", Changes().set("plan", "prd", {"name": "Waves 4"}), {})
+        self.assertEqual(sup.window_name("a", "openai-compatible"),
+                         "waves-4-wave1-task1-openai-compatible")
+
+
+class DirectivesAreDry(unittest.TestCase):
+    """REQUIREMENT 3.3, 3.5 and 3.6: the common block is declared once, never copied.
+
+    3.6 says a directive that repeats a common instruction is a defect. Requirement
+    4.3 then says the render JOINS the common block to the step block, so each
+    assembled prompt legitimately holds the common text once. The defect this class
+    catches is a SECOND copy: one in the common block and one in the step block, or
+    a copy written into a step declaration in the source.
+    """
+
+    def test_no_common_instruction_is_copied_into_any_prompt(self):
+        from jbi import briefs, rigor
+        sample = {"id": "a", "title": "A", "goal": "build a", "acceptance": "true", "owns": ["src/a.py"]}
+        prompts = [briefs.render(task=sample, role=stage.role, stage=stage.name, attempt=0,
+                                 receipt=Path("/tmp/r")) for stage in rigor.pipeline("high")]
+        for _number, text in briefs.COMMON:
+            for index, prompt in enumerate(prompts):
+                self.assertEqual(prompt.count(text), 1,
+                                 f"common instruction {text!r} appears {prompt.count(text)} "
+                                 f"times in prompt {index + 1}, not once")
+
+    def test_no_step_declaration_holds_a_common_instruction(self):
+        from jbi import briefs
+        step_texts = [text for _n, text in briefs.STAGE_DIRECTIVES.values()]
+        step_texts += [text for _n, text in briefs.ROLE_DIRECTIVES.values()]
+        for _number, common in briefs.COMMON:
+            for step in step_texts:
+                self.assertNotIn(common, step, f"the step block repeats the common instruction {common!r}")
+
+    def test_the_common_block_is_declared_once_in_the_source(self):
+        from jbi import briefs
+        source = Path(briefs.__file__).read_text()
+        for _number, text in briefs.COMMON:
+            self.assertEqual(source.count(text), 1,
+                             f"common instruction {text!r} is written {source.count(text)} "
+                             f"times in {briefs.__file__}")
+
+    def test_the_step_block_carries_only_the_step_instruction(self):
+        from jbi import briefs
+        sample = {"id": "a", "title": "A", "goal": "build a", "acceptance": "true"}
+        implement = briefs.render(task=sample, role="implement", stage="implement", attempt=0,
+                                  receipt=Path("/tmp/r"))
+        dry_run = briefs.render(task=sample, role="review", stage="dry-run", attempt=0,
+                                receipt=Path("/tmp/r"))
+        # One numbered step line each, and each line is false of the other step.
+        self.assertIn("Step 8.", implement)
+        self.assertNotIn("Step 7.", implement)
+        self.assertIn("Step 7.", dry_run)
+        self.assertNotIn("Step 8.", dry_run)
+
+
 class Runs(RunFixture):
     def test_dry_run_rehearses_the_landing_path_and_merges_nothing(self):
         """A dry run walks the whole pipeline and never lands anything.
@@ -155,7 +297,7 @@ class Runs(RunFixture):
         self.assertIn(("wave", 2), self.hooks.calls)
         self.assertEqual(self.store.read("/telemetry/tokens_in"), 240)
         if HAS_TMUX:
-            self.assertEqual(self.store.read("/sessions/s-a-implement-1/window"), "a:implement")
+            self.assertEqual(self.store.read("/sessions/s-a-implement-1/window"), "t-wave1-task1-simulator")
 
     def test_high_run_merges(self):
         sup = self.make([task("a"), task("b")], rigor="high")
