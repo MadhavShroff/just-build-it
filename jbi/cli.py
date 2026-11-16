@@ -58,6 +58,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="CI service for the merge stage (default: local lanes)")
     start.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
     start.add_argument("--offline", action="store_true", help="use the offline simulator for every model")
+    start.add_argument("--dry-run", action="store_true",
+                       help="rehearse the whole pipeline without touching the repo, the CI service or "
+                            "the train: every stage runs against the simulator and the landing path is "
+                            "reported, never taken")
     start.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
     start.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
 
@@ -186,7 +190,15 @@ class Run:
                                              max_sessions=args.max_sessions, lanes=args.lanes or default_lanes(),
                                              tmux=tmux)
             self.store = Store(self.dir / "run.db", initial)
-            self._seed_accounts(args.offline)
+            self._seed_accounts(args.offline or getattr(args, "dry_run", False))
+            if getattr(args, "dry_run", False):
+                # A dry run rehearses the whole pipeline and never lands anything.
+                # The simulator answers every model, the CI service is the local
+                # lane, and the merge stage reports what it would do.
+                from .store import Changes as _Changes
+                self.store.commit("config", _Changes()
+                                  .set("config", "dry_run", True)
+                                  .set("config", "ci_service", "local"), {})
 
         completer = make_completer(self.store, offline=bool(getattr(args, "offline", False)))
         self.engine = Engine(self.store, completer)

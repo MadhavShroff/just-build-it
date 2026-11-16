@@ -125,6 +125,25 @@ class Admission(RunFixture):
 
 
 class Runs(RunFixture):
+    def test_dry_run_rehearses_the_landing_path_and_merges_nothing(self):
+        """A dry run walks the whole pipeline and never lands anything.
+
+        The founder asked for an in-weight rehearsal: prove the app would work
+        in practice without taking the landing path. The merge stage must report
+        what it would do and leave the base branch untouched.
+        """
+        sup = self.make([task("a", owns=["src/a.txt"])], rigor="vibe")
+        self.store.commit("config", Changes().set("config", "dry_run", True), {})
+        base_before = wt.head(self.repo, "main")
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(60), self.store.read("/timeline"))
+        self.assertEqual(self.status("a"), "merged")
+        self.assertTrue(self.store.read("/plan/tasks/a/dry_run"))
+        # The base branch did not move: nothing was landed.
+        self.assertEqual(wt.head(self.repo, "main"), base_before)
+        log = " ".join(str(row) for row in (self.store.read("/timeline") or []))
+        self.assertIn("DRY RUN", log)
+
     def test_vibe_run_merges(self):
         sup = self.make([task("a", owns=["src/a.txt"]), task("b", deps=["a"])], rigor="vibe")
         sup.start_execution()

@@ -454,6 +454,17 @@ class Supervisor:
     # ---- merging ---------------------------------------------------------------------
 
     def _merge(self, tid: str, level: str, worktree: Path) -> bool:
+        if self.store.read("/config/dry_run"):
+            # A dry run rehearses the landing path and never takes it. Report what
+            # the merge would do, so the rehearsal proves the pipeline end to end.
+            task = self.store.read(f"/plan/tasks/{tid}") or {}
+            head = task.get("commit") or wt.head(worktree, "HEAD") or ""
+            self.store.log("lane", f"DRY RUN: {tid} would hand {head[:10]} to the CI service "
+                                   f"({self.store.read('/config/ci_service') or self.ci_service}) "
+                                   f"and merge on green. Nothing was pushed and nothing merged.",
+                           task=tid)
+            self._task_update(tid, status="merged", commit=head, dry_run=True)
+            return True
         done = threading.Event()
         self._merge_done[tid] = done
         service = self.store.read("/config/ci_service") or self.ci_service
