@@ -142,8 +142,11 @@ def latest_run_dir() -> Path:
 
 def prepare_resume(store: Store) -> list[str]:
     """Reconcile stored task states so an interrupted run continues cleanly on reopen."""
+    from . import resume as resume_mod
     from . import rigor
     from .store import Changes
+
+    _reclaim_orphans_on_resume(store, resume_mod)
 
     changes = Changes()
     if store.read("/run/stopping") is not None:
@@ -187,6 +190,35 @@ def prepare_resume(store: Store) -> list[str]:
     store.log("run", f"Run resumed ({len(resumed_tasks)} task(s) ready)",
               extra=changes, etype="run.config")
     return resumed_tasks
+
+
+def _reclaim_orphans_on_resume(store: Store, resume_mod) -> None:
+    """Reclaim orphans of a previous run before re-opening (REQUIREMENT-resume 2).
+
+    Reads the snapshot once: the run id, the target repo, and any GATE job ids
+    the run recorded. Records the report at `run_dir / "resume-record.json"`. A
+    failure here is logged and never aborts the resume (2.5).
+    """
+    _revision, state = store.snapshot()
+    run_section = (state or {}).get("run") or {}
+    run_id = run_section.get("id")
+    target = run_section.get("target")
+    gate_ids = (state or {}).get("gate_jobs") or []
+    run_dir = Path(store.path).parent
+    try:
+        report = resume_mod.orphaned(
+            str(run_id) if run_id else run_dir.name,
+            run_dir,
+            target_repo=Path(target) if target else None,
+            gate_ids=list(gate_ids) if isinstance(gate_ids, list) else [],
+        )
+        resume_mod.write_resume_record(run_dir, report)
+    except Exception as error:                          # never abort the resume (2.5)
+        try:
+            (run_dir / "resume-record.json").write_text(
+                json.dumps({"error": f"{type(error).__name__}: {error}"}) + "\n")
+        except OSError:
+            pass
 
 
 # ---- the run -------------------------------------------------------------------------

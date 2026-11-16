@@ -1,0 +1,323 @@
+"""Reclaim orphans left by a killed run (REQUIREMENT-resume section 2).
+
+Orphans come in three shapes: tmux windows on the run's private tmux server
+(`tmux -L jbi-<run-id>`), task worktrees under `run_dir / "worktrees" / <task>`,
+and GATE jobs whose ids the run recorded in state. Resume finds each orphan by
+run id and reclaims it. A live run is never reclaimed (2.2). A reclaim that
+cannot happen is recorded and the resume continues (2.5).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import worktrees as wt
+
+
+@dataclass
+class OrphanReport:
+    """What resume found and what it did about it."""
+    tmux_windows_killed: list[str] = field(default_factory=list)
+    tmux_windows_kept: list[dict] = field(default_factory=list)
+    tmux_server_killed: bool = False
+    worktrees_removed: list[str] = field(default_factory=list)
+    worktrees_kept: list[dict] = field(default_factory=list)
+    gate_jobs_stopped: list[str] = field(default_factory=list)
+    gate_jobs_kept: list[dict] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "tmux_windows_killed": list(self.tmux_windows_killed),
+            "tmux_windows_kept": list(self.tmux_windows_kept),
+            "tmux_server_killed": self.tmux_server_killed,
+            "worktrees_removed": list(self.worktrees_removed),
+            "worktrees_kept": list(self.worktrees_kept),
+            "gate_jobs_stopped": list(self.gate_jobs_stopped),
+            "gate_jobs_kept": list(self.gate_jobs_kept),
+            "notes": list(self.notes),
+        }
+
+
+# ---- liveness (2.2) ----------------------------------------------------------------
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Return True when `pid` names a live, non-zombie process.
+
+    Read /proc/<pid>/stat directly so we never rely on a name pattern; a zombie
+    answers kill(0) but runs nothing.
+    """
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True    # owned by another user: err on the side of "live"
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    rest = text.rsplit(")", 1)
+    if len(rest) < 2:
+        return False
+    state = rest[1].lstrip().split()[0] if rest[1].lstrip() else ""
+    return state != "Z"
+
+
+def control_pid(run_dir: Path) -> int | None:
+    """Read the original run's pid from `control.json`. None when absent or stale."""
+    path = run_dir / "control.json"
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    pid = raw.get("pid")
+    return int(pid) if isinstance(pid, int) else None
+
+
+# ---- tmux (2.1, 2.2, 2.5) ----------------------------------------------------------
+
+
+def tmux_socket(run_id: str) -> str:
+    return f"jbi-{run_id}"
+
+
+def list_tmux_windows(socket: str) -> list[str] | None:
+    """Names of windows on the run's private tmux server, or None when no server.
+
+    A non-zero exit that is NOT "no server" (e.g. a permission error) also
+    returns None: we cannot list, so we cannot prove which windows to kill.
+    """
+    if shutil.which("tmux") is None:
+        return None
+    proc = subprocess.run(
+        ["tmux", "-L", socket, "list-windows", "-a", "-F", "#{window_name}"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or "").lower() + (proc.stdout or "").lower()
+        if "no server" in err or "can't find session" in err or "no sessions" in err:
+            return []
+        return None
+    return [name for name in proc.stdout.splitlines() if name.strip()]
+
+
+def _kill_window(socket: str, name: str) -> bool:
+    proc = subprocess.run(
+        ["tmux", "-L", socket, "kill-window", "-t", f"jbi:{name}"],
+        capture_output=True, text=True,
+    )
+    return proc.returncode == 0
+
+
+def kill_tmux_server(socket: str) -> bool:
+    if shutil.which("tmux") is None:
+        return False
+    proc = subprocess.run(["tmux", "-L", socket, "kill-server"],
+                          capture_output=True, text=True)
+    socket_path = Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / socket
+    try:
+        socket_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return proc.returncode == 0
+
+
+def reclaim_tmux(run_id: str, original_pid: int | None, report: OrphanReport) -> None:
+    """Reclaim the run's private tmux server when the original pid is dead.
+
+    Never fails: any window that cannot be reclaimed is recorded (2.5). The
+    control window is auto-started by the supervisor with a `kill -0 <pid>` watch
+    that ends the server when the parent dies, so a dead parent usually means
+    the server is already gone.
+    """
+    socket = tmux_socket(run_id)
+    if pid_alive(original_pid):
+        report.tmux_windows_kept.append({"reason": "run pid still live", "pid": original_pid})
+        return
+    names = list_tmux_windows(socket)
+    if names is None:
+        report.tmux_windows_kept.append({"reason": "cannot list windows on the run's tmux server",
+                                         "socket": socket})
+        return
+    if not names:
+        report.tmux_server_killed = kill_tmux_server(socket)
+        return
+    failed: list[str] = []
+    for name in names:
+        if _kill_window(socket, name):
+            report.tmux_windows_killed.append(name)
+        else:
+            failed.append(name)
+    for name in failed:
+        report.tmux_windows_kept.append({"window": name, "reason": "tmux kill-window failed"})
+    if kill_tmux_server(socket):
+        report.tmux_server_killed = True
+    elif failed:
+        report.notes.append(f"tmux server {socket} not killed; {len(failed)} window(s) resisted")
+
+
+# ---- worktrees (2.3) --------------------------------------------------------------
+
+
+def _worktree_contents_committed(repo: Path, path: Path) -> tuple[bool, str]:
+    """Prove every byte in the worktree is reachable in a commit.
+
+    Step 1: `git status --ignored` must be empty. A dirty or ignored path means a
+    half-written file we must not lose.
+
+    Step 2: HEAD exists (the task's first commit landed), the worktree HEAD is
+    reachable from the branch, and the working tree equals HEAD.
+
+    Returns (ok, why).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(path), "status", "--ignored", "--porcelain", "-uall"],
+            capture_output=True, text=True,
+        )
+    except OSError as error:
+        return False, f"git status unavailable: {error}"
+    if out.returncode != 0:
+        return False, f"git status failed: {(out.stderr or out.stdout).strip()[:200]}"
+    if out.stdout.strip():
+        return False, "uncommitted or ignored paths present"
+    head = wt.head(path, "HEAD")
+    if head is None:
+        # An empty task worktree with no commit yet: nothing to lose beyond the
+        # worktree plumbing. Refuse removal anyway; the original brief aborted
+        # before the implementer committed, and someone may have placed an
+        # untracked scratch file that `git status --ignored` would have shown.
+        return False, "no HEAD commit in worktree"
+    branch = wt.git(path, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+    if not branch:
+        return False, "detached HEAD"
+    if wt.head(path, branch) != head:
+        return False, "worktree HEAD is not the branch head"
+    tree_head = wt.tree_of(path, head)
+    tree_wt = wt.git(path, "write-tree")
+    if tree_head != tree_wt:
+        return False, "working tree differs from HEAD"
+    return True, "clean and committed"
+
+
+def reclaim_worktrees(repo: Path | None, run_dir: Path, report: OrphanReport) -> None:
+    """Remove task worktrees that are clean against their branch (2.3).
+
+    Each orphan lives at `run_dir / "worktrees" / <task>`. Removal calls into
+    `wt.remove_worktree`, which uses `git worktree remove` and never `rm -rf`.
+    """
+    if repo is None or not (Path(repo) / ".git").exists():
+        report.notes.append("no repository to verify against; no worktree removed")
+        return
+    root = Path(run_dir) / "worktrees"
+    if not root.is_dir():
+        return
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        if not (child / ".git").exists():
+            report.worktrees_kept.append({"path": str(child), "reason": "not a git worktree"})
+            continue
+        ok, why = _worktree_contents_committed(Path(repo), child)
+        if not ok:
+            report.worktrees_kept.append({"path": str(child), "reason": why})
+            continue
+        try:
+            wt.remove_worktree(Path(repo), child)
+            if child.exists():
+                report.worktrees_kept.append({"path": str(child), "reason": "git worktree remove left files"})
+            else:
+                report.worktrees_removed.append(str(child))
+        except Exception as error:
+            report.worktrees_kept.append({"path": str(child), "reason": f"{type(error).__name__}: {error}"})
+
+
+# ---- GATE jobs (2.4) -------------------------------------------------------------
+
+
+def _gateids_from_state(record: dict | None) -> list[str]:
+    if not isinstance(record, dict):
+        return []
+    raw = record.get("gate_jobs") or []
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if isinstance(item, (str, int))]
+
+
+def reclaim_gate_jobs(gate_ids: list[str], report: OrphanReport, *, gatectl_path: str | None = None) -> None:
+    """Stop each recorded GATE job through `gatectl stop`, never directly (2.4)."""
+    if not gate_ids:
+        return
+    binary = gatectl_path or shutil.which("gatectl")
+    if binary is None:
+        for gid in gate_ids:
+            report.gate_jobs_kept.append({"id": gid, "reason": "gatectl not on PATH"})
+        return
+    for gid in gate_ids:
+        proc = subprocess.run([binary, "stop", str(gid)], capture_output=True, text=True)
+        if proc.returncode == 0:
+            report.gate_jobs_stopped.append(gid)
+        else:
+            report.gate_jobs_kept.append({"id": gid,
+                                          "reason": f"gatectl stop rc={proc.returncode}: {(proc.stderr or proc.stdout).strip()[:200]}"})
+
+
+# ---- the orchestrator (1.3, 2.1, 2.5) ---------------------------------------------
+
+
+def _state_read(run_dir: Path) -> dict:
+    """Read lightweight fields I need from the run's store, without opening it.
+
+    The store is a SQLite file opened by the runtime; this pass needs only the
+    run id (already known), the target repo, and any recorded GATE job ids. Use
+    the saved initial-state JSON if present, else walk `control.json` only.
+    """
+    state_path = Path(run_dir) / "initial-state.json"
+    if state_path.is_file():
+        try:
+            return json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def write_resume_record(run_dir: Path, report: OrphanReport) -> Path:
+    path = Path(run_dir) / "resume-record.json"
+    path.write_text(json.dumps(report.as_dict(), indent=2) + "\n")
+    return path
+
+
+def orphaned(run_id: str, run_dir: Path, *, target_repo: Path | None = None,
+             gate_ids: list[str] | None = None, gatectl_path: str | None = None) -> OrphanReport:
+    """Reclaim every orphan of the run. Idempotent (1.3): a second pass finds
+    nothing to reclaim. Never raises (2.5): every failure is recorded in the
+    report and the caller continues.
+    """
+    report = OrphanReport()
+    original_pid = control_pid(Path(run_dir))
+    if pid_alive(original_pid):
+        report.notes.append(f"run {run_id} is still live at pid {original_pid}; nothing reclaimed")
+        return report
+    try:
+        reclaim_tmux(run_id, original_pid, report)
+    except Exception as error:
+        report.notes.append(f"tmux reclaim failed: {type(error).__name__}: {error}")
+    try:
+        reclaim_worktrees(target_repo, Path(run_dir), report)
+    except Exception as error:
+        report.notes.append(f"worktree reclaim failed: {type(error).__name__}: {error}")
+    try:
+        reclaim_gate_jobs(gate_ids or [], report, gatectl_path=gatectl_path)
+    except Exception as error:
+        report.notes.append(f"gate reclaim failed: {type(error).__name__}: {error}")
+    return report
