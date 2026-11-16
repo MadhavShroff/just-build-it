@@ -92,20 +92,27 @@ class CIAdapter:
             raise CIAdapterError(f"cannot determine PR number for {branch}: {created}") from error
 
     def mark_ready(self, repo: Path, pr_number: int, head_sha: str) -> dict[str, Any]:
-        out = self._exec(["illm", "--json", "ci", "ready", str(pr_number), "--head", head_sha], repo)
+        return self._illm_ci(repo, "ready", pr_number, head_sha)
+
+    def submit(self, repo: Path, pr_number: int, head_sha: str) -> dict[str, Any]:
+        return self._illm_ci(repo, "submit", pr_number, head_sha)
+
+    def _illm_ci(self, repo: Path, verb: str, pr_number: int, head_sha: str) -> dict[str, Any]:
+        out = self._exec(["illm", "--json", "ci", verb, str(pr_number), "--head", head_sha], repo)
         try:
             reply = json.loads(out) if out else {}
         except ValueError as error:
-            raise CIAdapterError(f"illm ci ready returned invalid JSON: {out[:200]}") from error
+            raise CIAdapterError(f"illm ci {verb} returned invalid JSON: {out[:200]}") from error
         if not isinstance(reply, dict):
-            raise CIAdapterError("illm ci ready returned a non-object JSON payload")
+            raise CIAdapterError(f"illm ci {verb} returned a non-object JSON payload")
         status = reply.get("status")
         if status in ("refused", "failed", "need"):
             reason = reply.get("text") or reply.get("reason") or reply.get("error") or status
-            raise CIAdapterError(f"illm ci ready {status}: {reason}")
+            raise CIAdapterError(f"illm ci {verb} {status}: {reason}")
         return reply
 
-    def handover(self, repo: Path, task: dict[str, Any], *, base: str = wt.MAIN) -> HandoverResult:
+    def handover(self, repo: Path, task: dict[str, Any], *, base: str = wt.MAIN,
+                 verb: str = "ready") -> HandoverResult:
         tid = task["id"]
         branch = task.get("branch") or f"jbi/{tid}"
         head_sha = wt.head(repo, branch) or task.get("commit")
@@ -115,7 +122,7 @@ class CIAdapter:
         title = task.get("title") or tid
         body = task.get("goal") or title
         pr_number = self.find_or_create_draft_pr(repo, branch=branch, base=base, title=title, body=body)
-        reply = self.mark_ready(repo, pr_number, head_sha)
+        reply = self.submit(repo, pr_number, head_sha) if verb == "submit" else self.mark_ready(repo, pr_number, head_sha)
         return HandoverResult(task=tid, branch=branch, pr_number=pr_number, head_sha=head_sha, reply=reply)
 
 

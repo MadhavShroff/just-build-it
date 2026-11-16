@@ -37,6 +37,23 @@ PIPELINES: dict[str, tuple[Stage, ...]] = {
                      ("merge", "merge", "Train merge")),
 }
 
+# FOUNDER RULE 2026-11-16: every review step runs FOUR reviews in parallel.
+# One on the model the cascade service names as active, and three independent
+# DeepSeek agents. The three are not coordinated with each other or with the
+# first. DeepSeek credits are near-unlimited, so the extra reads cost nothing
+# that matters. This is not a per-task choice and not a rigor-level option.
+REVIEW_FANOUT = 4
+REVIEW_DEEPSEEK_COUNT = 3
+REVIEW_CASCADE_STAGE = "review-cascade"
+REVIEW_DEEPSEEK_STAGES = ("review-ds-1", "review-ds-2", "review-ds-3")
+
+
+def review_stages() -> tuple[Stage, ...]:
+    """The four review stages every review step runs, in parallel."""
+    return (Stage(REVIEW_CASCADE_STAGE, "review", "Review (cascade model)"),
+            *(Stage(name, "review", f"Review (DeepSeek {i})")
+              for i, name in enumerate(REVIEW_DEEPSEEK_STAGES, start=1)))
+
 LEVELS: dict[str, dict] = {
     "vibe": {"label": "Vibe coder", "summary": "Builds the features. No tests, reviews or scans.",
              "lane_checks": ()},

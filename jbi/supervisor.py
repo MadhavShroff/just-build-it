@@ -321,6 +321,7 @@ class Supervisor:
                                                 "detail": detail[:2000], "model": model}}), {"task": tid})
             if ok:
                 if stage.role == "merge":
+                    self._progress()
                     return
                 stage_name, findings = stage.name, []
                 if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
@@ -465,7 +466,12 @@ class Supervisor:
             if number not in self._waves_done and all(plan["tasks"][t]["status"] == "merged" for t in wave):
                 self._waves_done.add(number)
                 self.hooks.wave_completed(number)
-        if not self._all_merged and all(t["status"] == "merged" for t in plan["tasks"].values()):
+        # A task's status turns "merged" inside the lane callback, before the task
+        # thread commits the merge stage record. Firing all_merged on status alone
+        # lets a reader see a merged task with no merge stage. Require the record.
+        if not self._all_merged and all(
+                t["status"] == "merged" and "merge" in (t.get("stages") or {})
+                for t in plan["tasks"].values()):
             self._all_merged = True
             self.hooks.all_merged()
 

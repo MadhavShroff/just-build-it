@@ -657,6 +657,83 @@ class ReviewFindings(unittest.TestCase):
         self.assertIn("file:///tmp/ev/result.json", second_brief)
         self.assertIn("412: FAIL src/auth/authority.spec.ts", second_brief)
 
+    def test_12_ceremony_runs_full_9_step_loop_rebriefs_same_window_and_takes_next_task(self):
+        from jbi import briefs
+        from jbi.ceremony import CeremonyReceipt, TaskLedger, WindowPool, run_ceremony
+        repo = self.tmp / "ceremony_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+        t1 = task("a", owns=["src/a.py"])
+        t2 = task("b", deps=["a"], owns=["src/b.py"])
+        sup, store, hooks = self.supervisor(repo, [t1, t2])
+        pool = WindowPool(sup.run_dir / "window_pool.json", windows=("work1",))
+        ledger = TaskLedger(sup.run_dir / "task_ledger.jsonl")
+        commands: list[list[str]] = []
+        busy_snapshots: list[dict] = []
+
+        def fake_runner(argv, cwd):
+            commands.append(list(argv))
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                pr = "901\n" if "jbi/a" in argv else "902\n"
+                return subprocess.CompletedProcess(argv, 0, pr, "")
+            if argv[:4] == ["illm", "--json", "ci", "submit"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
+            return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+        def wait_receipt(window, tid, attempt, receipt_file):
+            busy_snapshots.append(pool.get(window))
+            worktree = sup.run_dir / "worktrees" / tid
+            (worktree / "src").mkdir(exist_ok=True)
+            (worktree / "src" / f"{tid}.py").write_text(f"attempt = {attempt}\n")
+            return CeremonyReceipt(task=tid, sha="uncommitted", passed=True, findings=[], tokens=500)
+
+        def wait_ci_notice(tid, pr_number, head_sha, attempt):
+            # Fail 5 times on task 'a' (> rigor.DECISION_AFTER = 4) to prove no decision card opens.
+            if tid == "a" and attempt < 5:
+                return {
+                    "schema": "illm.ci.failure.v1",
+                    "job_id": f"job-{attempt}",
+                    "pr_number": pr_number,
+                    "head_sha": head_sha,
+                    "verdict": "red",
+                    "failed_gates": ["unit"],
+                    "evidence_url": f"file:///tmp/ev/{attempt}.json",
+                    "first_failure_excerpt": f"failure on attempt {attempt}",
+                    "retry_allowed": True,
+                }
+            return {"pr_number": pr_number, "head_sha": head_sha, "verdict": "green", "merge_sha": head_sha}
+
+        outcome = run_ceremony(
+            t1, next_tasks=[t2], pool=pool, ledger=ledger, repo=repo, run_dir=sup.run_dir,
+            store=store, runner=fake_runner, wait_receipt=wait_receipt, wait_ci_notice=wait_ci_notice,
+        )
+        self.assertEqual(len(outcome), 2)
+        self.assertEqual((outcome[0].task, outcome[0].window, outcome[0].pr_number, outcome[0].attempts, outcome[0].tokens),
+                         ("a", "work1", 901, 6, 3000))
+        self.assertEqual((outcome[1].task, outcome[1].window, outcome[1].pr_number, outcome[1].attempts, outcome[1].tokens),
+                         ("b", "work1", 902, 1, 500))
+        self.assertTrue(all(s["status"] == "busy" for s in busy_snapshots))
+        self.assertEqual(pool.get("work1")["status"], "free")
+        self.assertEqual(store.read("/decisions"), {}, "ceremony must never open a decision card")
+        self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
+        self.assertEqual(store.read("/plan/tasks/b/status"), "merged")
+        ticket_starts = [c for c in commands if c[:2] == ["ticket", "start"]]
+        sb_rebriefs = [c for c in commands if c[:2] == ["sb", "send"]]
+        ci_submits = [c for c in commands if c[:4] == ["illm", "--json", "ci", "submit"]]
+        self.assertEqual(len(ticket_starts), 2)
+        self.assertEqual(len(sb_rebriefs), 5)
+        self.assertTrue(all(c[2] == "work1" for c in sb_rebriefs), "must re-brief the SAME window")
+        self.assertEqual(len(ci_submits), 7)
+        rebrief_text = briefs.brief_path(sup.run_dir, "a", "implement", 5).read_text()
+        self.assertIn("job-4", rebrief_text)
+        self.assertIn("failure on attempt 4", rebrief_text)
+        entries = ledger.entries()
+        self.assertEqual([e["task"] for e in entries], ["a", "b"])
+        self.assertEqual([e["tokens"] for e in entries], [3000, 500])
+
 
 if __name__ == "__main__":
     unittest.main()
