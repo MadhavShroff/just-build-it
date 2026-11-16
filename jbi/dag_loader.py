@@ -1,216 +1,89 @@
-"""Typed DAG loader for restricted-YAML wave files and `.planning/.../dag.json` files.
+"""Typed DAG loader backed by `/home/madhavshroff/src/devloop-cli/wave-compiler`.
 
-Reads either the restricted YAML format that `devloop-cli/wave-compiler` accepts or a
-JSON task DAG (`.planning/.../dag.json`), validates task identifiers, dependencies,
-cycles, owned paths, and explicit wave groups, and emits the plan structure that
-`jbi.waves` compiles.
+Imports the canonical `wave-compiler` module as a library instead of duplicating its
+restricted-YAML parser, schema validator, or Kahn cycle detector, and also normalizes
+`.planning/.../dag.json` files through the same validator before emitting a `jbi.waves`
+plan dictionary.
 """
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
-import re
+import os
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from . import waves
-from .protocol import TASK_ID, ProtocolError
+from .protocol import ProtocolError
 
-KIND: dict[str, str] = {k: "str" for k in ("project", "repo", "mode", "waves", "id", "title", "goal", "acceptance")}
-KIND.update(deps="list", owns="list", components="list", wave_groups="any")
-TASK_REQ = ("id", "title", "goal", "deps", "acceptance")
-KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
-ID_RE = TASK_ID
+WAVE_COMPILER_PATH = Path(
+    os.environ.get("JBI_WAVE_COMPILER", "/home/madhavshroff/src/devloop-cli/wave-compiler")
+)
 
 
-class Invalid(ProtocolError):
+def _load_wave_compiler(path: Path = WAVE_COMPILER_PATH) -> ModuleType:
+    loader = importlib.machinery.SourceFileLoader("wave_compiler", str(path))
+    spec = importlib.util.spec_from_loader("wave_compiler", loader)
+    if spec is None:
+        raise RuntimeError(f"Cannot load wave-compiler from {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+wave_compiler = _load_wave_compiler()
+
+
+class Invalid(ProtocolError, wave_compiler.Invalid):
     """A malformed or contradictory DAG file."""
 
     def __init__(self, message: str, **details: Any):
-        super().__init__("conflict", message, **details)
+        ProtocolError.__init__(self, "conflict", message, **details)
+        wave_compiler.Invalid.__init__(self, message)
 
 
-def _bad(line: int, msg: str) -> None:
-    raise Invalid(f"line {line}: {msg}")
-
-
-def _assign(target: dict[str, Any], key: str, rest: str, line: int) -> None:
-    if key in target:
-        _bad(line, f"duplicate field '{key}'")
-    if not rest or rest[0] not in '"[':
-        _bad(line, f"field '{key}' must be a JSON-quoted string or a JSON flow list")
-    try:
-        value, end = json.JSONDecoder().raw_decode(rest)
-    except ValueError:
-        _bad(line, "value is not valid restricted-YAML syntax")
-    if rest[end:].strip():
-        _bad(line, "value has trailing content on the line")
-    if KIND[key] == "str" and not isinstance(value, str):
-        _bad(line, f"field '{key}' must be one JSON-quoted string")
-    if KIND[key] == "list" and (not isinstance(value, list) or not all(isinstance(e, str) for e in value)):
-        _bad(line, f"field '{key}' must be a JSON flow list of strings")
-    target[key] = value
+def _wrap_invalid(exc: Exception) -> Invalid:
+    msg = str(exc)
+    if msg.startswith("dependency cycle: "):
+        cycle = [part.strip() for part in msg.removeprefix("dependency cycle: ").split("->")]
+        return Invalid(msg, cycle=cycle)
+    return Invalid(msg)
 
 
 def parse(text: str) -> dict[str, Any]:
-    """Parse restricted-YAML text per PRD-FORMAT.md."""
-    if "\t" in text:
-        raise Invalid("file contains a tab; use spaces")
-    doc: dict[str, Any] = {}
-    tasks: list[dict[str, Any]] = []
-    cur: dict[str, Any] | None = None
-    in_tasks = False
-    for n, raw in enumerate(text.split("\n"), 1):
-        stripped = raw.lstrip(" ")
-        indent = len(raw) - len(stripped)
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            _bad(n, "comments are not allowed")
-        if indent == 0:
-            cur, in_tasks = None, False
-            key, sep, rest = raw.partition(":")
-            if key == "tasks":
-                if rest.strip():
-                    _bad(n, "tasks must be a block sequence of task items")
-                if "tasks" in doc:
-                    _bad(n, "duplicate field 'tasks'")
-                doc["tasks"], in_tasks = "block", True
-            elif key in KIND and sep and KEY_RE.match(key):
-                _assign(doc, key, rest.strip(), n)
-            else:
-                _bad(n, f"unknown or malformed root field '{key}'")
-        elif indent == 4 or (indent == 2 and stripped.startswith("- ")):
-            if indent == 2:
-                if not in_tasks:
-                    _bad(n, "task item outside the tasks block")
-                cur = {}
-                tasks.append(cur)
-                stripped = stripped[2:]
-            elif cur is None:
-                _bad(n, "indented line outside a task item")
-            key, sep, rest = stripped.partition(":")
-            if not sep or not KEY_RE.match(key) or key not in KIND or key == "wave_groups":
-                _bad(n, f"unknown or malformed task field '{key}'")
-            _assign(cur, key, rest.strip(), n)
-        else:
-            _bad(n, "unexpected indentation")
-    doc["tasks"] = tasks
-    return doc
-
-
-def _validate_tasks_and_groups(tasks: list[dict[str, Any]], waves_mode: str,
-                               wave_groups: Any = None, has_wave_groups: bool = False) -> None:
-    if not tasks:
-        raise Invalid("supply at least one task")
-    ids = [t.get("id") if isinstance(t.get("id"), str) and t.get("id") else "?" for t in tasks]
-    seen = {i for i in ids if i != "?" and ids.count(i) > 1}
-    if seen:
-        raise Invalid(f"duplicate task id '{sorted(seen)[0]}'")
-    known = set(ids)
-    for task in tasks:
-        absent = [k for k in TASK_REQ if k not in task]
-        if absent:
-            raise Invalid(f"task '{task.get('id', '?')}' is missing field '{absent[0]}'")
-        for name in ("title", "goal", "acceptance"):
-            if not isinstance(task[name], str) or not task[name].strip():
-                raise Invalid(f"task '{task['id']}' field '{name}' must be non-empty")
-        if not isinstance(task["id"], str) or not ID_RE.match(task["id"]):
-            raise Invalid(f"invalid task id '{task['id']}'")
-        if not isinstance(task["deps"], list) or not all(isinstance(d, str) for d in task["deps"]):
-            raise Invalid(f"task '{task['id']}' field 'deps' must be a list of strings")
-        for dep in task["deps"]:
-            if dep == task["id"]:
-                raise Invalid(f"task '{dep}' depends on itself", cycle=[dep, dep])
-            if dep not in known:
-                raise Invalid(f"task '{task['id']}' depends on unknown task '{dep}'")
-        if len(set(task["deps"])) != len(task["deps"]):
-            raise Invalid(f"task '{task['id']}' repeats a dependency")
-        owns = task.setdefault("owns", [])
-        if not isinstance(owns, list) or not all(isinstance(p, str) for p in owns):
-            raise Invalid(f"task '{task['id']}' field 'owns' must be a list of strings")
-        for path in owns:
-            if not path or path[0] == "/" or "\\" in path or ".." in path.split("/"):
-                raise Invalid(f"task '{task['id']}' owns invalid path '{path}'")
-        if len(set(owns)) != len(owns):
-            raise Invalid(f"task '{task['id']}' repeats an owns path")
-        task.setdefault("components", [])
-    depmap = {t["id"]: t["deps"] for t in tasks}
-    if waves_mode == "explicit":
-        if not isinstance(wave_groups, list) or not wave_groups:
-            raise Invalid("wave_groups must be a flow list of non-empty identifier lists")
-        placed: dict[str, int] = {}
-        for num, group in enumerate(wave_groups, 1):
-            if not isinstance(group, list) or not group:
-                raise Invalid(f"wave group {num} must be a non-empty list of identifiers")
-            for tid in group:
-                if not isinstance(tid, str) or tid not in known:
-                    raise Invalid(f"wave group {num} holds unknown or invalid task '{tid}'")
-                if tid in placed:
-                    raise Invalid(f"task '{tid}' appears in groups {placed[tid]} and {num}")
-                placed[tid] = num
-        miss = [t for t in ids if t not in placed]
-        if miss:
-            raise Invalid(f"task '{miss[0]}' is missing from wave_groups")
-        for tid, num in placed.items():
-            late = [d for d in depmap[tid] if placed[d] >= num]
-            if late:
-                raise Invalid(f"task '{tid}' in group {num} needs '{late[0]}' in an earlier group")
-    elif has_wave_groups:
-        raise Invalid("waves 'auto' must not supply wave_groups")
+    """Parse restricted-YAML text by calling `wave_compiler.parse`."""
+    try:
+        return wave_compiler.parse(text)
+    except wave_compiler.Invalid as exc:
+        raise _wrap_invalid(exc) from exc
 
 
 def validate(doc: dict[str, Any]) -> dict[str, Any]:
-    """Validate a parsed restricted-YAML document and verify it is acyclic."""
-    for key in ("project", "repo", "mode", "waves"):
-        if not isinstance(doc.get(key), str) or not doc[key].strip():
-            raise Invalid(f"root field '{key}' must be a non-empty string")
-    if doc["mode"] not in ("new", "existing"):
-        raise Invalid("mode must be 'new' or 'existing'")
-    if doc["waves"] not in ("auto", "explicit"):
-        raise Invalid("waves must be 'auto' or 'explicit'")
-    tasks = doc.get("tasks")
-    if not isinstance(tasks, list):
-        raise Invalid("supply at least one task")
-    _validate_tasks_and_groups(tasks, doc["waves"], doc.get("wave_groups"), "wave_groups" in doc)
-    kahn(tasks)
-    return doc
+    """Validate a parsed DAG document and verify it is acyclic via `wave_compiler`."""
+    try:
+        validated = wave_compiler.validate(doc)
+        wave_compiler.kahn(validated["tasks"])
+    except wave_compiler.Invalid as exc:
+        raise _wrap_invalid(exc) from exc
+    for task in validated["tasks"]:
+        task.setdefault("components", [])
+    return validated
 
 
 def kahn(tasks: list[dict[str, Any]]) -> tuple[dict[str, int], list[str]]:
-    """Compute Kahn topological levels in task order, or raise Invalid naming a closed cycle."""
-    order = [t["id"] for t in tasks]
-    dependents: dict[str, list[str]] = {t: [] for t in order}
-    waiting = {t["id"]: len(t["deps"]) for t in tasks}
-    for task in tasks:
-        for dep in task["deps"]:
-            dependents[dep].append(task["id"])
-    level = {t: 0 for t in order if not waiting[t]}
-    queue, head = list(level), 0
-    while head < len(queue):
-        for tid in dependents[queue[head]]:
-            level[tid] = max(level.get(tid, 0), level[queue[head]] + 1)
-            waiting[tid] -= 1
-            if not waiting[tid]:
-                queue.append(tid)
-        head += 1
-    if len(level) == len(order):
-        return level, order
-    rest = set(order) - set(level)
-    pos = {t: i for i, t in enumerate(order)}
-    deps = {t["id"]: [d for d in t["deps"] if d in rest] for t in tasks if t["id"] in rest}
-    path, shut = [min(rest, key=pos.get)], set()
-    while path:
-        hit = next((d for d in deps[path[-1]] if d in path), None)
-        if hit:
-            cycle = path[path.index(hit):] + [hit]
-            raise Invalid("dependency cycle: " + " -> ".join(cycle), cycle=cycle)
-        fresh = next((d for d in deps[path[-1]] if d not in shut), None)
-        if fresh is None:
-            shut.add(path.pop())
-        else:
-            path.append(fresh)
-    raise Invalid("dependency cycle")
+    """Compute Kahn topological levels in task order via `wave_compiler.kahn`."""
+    try:
+        return wave_compiler.kahn(tasks)
+    except wave_compiler.Invalid as exc:
+        raise _wrap_invalid(exc) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the `wave-compiler` CLI entry point directly."""
+    return int(wave_compiler.main(argv))
 
 
 def _normalize_json_node(node: Any) -> dict[str, Any]:
@@ -235,7 +108,7 @@ def _normalize_json_node(node: Any) -> dict[str, Any]:
 
 
 def parse_dag_json(text: str) -> dict[str, Any]:
-    """Parse and validate a `.planning/.../dag.json` document."""
+    """Parse a `.planning/.../dag.json` document and validate it with `wave_compiler`."""
     try:
         raw = json.loads(text)
     except ValueError as error:
@@ -253,13 +126,6 @@ def parse_dag_json(text: str) -> dict[str, Any]:
     tasks = [_normalize_json_node(item) for item in items]
     explicit_waves = raw.get("wave_groups") if "wave_groups" in raw else raw.get("waves")
     waves_mode = "explicit" if isinstance(explicit_waves, list) else "auto"
-    _validate_tasks_and_groups(
-        tasks,
-        waves_mode,
-        explicit_waves if waves_mode == "explicit" else None,
-        False,
-    )
-    kahn(tasks)
     doc: dict[str, Any] = {
         "project": str(raw.get("project") or raw.get("name") or "dag"),
         "repo": str(raw.get("repo") or raw.get("target") or "."),
@@ -269,7 +135,7 @@ def parse_dag_json(text: str) -> dict[str, Any]:
     }
     if waves_mode == "explicit":
         doc["wave_groups"] = [list(g) for g in explicit_waves]
-    return doc
+    return validate(doc)
 
 
 def _read_source(source: str | Path) -> tuple[str, bool]:
