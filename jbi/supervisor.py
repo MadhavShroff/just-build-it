@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, briefs, models, rigor, waves, worktrees as wt
+from . import agents, briefs, ci_adapter as ci_mod, models, rigor, waves, worktrees as wt
 from .contracts import Hooks
 from .lanes import Lanes, MergeJob
 from .shim import Groups, alive, process_start, run_command
@@ -38,6 +38,7 @@ class Tmux:
         self.parent_pid = parent_pid or os.getpid()
         self.available = shutil.which("tmux") is not None
         self._started = False
+        self._start_lock = threading.Lock()
 
     def _run(self, *args: str) -> subprocess.CompletedProcess:
         env = {**agents.runtime_env(), "PYTHONPATH": str(agents.PACKAGE_ROOT)}
@@ -45,17 +46,23 @@ class Tmux:
                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
     def window(self, name: str, argv: list[str]) -> str | None:
-        """Open a detached window running `argv`. Returns the window name, or None without tmux."""
+        """Open a detached window running `argv`. Returns the window name, or None without tmux.
+
+        The four reviews of one task call this at the same time (founder rule
+        2026-11-16), so the first-window setup is guarded: two threads that both
+        saw `_started` false would both run `new-session`, and the second fails.
+        """
         if not self.available:
             return None
-        if not self._started:
-            # The control window keeps the server open while the CLI lives, then ends the
-            # server, so a CLI that dies without cleanup still leaves no tmux server behind.
-            watch = (f"while kill -0 {self.parent_pid} 2>/dev/null; do sleep 1; done; "
-                     f"tmux -L {self.socket} kill-server; rm -f {self._socket_path()}")
-            self._run("new-session", "-d", "-s", "jbi", "-n", "control", "-x", "200", "-y", "50",
-                      "--", "sh", "-c", watch)
-            self._started = True
+        with self._start_lock:
+            if not self._started:
+                # The control window keeps the server open while the CLI lives, then ends the
+                # server, so a CLI that dies without cleanup still leaves no tmux server behind.
+                watch = (f"while kill -0 {self.parent_pid} 2>/dev/null; do sleep 1; done; "
+                         f"tmux -L {self.socket} kill-server; rm -f {self._socket_path()}")
+                self._run("new-session", "-d", "-s", "jbi", "-n", "control", "-x", "200", "-y", "50",
+                          "--", "sh", "-c", watch)
+                self._started = True
         result = self._run("new-window", "-d", "-t", "jbi:", "-n", name, "--", *argv)
         return name if result.returncode == 0 else None
 
@@ -92,12 +99,15 @@ class Session:
 
 class Supervisor:
     def __init__(self, store: Store, hooks: Hooks, run_dir: Path, repo: Path | None = None, *,
-                 parent_pid: int | None = None, use_tmux: bool = True):
+                 parent_pid: int | None = None, use_tmux: bool = True,
+                 ci_service: str | None = None, ci_adapter: ci_mod.CIAdapter | None = None):
         """`repo` pins the repository for tests. A real run leaves it None: the repository is
         always `state.run.target`, which the user can change until bootstrap starts."""
         self.store, self.hooks = store, hooks
         self.run_dir, self._repo = Path(run_dir), Path(repo) if repo else None
         self.parent_pid = parent_pid or os.getpid()
+        self.ci_service = ci_service or store.read("/config/ci_service") or "local"
+        self.ci_adapter = ci_adapter or ci_mod.CIAdapter()
         run_id = store.read("/run/id")
         self.tmux = Tmux(f"jbi-{run_id}", self.run_dir, self.parent_pid)
         self.tmux.available = self.tmux.available and use_tmux
@@ -112,6 +122,7 @@ class Supervisor:
         self._running: dict[str, threading.Thread] = {}
         self._merge_done: dict[str, threading.Event] = {}
         self._merge_ok: dict[str, bool] = {}
+        self._merge_notes: dict[str, list[str]] = {}
         self._waves_done: set[int] = set()
         self._all_merged = False
         self._scheduler: threading.Thread | None = None
@@ -311,14 +322,20 @@ class Supervisor:
             ok, detail, model = self._run_stage(task, stage, level, worktree, findings)
             if self._stopping in ("quit", "kill", "standdown"):
                 return
-            self.store.commit("task.stage", Changes()
-                              .set("plan", "tasks", tid, "stages", {**(task.get("stages") or {}),
-                                   stage.name: {"status": "passed" if ok else "failed",
-                                                "detail": detail[:2000], "model": model}}), {"task": tid})
+            if stage.name != rigor.REVIEW_CASCADE_STAGE:
+                self.store.commit("task.stage", Changes()
+                                  .set("plan", "tasks", tid, "stages", {**(task.get("stages") or {}),
+                                       stage.name: {"status": "passed" if ok else "failed",
+                                                    "detail": detail[:2000], "model": model}}), {"task": tid})
             if ok:
                 if stage.role == "merge":
+                    self._progress()
                     return
+                # The four reviews run together inside the cascade stage, so the
+                # loop must skip past the three DeepSeek stages it already ran.
                 stage_name, findings = stage.name, []
+                if stage.name == rigor.REVIEW_CASCADE_STAGE:
+                    stage_name = rigor.REVIEW_DEEPSEEK_STAGES[-1]
                 if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
                     self._task_update(tid, resume_after=stage_name)
                     return
@@ -350,11 +367,63 @@ class Supervisor:
             code, out = result.returncode, result.output
             return code == 0, f"exit {'timeout' if code is None else code}\n{out[-2000:]}", None
         if stage.role == "merge":
-            return self._merge(tid, level, worktree), "merged", None
+            ok = self._merge(tid, level, worktree)
+            notes = self._merge_notes.pop(tid, None)
+            return ok, "merged" if ok else ("\n".join(notes) if notes else "merge failed"), None
+        if stage.name == rigor.REVIEW_CASCADE_STAGE:
+            return self._review_fanout(task, worktree, findings)
         return self._agent_stage(task, stage, worktree, findings)
 
+    def _review_fanout(self, task: dict, worktree: Path,
+                       findings: list[str]) -> tuple[bool, str, str | None]:
+        """FOUNDER RULE 2026-11-16: run the four reviews at the same time.
+
+        One review on the model the cascade service names as active, and three
+        independent DeepSeek agents. The three are not coordinated with each
+        other or with the first. Every review must pass; the findings of every
+        failing review are returned together, so the implementer sees all four
+        reads at once.
+        """
+        stages = rigor.review_stages()
+        results: dict[str, tuple[bool, str, str | None]] = {}
+        lock = threading.Lock()
+
+        def one(stage: rigor.Stage) -> None:
+            try:
+                got = self._agent_stage(task, stage, worktree, findings, discard=False)
+            except Exception as error:          # one review failing never hides the others
+                got = (False, f"{type(error).__name__}: {error}", None)
+            with lock:
+                results[stage.name] = got
+
+        threads = [threading.Thread(target=one, args=(s,), name=f"jbi-{task['id']}-{s.name}",
+                                    daemon=True) for s in stages]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wt.discard_changes(worktree)
+        ordered = [results.get(s.name, (False, "review did not report", None)) for s in stages]
+        if self._stopping not in ("quit", "kill", "standdown"):
+            tid = task["id"]
+            recorded = dict(self.store.read(f"/plan/tasks/{tid}/stages") or {})
+            for s, (s_ok, s_detail, s_model) in zip(stages, ordered):
+                recorded[s.name] = {
+                    "status": "passed" if s_ok else "failed",
+                    "detail": s_detail[:2000],
+                    "model": s_model,
+                }
+            self.store.commit("task.stage", Changes().set("plan", "tasks", tid, "stages", recorded),
+                              {"task": tid})
+        passed = all(ok for ok, _detail, _model in ordered)
+        detail = "\n".join(
+            "%s: %s" % (s.name, d) for s, (ok, d, _m) in zip(stages, ordered) if not ok
+        ) or "all four reviews passed"
+        models = ",".join(sorted({m for _ok, _d, m in ordered if m}))
+        return passed, detail, models or None
+
     def _agent_stage(self, task: dict, stage: rigor.Stage, worktree: Path,
-                     findings: list[str]) -> tuple[bool, str, str | None]:
+                     findings: list[str], *, discard: bool = True) -> tuple[bool, str, str | None]:
         tid, attempt = task["id"], task.get("attempts", 0)
         state = self.store.snapshot()[1]
         choice = models.select(state, stage.role, task=task, attempts=attempt)
@@ -368,9 +437,15 @@ class Supervisor:
             return False, f"stopped by {self._stopping}", choice.model
         result = briefs.parse_receipt(receipt)
         if stage.role == "implement":
+            owns = task.get("owns") or []
+            if owns:
+                unowned = [p for p in wt.dirty_paths(worktree) if not wt.path_owned(p, owns)]
+                if unowned:
+                    wt.discard_changes(worktree)
+                    return False, f"modified unowned path {', '.join(unowned)}", choice.model
             sha = wt.commit_all(worktree, f"{tid}: implement attempt {attempt + 1}")
             self._task_update(tid, commit=sha or wt.head(worktree, "HEAD"), receipt=str(receipt))
-        else:
+        elif discard:
             wt.discard_changes(worktree)        # verifiers and reviewers never edit code
         if result is None:
             return False, f"no valid receipt (exit {session.status.get('exit_code')})", choice.model
@@ -379,9 +454,34 @@ class Supervisor:
     # ---- merging ---------------------------------------------------------------------
 
     def _merge(self, tid: str, level: str, worktree: Path) -> bool:
+        if self.store.read("/config/dry_run"):
+            # A dry run rehearses the landing path and never takes it. Report what
+            # the merge would do, so the rehearsal proves the pipeline end to end.
+            task = self.store.read(f"/plan/tasks/{tid}") or {}
+            head = task.get("commit") or wt.head(worktree, "HEAD") or ""
+            self.store.log("lane", f"DRY RUN: {tid} would hand {head[:10]} to the CI service "
+                                   f"({self.store.read('/config/ci_service') or self.ci_service}) "
+                                   f"and merge on green. Nothing was pushed and nothing merged.",
+                           task=tid)
+            self._task_update(tid, status="merged", commit=head, dry_run=True)
+            return True
         done = threading.Event()
         self._merge_done[tid] = done
-        self.lanes.submit(MergeJob(tid, f"jbi/{tid}", level, worktree))
+        service = self.store.read("/config/ci_service") or self.ci_service
+        if service == "illm":
+            task = self.store.read(f"/plan/tasks/{tid}")
+            try:
+                handover = self.ci_adapter.handover(self.repo, task, base=self.branch)
+            except ci_mod.CIAdapterError as error:
+                self._merge_failed(MergeJob(tid, f"jbi/{tid}", level, worktree), [str(error)])
+                return self._merge_ok.pop(tid, False)
+            self._task_update(tid, pr_number=handover.pr_number, commit=handover.head_sha)
+            if not done.is_set():
+                self._task_update(tid, status="merging")
+            self.store.log("lane", f"{tid} handed over to illm ci ready #{handover.pr_number} @ {handover.head_sha[:10]}",
+                           task=tid)
+        else:
+            self.lanes.submit(MergeJob(tid, f"jbi/{tid}", level, worktree))
         while not done.wait(0.2):
             if self._stopping in ("quit", "kill", "standdown"):
                 return False
@@ -396,14 +496,31 @@ class Supervisor:
             patch = None
         self.hooks.task_merged(job.task, sha, patch)
         self._merge_ok[job.task] = True
-        self._merge_done[job.task].set()
+        if job.task in self._merge_done:
+            self._merge_done[job.task].set()
         self._progress()
         self.wake()
 
     def _merge_failed(self, job: MergeJob, notes: list[str]) -> None:
         self._merge_ok[job.task] = False
+        self._merge_notes[job.task] = list(notes)
         self.store.log("lane", f"{job.task} failed in a lane: {notes[0] if notes else ''}", task=job.task)
-        self._merge_done[job.task].set()
+        if job.task in self._merge_done:
+            self._merge_done[job.task].set()
+
+    def ci_notice(self, tid: str, notice: dict) -> None:
+        verdict = notice.get("verdict")
+        worktree = self.run_dir / "worktrees" / tid
+        level = self.store.read("/config/rigor") or "high"
+        job = MergeJob(tid, f"jbi/{tid}", level, worktree)
+        if verdict in ("green", "merged"):
+            sha = str(notice.get("merge_sha") or notice.get("head_sha")
+                      or self.store.read(f"/plan/tasks/{tid}/commit") or "")
+            self._merged(job, sha)
+            return
+        findings = ci_mod.format_failure_findings(notice)
+        self._task_update(tid, findings=findings)
+        self._merge_failed(job, findings)
 
     def _block_dependents(self, skipped: str) -> None:
         plan = self.store.read("/plan")
@@ -422,7 +539,12 @@ class Supervisor:
             if number not in self._waves_done and all(plan["tasks"][t]["status"] == "merged" for t in wave):
                 self._waves_done.add(number)
                 self.hooks.wave_completed(number)
-        if not self._all_merged and all(t["status"] == "merged" for t in plan["tasks"].values()):
+        # A task's status turns "merged" inside the lane callback, before the task
+        # thread commits the merge stage record. Firing all_merged on status alone
+        # lets a reader see a merged task with no merge stage. Require the record.
+        if not self._all_merged and all(
+                t["status"] == "merged" and "merge" in (t.get("stages") or {})
+                for t in plan["tasks"].values()):
             self._all_merged = True
             self.hooks.all_merged()
 

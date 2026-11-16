@@ -54,6 +54,9 @@ class Runtime(Protocol):
     def control(self, task: str, action: str) -> None:
         """Apply `retry`, `pause` or `resume` to one task."""
 
+    def ci_notice(self, task: str, notice: dict) -> None:
+        """Deliver a structured CI verdict or failure notice to a waiting task."""
+
     def answer(self, decision: str, answer: str) -> None:
         """A decision that the runtime opened has an answer."""
 

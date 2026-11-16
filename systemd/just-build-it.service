@@ -1,0 +1,19 @@
+[Unit]
+Description=just-build-it: deterministic development scheduler and dashboard
+Documentation=file://@ROOT@/README.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=PATH=@HOME@/.local/bin:@HOME@/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=@HOME@
+Environment=PYTHONPATH=@ROOT@
+WorkingDirectory=@ROOT@
+ExecStart=/usr/bin/python3 -m jbi resume --if-exists --no-menu --no-tailscale
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:@HOME@/.local/state/just-build-it/unit.log
+StandardError=append:@HOME@/.local/state/just-build-it/unit.log
+
+[Install]
+WantedBy=default.target

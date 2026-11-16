@@ -12,6 +12,8 @@ import { mountBootstrap } from './bootstrap.js';
 import { mountConfigure } from './configure.js';
 import { mountBoard } from './board.js';
 import { mountTaskDrawer } from './task-drawer.js';
+import { mountMetrics } from './metrics.js';
+import { mountPreview } from './preview.js';
 
 const THEME_KEY = 'jbi-theme';
 
@@ -34,13 +36,59 @@ function main() {
   const splash = document.getElementById('splash');
   const splashText = document.getElementById('splash-text');
   const sections = [...document.querySelectorAll('.phase')];
+  const previewSection = document.getElementById('phase-preview');
+  const metricsSection = document.getElementById('phase-metrics');
+  let tasksRef = null;
+  const previewPage = mountPreview(ctx, previewSection, { onOpenTask: (id) => tasksRef?.open(id) });
+  const metricsPage = mountMetrics(ctx, metricsSection);
   let mounted = false;
+  // A reverse proxy may mount the dashboard under a prefix, so the overlay is
+  // read from the END of the path as well as the hash. /jbi/preview and
+  // /jbi/preview/#preview both open the preview.
+  const pathTail = (value) => (value || '').split('/').filter(Boolean).pop() || '';
+  const hashParts = (location.hash || '').replace(/^#/, '').split('&');
+  const wantsPreview = hashParts.includes('preview') || pathTail(location.pathname) === 'preview';
+  const wantsMetrics = hashParts.includes('metrics') || pathTail(location.pathname) === 'metrics';
+  let activeOverlay = wantsMetrics ? 'metrics' : wantsPreview ? 'preview' : null;
+
+  function syncSections() {
+    if (activeOverlay === 'metrics') {
+      splash.hidden = true;
+      for (const section of sections) section.hidden = section !== metricsSection;
+      metricsPage.refresh();
+      return;
+    }
+    if (activeOverlay === 'preview') {
+      splash.hidden = true;
+      for (const section of sections) section.hidden = section !== previewSection;
+      previewPage.refresh();
+      return;
+    }
+    if (!store.state?.run) return;
+    splash.hidden = true;
+    const phase = store.state.run.phase;
+    for (const section of sections) {
+      const show = section.dataset.phase.split(' ').includes(phase);
+      if (section.hidden === show) section.hidden = !show;
+    }
+    document.body.dataset.phase = phase;
+  }
+
+  function toggleOverlay(which) {
+    activeOverlay = activeOverlay === which ? null : which;
+    syncSections();
+  }
 
   function mountViews() {
     mounted = true;
+    if (!activeOverlay && store.state?.config?.preview) {
+      activeOverlay = 'preview';
+    }
     const accounts = mountAccounts(ctx);
     const header = mountHeader(ctx, {
       onAccounts: accounts.open,
+      onPreview: () => toggleOverlay('preview'),
+      onMetrics: () => toggleOverlay('metrics'),
       onTheme: () => {
         const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
         localStorage.setItem(THEME_KEY, next);
@@ -56,6 +104,7 @@ function main() {
     });
 
     const tasks = mountTaskDrawer(ctx);
+    tasksRef = tasks;
     const byId = (id) => document.getElementById(id);
     mountIntake(ctx, byId('phase-intake'));
     mountStack(ctx, byId('phase-stack'));
@@ -63,19 +112,18 @@ function main() {
     mountConfigure(ctx, byId('phase-configure'));
     mountBoard(ctx, byId('phase-board'), { onOpenTask: tasks.open });
 
-    store.subscribe(['run'], (state) => {
-      splash.hidden = true;
-      for (const section of sections) {
-        const show = section.dataset.phase.split(' ').includes(state.run.phase);
-        if (section.hidden === show) section.hidden = !show;
-      }
-      document.body.dataset.phase = state.run.phase;
+    store.subscribe(['run'], () => {
+      syncSections();
     });
+  }
+
+  if (activeOverlay) {
+    syncSections();
   }
 
   store.subscribe(['$connection'], () => {
     const value = store.local.connection;
-    if (value === 'unauthenticated') {
+    if (value === 'unauthenticated' && !activeOverlay) {
       splash.hidden = false;
       for (const section of sections) section.hidden = true;
       document.getElementById('run-name').textContent = 'Signed out';
@@ -90,6 +138,12 @@ function main() {
       queueMicrotask(stopWaiting);
     }
   });
+
+  // The preview is read-only and needs no session when the proxy publishes it.
+  // Read it directly, so a signed-out visitor still sees the graph.
+  if (activeOverlay === 'preview') {
+    previewPage.refresh();
+  }
 
   api.start();
 }

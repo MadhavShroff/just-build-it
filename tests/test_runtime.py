@@ -125,6 +125,25 @@ class Admission(RunFixture):
 
 
 class Runs(RunFixture):
+    def test_dry_run_rehearses_the_landing_path_and_merges_nothing(self):
+        """A dry run walks the whole pipeline and never lands anything.
+
+        The founder asked for an in-weight rehearsal: prove the app would work
+        in practice without taking the landing path. The merge stage must report
+        what it would do and leave the base branch untouched.
+        """
+        sup = self.make([task("a", owns=["src/a.txt"])], rigor="vibe")
+        self.store.commit("config", Changes().set("config", "dry_run", True), {})
+        base_before = wt.head(self.repo, "main")
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(60), self.store.read("/timeline"))
+        self.assertEqual(self.status("a"), "merged")
+        self.assertTrue(self.store.read("/plan/tasks/a/dry_run"))
+        # The base branch did not move: nothing was landed.
+        self.assertEqual(wt.head(self.repo, "main"), base_before)
+        log = " ".join(str(row) for row in (self.store.read("/timeline") or []))
+        self.assertIn("DRY RUN", log)
+
     def test_vibe_run_merges(self):
         sup = self.make([task("a", owns=["src/a.txt"]), task("b", deps=["a"])], rigor="vibe")
         sup.start_execution()
@@ -143,8 +162,15 @@ class Runs(RunFixture):
         sup.start_execution()
         self.assertTrue(self.hooks.merged_event.wait(90), self.store.read("/timeline"))
         stages = self.store.read("/plan/tasks/a/stages")
-        self.assertEqual(list(stages), ["implement", "acceptance", "verify", "review", "security", "merge"])
+        # FOUNDER RULE 2026-11-16: the review step is four reviews run together,
+        # followed by security, test-audit, methodology-audit, and dry-run before merge.
+        self.assertEqual(list(stages), ["implement", "acceptance", "verify",
+                                        "review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
+                                        "security", "test-audit", "methodology-audit", "dry-run", "merge"])
         self.assertTrue(all(s["status"] == "passed" for s in stages.values()))
+        for rname in ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
+                      "test-audit", "methodology-audit", "dry-run"):
+            self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result", "model": "sim-l"})
 
 
 class Failures(RunFixture):
@@ -533,6 +559,401 @@ class ReviewFindings(unittest.TestCase):
         sup.retry_bootstrap()
         self.assertTrue(wait_for(lambda: store.read("/bootstrap/status") == "failed"
                                  and hooks.calls.count(("bootstrap", False)) == 2, 10))
+
+    def test_9_diff_ownership_enforcement_discards_unowned_edits(self):
+        from jbi import briefs, rigor
+        repo = self.tmp / "own_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        base_sha = wt.commit_all(repo, "base")
+        t = task("a", owns=["src/owned.py"])
+        sup, store, hooks = self.supervisor(repo, [t])
+        worktree = wt.create_worktree(repo, "a", base_sha, sup.run_dir / "worktrees")
+
+        def bad_session(tid, role, cmd, cwd, provider, model, attempt):
+            (cwd / "src").mkdir(exist_ok=True)
+            (cwd / "src" / "owned.py").write_text("ok = True\n")
+            (cwd / "src" / "unowned.py").write_text("bad = True\n")
+            rec = briefs.receipt_path(sup.run_dir, tid, role, attempt)
+            rec.parent.mkdir(parents=True, exist_ok=True)
+            rec.write_text(f"BRIEF {tid} | uncommitted | PASS\ndone\n")
+            return type("S", (), {"status": {"exit_code": 0}})()
+
+        sup.run_session = bad_session
+        ok, detail, _ = sup._agent_stage(store.read("/plan/tasks/a"), rigor.pipeline("vibe")[0],
+                                         worktree, [])
+        self.assertFalse(ok)
+        self.assertIn("modified unowned path", detail)
+        self.assertIn("src/unowned.py", detail)
+        self.assertEqual(wt.dirty_paths(worktree), [])
+        self.assertEqual(wt.head(worktree, "HEAD"), base_sha)
+        self.assertFalse((worktree / "src" / "unowned.py").exists())
+
+    def test_10_external_ci_handover_pushes_creates_pr_and_calls_illm(self):
+        from jbi import ci_adapter as ci_mod
+        repo = self.tmp / "ci_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        base_sha = wt.commit_all(repo, "base")
+        t = task("a", owns=["src/a.py"])
+        sup, store, hooks = self.supervisor(repo, [t])
+        sup.ci_service = "illm"
+        worktree = wt.create_worktree(repo, "a", base_sha, sup.run_dir / "worktrees")
+        (worktree / "src").mkdir(exist_ok=True)
+        (worktree / "src" / "a.py").write_text("x = 1\n")
+        head_sha = wt.commit_all(worktree, "a: implement attempt 1")
+        sup._task_update("a", commit=head_sha)
+        calls: list[list[str]] = []
+
+        def fake_runner(argv, cwd):
+            calls.append(list(argv))
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(argv, 0, "https://github.com/org/repo/pull/812\n", "")
+            if argv[:4] == ["illm", "--json", "ci", "ready"]:
+                threading.Timer(0.05, lambda: sup._merged(MergeJob("a", "jbi/a", "vibe", worktree), head_sha)).start()
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued", "pr": 812}), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sup.ci_adapter = ci_mod.CIAdapter(runner=fake_runner)
+        ok = sup._merge("a", "vibe", worktree)
+        self.assertTrue(ok)
+        self.assertEqual(store.read("/plan/tasks/a/pr_number"), 812)
+        self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
+        self.assertTrue(any(c[:3] == ["gh", "pr", "create"] and "--draft" in c for c in calls))
+        self.assertIn(["illm", "--json", "ci", "ready", "812", "--head", head_sha], calls)
+
+    def test_11_ci_notice_failure_wakes_task_and_rebriefs_with_structured_findings(self):
+        from jbi import briefs, ci_adapter as ci_mod
+        from jbi.engine import Engine
+        repo = self.tmp / "notice_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+        t = task("a", owns=["src/a.txt"])
+        sup, store, hooks = self.supervisor(repo, [t])
+        store.commit("p", Changes().replace("run", "phase", "execute"))
+        sup.ci_service = "illm"
+        engine = Engine(store, completer=None, runtime=sup)
+        ready_calls = 0
+
+        def fake_runner(argv, cwd):
+            nonlocal ready_calls
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([{"number": 812}]) if ready_calls else "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(argv, 0, "812\n", "")
+            if argv[:4] == ["illm", "--json", "ci", "ready"]:
+                ready_calls += 1
+                sha = argv[6]
+                if ready_calls == 1:
+                    threading.Timer(0.05, lambda: engine.submit({
+                        "id": "n-1",
+                        "type": "ci.notice",
+                        "payload": {
+                            "schema": "illm.ci.failure.v1",
+                            "job_id": "20261116-183000-l0-gA",
+                            "pr_number": 812,
+                            "head_sha": sha,
+                            "verdict": "red",
+                            "failed_gates": ["backend-unit", "authority"],
+                            "evidence_url": "file:///tmp/ev/result.json",
+                            "first_failure_excerpt": "412: FAIL src/auth/authority.spec.ts",
+                            "retry_allowed": True,
+                        },
+                    })).start()
+                else:
+                    threading.Timer(0.05, lambda: engine.submit({
+                        "id": "n-2",
+                        "type": "ci.notice",
+                        "payload": {"pr_number": 812, "head_sha": sha, "verdict": "merged", "merge_sha": sha},
+                    })).start()
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sup.ci_adapter = ci_mod.CIAdapter(runner=fake_runner)
+        sup.start_execution()
+        self.assertTrue(hooks.merged_event.wait(60), store.read("/plan/tasks/a"))
+        self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
+        self.assertEqual(store.read("/plan/tasks/a/attempts"), 1)
+        second_brief = briefs.brief_path(sup.run_dir, "a", "implement", 1).read_text()
+        self.assertIn("20261116-183000-l0-gA", second_brief)
+        self.assertIn("backend-unit, authority", second_brief)
+        self.assertIn("file:///tmp/ev/result.json", second_brief)
+        self.assertIn("412: FAIL src/auth/authority.spec.ts", second_brief)
+
+    def test_12_ceremony_runs_full_9_step_loop_rebriefs_same_window_and_takes_next_task(self):
+        from jbi import briefs
+        from jbi.ceremony import CeremonyReceipt, TaskLedger, WindowPool, run_ceremony
+        repo = self.tmp / "ceremony_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+        t1 = task("a", owns=["src/a.py"])
+        t2 = task("b", deps=["a"], owns=["src/b.py"])
+        sup, store, hooks = self.supervisor(repo, [t1, t2])
+        pool = WindowPool(sup.run_dir / "window_pool.json", windows=("work1",))
+        ledger = TaskLedger(sup.run_dir / "task_ledger.jsonl")
+        commands: list[list[str]] = []
+        busy_snapshots: list[dict] = []
+
+        def fake_runner(argv, cwd):
+            commands.append(list(argv))
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                pr = "901\n" if "jbi/a" in argv else "902\n"
+                return subprocess.CompletedProcess(argv, 0, pr, "")
+            if argv[:4] == ["illm", "--json", "ci", "submit"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
+            return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+        def wait_receipt(window, tid, attempt, receipt_file):
+            busy_snapshots.append(pool.get(window))
+            worktree = sup.run_dir / "worktrees" / tid
+            (worktree / "src").mkdir(exist_ok=True)
+            (worktree / "src" / f"{tid}.py").write_text(f"attempt = {attempt}\n")
+            return CeremonyReceipt(task=tid, sha="uncommitted", passed=True, findings=[], tokens=500)
+
+        def wait_ci_notice(tid, pr_number, head_sha, attempt):
+            # Fail 5 times on task 'a' (> rigor.DECISION_AFTER = 4) to prove no decision card opens.
+            if tid == "a" and attempt < 5:
+                return {
+                    "schema": "illm.ci.failure.v1",
+                    "job_id": f"job-{attempt}",
+                    "pr_number": pr_number,
+                    "head_sha": head_sha,
+                    "verdict": "red",
+                    "failed_gates": ["unit"],
+                    "evidence_url": f"file:///tmp/ev/{attempt}.json",
+                    "first_failure_excerpt": f"failure on attempt {attempt}",
+                    "retry_allowed": True,
+                }
+            return {"pr_number": pr_number, "head_sha": head_sha, "verdict": "green", "merge_sha": head_sha}
+
+        outcome = run_ceremony(
+            t1, next_tasks=[t2], pool=pool, ledger=ledger, repo=repo, run_dir=sup.run_dir,
+            store=store, runner=fake_runner, wait_receipt=wait_receipt, wait_ci_notice=wait_ci_notice,
+        )
+        self.assertEqual(len(outcome), 2)
+        self.assertEqual((outcome[0].task, outcome[0].window, outcome[0].pr_number, outcome[0].attempts, outcome[0].tokens),
+                         ("a", "work1", 901, 6, 3000))
+        self.assertEqual((outcome[1].task, outcome[1].window, outcome[1].pr_number, outcome[1].attempts, outcome[1].tokens),
+                         ("b", "work1", 902, 1, 500))
+        self.assertTrue(all(s["status"] == "busy" for s in busy_snapshots))
+        self.assertEqual(pool.get("work1")["status"], "free")
+        self.assertEqual(store.read("/decisions"), {}, "ceremony must never open a decision card")
+        self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
+        self.assertEqual(store.read("/plan/tasks/b/status"), "merged")
+        ticket_starts = [c for c in commands if c[:2] == ["ticket", "start"]]
+        sb_rebriefs = [c for c in commands if c[:2] == ["sb", "send"]]
+        ci_submits = [c for c in commands if c[:4] == ["illm", "--json", "ci", "submit"]]
+        self.assertEqual(len(ticket_starts), 2)
+        self.assertEqual(len(sb_rebriefs), 5)
+        self.assertTrue(all(c[2] == "work1" for c in sb_rebriefs), "must re-brief the SAME window")
+        self.assertEqual(len(ci_submits), 7)
+        rebrief_text = briefs.brief_path(sup.run_dir, "a", "implement", 5).read_text()
+        self.assertIn("job-4", rebrief_text)
+        self.assertIn("failure on attempt 4", rebrief_text)
+        entries = ledger.entries()
+        self.assertEqual([e["task"] for e in entries], ["a", "b"])
+        self.assertEqual([e["tokens"] for e in entries], [3000, 500])
+
+    def test_13_ceremony_main_runs_end_to_end_with_illm_mailbox_notice(self):
+        import sqlite3
+        from jbi import briefs, ceremony
+        repo = self.tmp / "main_repo"
+        run_dir = self.tmp / "main_run"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+
+        dag_file = self.tmp / "plan.yaml"
+        dag_file.write_text(
+            'project: "demo"\n'
+            'repo: "./demo"\n'
+            'mode: "existing"\n'
+            'waves: "auto"\n'
+            'tasks:\n'
+            '  - id: "D01"\n'
+            '    title: "Build core"\n'
+            '    goal: "Provide core"\n'
+            '    deps: []\n'
+            '    acceptance: "true"\n'
+            '    owns: ["src/core.py"]\n'
+        )
+        board_db = self.tmp / "board.db"
+        with sqlite3.connect(str(board_db)) as conn:
+            conn.execute("CREATE TABLE sb_messages (id INTEGER PRIMARY KEY, from_slot TEXT, to_slot TEXT, text TEXT)")
+        illm_state = self.tmp / "illm_state"
+        queue_dir = illm_state / "mailboxes" / "main" / "queue"
+        queue_dir.mkdir(parents=True)
+        submit_count = 0
+
+        def fake_runner(argv, cwd):
+            nonlocal submit_count
+            if argv[:2] == ["ticket", "start"] or argv[:2] == ["sb", "send"]:
+                worktree = run_dir / "worktrees" / "D01"
+                (worktree / "src").mkdir(exist_ok=True)
+                (worktree / "src" / "core.py").write_text(f"v = {submit_count + 1}\n")
+                rec_path = briefs.receipt_path(run_dir, "D01", "implement", submit_count)
+                rec_path.parent.mkdir(parents=True, exist_ok=True)
+                rec_path.write_text("BRIEF D01 | uncommitted | PASS\ntokens: 800\n")
+                return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(argv, 0, "910\n", "")
+            if argv[:4] == ["illm", "--json", "ci", "submit"]:
+                submit_count += 1
+                sha = argv[6]
+                if submit_count == 1:
+                    (queue_dir / "1001-red.json").write_text(json.dumps({
+                        "id": "1001-red",
+                        "from": "ci",
+                        "to": "main",
+                        "type": "failed",
+                        "job": "j-red-1",
+                        "text": "CI red on unit",
+                        "data": {
+                            "schema": "illm.ci.failure.v1",
+                            "job_id": "j-red-1",
+                            "pr_number": 910,
+                            "head_sha": sha,
+                            "verdict": "red",
+                            "failed_gates": ["unit"],
+                            "first_failure_excerpt": "FAIL src/core.spec.py",
+                        },
+                    }))
+                else:
+                    (queue_dir / "1002-green.json").write_text(json.dumps({
+                        "id": "1002-green",
+                        "from": "ci",
+                        "to": "main",
+                        "type": "done",
+                        "job": "j-green-2",
+                        "text": "PR #910 merged",
+                        "data": {
+                            "pr_number": 910,
+                            "head_sha": sha,
+                            "verdict": "merged",
+                            "merge_sha": sha,
+                        },
+                    }))
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        rc = ceremony.main(
+            ["--dag", str(dag_file), "--repo", str(repo), "--run-dir", str(run_dir), "--windows", "work1"],
+            runner=fake_runner,
+            board_db=board_db,
+            illm_state_dir=illm_state,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(submit_count, 2)
+        entries = ceremony.TaskLedger(run_dir / "task_ledger.jsonl").entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0]["task"], entries[0]["pr_number"], entries[0]["attempts"], entries[0]["tokens"]),
+                         ("D01", 910, 2, 1600))
+        pool = ceremony.WindowPool(run_dir / "window_pool.json")
+        self.assertEqual(pool.get("work1")["status"], "free")
+
+    def test_14_cli_resume_reopens_stored_run_and_finishes_remaining_tasks(self):
+        from jbi import cli
+        repo = self.tmp / "resume_repo"
+        run_dir = self.tmp / "r-20261116-resume"
+        run_dir.mkdir(parents=True)
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+
+        state = protocol.initial_state("r-20261116-resume", "now", name="demo", mode="existing",
+                                       target=str(repo), max_sessions=2, lanes=1, tmux="")
+        state["config"]["rigor"] = "vibe"
+        state["run"]["phase"] = "execute"
+        state["bootstrap"]["status"] = "passed"
+        state["bootstrap"]["branch"] = "main"
+        state["accounts"] = {"simulator": {"label": "Simulator", "enabled": True, "status": "ok"}}
+        plan = waves.compile_plan([task("a", owns=["src/a.txt"]), task("b", deps=["a"], owns=["src/b.txt"])], 1)
+        plan["tasks"]["a"]["status"] = "merged"
+        plan["tasks"]["a"]["stages"] = {"implement": {"status": "passed", "detail": "ok", "model": "sim-s"},
+                                        "merge": {"status": "passed", "detail": "merged", "model": None}}
+        plan["tasks"]["b"]["status"] = "running"
+        state["plan"] = plan
+        store = Store(run_dir / "run.db", state)
+        store.close()
+
+        args = cli.parse_args(["resume", str(run_dir), "--offline", "--no-tailscale", "--no-menu"])
+        resumed = cli.Run(args, resume_dir=run_dir)
+        self.addCleanup(resumed.close)
+        self.addCleanup(lambda: (resumed.runtime.stop("kill"), resumed.stopped.wait(20)))
+        self.assertTrue(wait_for(lambda: resumed.store.read("/run/phase") == "complete", 60),
+                        resumed.store.read("/plan/tasks"))
+        self.assertEqual(resumed.store.read("/plan/tasks/a/status"), "merged")
+        self.assertEqual(resumed.store.read("/plan/tasks/b/status"), "merged")
+        resumed.engine.submit({"id": "stop-resumed", "type": "run.stop", "payload": {"mode": "quit"}})
+        self.assertTrue(resumed.stopped.wait(20))
+
+    def test_15_dry_run_preview_cli_serves_waves_etas_and_updates_live_to_completion(self):
+        import urllib.request
+        from jbi import cli
+        dag_file = self.tmp / "preview_dag.yaml"
+        dag_file.write_text(
+            'project: "preview-demo"\n'
+            'repo: "./preview-demo"\n'
+            'mode: "new"\n'
+            'waves: "auto"\n'
+            'tasks:\n'
+            '  - id: "core"\n'
+            '    title: "Build core"\n'
+            '    goal: "Provide core"\n'
+            '    deps: []\n'
+            '    acceptance: "true"\n'
+            '    owns: ["src/core.py"]\n'
+            '  - id: "docs"\n'
+            '    title: "Write docs"\n'
+            '    goal: "Document core"\n'
+            '    deps: []\n'
+            '    acceptance: "true"\n'
+            '    owns: ["docs/readme.md"]\n'
+            '  - id: "cli"\n'
+            '    title: "Build CLI"\n'
+            '    goal: "Expose core"\n'
+            '    deps: ["core"]\n'
+            '    acceptance: "true"\n'
+            '    owns: ["src/cli.py"]\n'
+        )
+        args = cli.parse_args(["--dag", str(dag_file), "--dry-run", "--preview", "--no-tailscale", "--no-menu"])
+        run = cli.Run(args)
+        self.addCleanup(run.close)
+        self.addCleanup(lambda: (run.runtime.stop("kill"), run.stopped.wait(20)))
+        run.store.commit("cfg", Changes().replace("config", "rigor", "vibe"))
+
+        url = f"http://127.0.0.1:{run.server.port}/api/v1/preview"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            initial = json.loads(resp.read())["preview"]
+        self.assertTrue(initial["dry_run"])
+        self.assertEqual(initial["total_tasks"], 3)
+        self.assertEqual(initial["merged_tasks"], 0)
+        self.assertEqual(initial["waves_total"], 2)
+        self.assertEqual(initial["waves_completed"], 0)
+        self.assertTrue(initial["waves"][0]["parallel"])
+        self.assertEqual(initial["critical_path"], ["core", "cli"])
+        self.assertGreater(initial["remaining_eta_s"], 0)
+
+        run.engine.submit({"id": "start-preview", "type": "run.start", "payload": {}})
+        self.assertTrue(wait_for(lambda: run.store.read("/run/phase") == "complete", 60),
+                        run.store.read("/plan/tasks"))
+
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            final = json.loads(resp.read())["preview"]
+        self.assertEqual(final["merged_tasks"], 3)
+        self.assertEqual(final["waves_completed"], 2)
+        self.assertEqual(final["remaining_eta_s"], 0)
+        self.assertTrue(all(w["status"] == "merged" and w["remaining_eta_s"] == 0 for w in final["waves"]))
+        run.engine.submit({"id": "stop-preview", "type": "run.stop", "payload": {"mode": "quit"}})
+        self.assertTrue(run.stopped.wait(20))
 
 
 if __name__ == "__main__":

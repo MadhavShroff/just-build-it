@@ -23,6 +23,23 @@ ROLE_GOALS = {
     "bootstrap": "Set up the repository only. Write no feature code.",
 }
 
+STAGE_GOALS = {
+    "test-audit": (
+        "Review the tests the app produced and confirm they actually prove the behaviour, "
+        "not just that they pass. Do not edit files."
+    ),
+    "methodology-audit": (
+        "Check the built app against our way of doing and landing code: branch + draft PR, "
+        "the work contract headings, tg work:ready, the train, squash merge, no attribution lines, "
+        "no --amend, atomic commits. Do not edit files."
+    ),
+    "dry-run": (
+        "Run an in-weight rehearsal of the app itself: take the built app and walk it through "
+        "the real landing path without merging, and report whether it would work in practice and "
+        "whether it maps to our way. Do not edit files."
+    ),
+}
+
 RULES = (
     "Work only inside the current directory, the task worktree.",
     "Edit only the owned paths. Do not commit; the runtime commits for you.",
@@ -51,9 +68,25 @@ def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
            findings: list[str] | None = None, goal: str | None = None) -> str:
     """The brief text for one stage of one task, clipped to MAX_LINES."""
     lines = [f"# Brief {task['id']} — {stage} (attempt {attempt + 1})", "",
-             "## Goal", goal or task.get("goal", ""), "", ROLE_GOALS.get(role, ""), ""]
+             "## Goal", goal or task.get("goal", ""), "",
+             STAGE_GOALS.get(stage) or ROLE_GOALS.get(role, ""), ""]
     if task.get("title"):
         lines[2:2] = [f"Task: {task['title']}", ""]
+    if task.get("path") or task.get("spec"):
+        refs = [p for p in (task.get("path"), task.get("spec")) if p]
+        lines += ["## Source Docs", *(f"- {r}" for r in refs), ""]
+    if task.get("spec_details"):
+        details = task["spec_details"]
+        detail_lines = details if isinstance(details, list) else [str(details)]
+        lines += ["## Specification Details", *(f"- {d}" for d in detail_lines), ""]
+    if task.get("contracts"):
+        lines += ["## Contracts & Interfaces", *(f"- {c}" for c in task["contracts"]), ""]
+    if task.get("invariants"):
+        lines += ["## Invariants", *(f"- {inv}" for inv in task["invariants"]), ""]
+    if task.get("test_cases"):
+        lines += ["## Required Test Cases", *(f"- {tc}" for tc in task["test_cases"]), ""]
+    if task.get("done_criteria"):
+        lines += ["## Done Criteria", *(f"- {dc}" for dc in task["done_criteria"]), ""]
     lines += ["## Owns", *(f"- {p}" for p in task.get("owns") or ["(no declared paths)"]), ""]
     lines += ["## Acceptance", f"`{task.get('acceptance') or 'none'}` must exit 0.", ""]
     if findings:

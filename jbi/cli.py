@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__, netinfo, protocol
@@ -48,12 +48,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     start = parser
     start.add_argument("--repo", type=Path, help="an existing git repository to add features to")
+    start.add_argument("--dag", type=Path, help="a typed task DAG file (.json or restricted YAML)")
+    start.add_argument("--start", action="store_true", help="start execution immediately after loading the DAG")
     start.add_argument("--name", default="new-app", help="the working name of a new project")
     start.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
     start.add_argument("--max-sessions", type=int, default=3, help="agents that run at the same time")
     start.add_argument("--lanes", type=int, default=0, help="CI lanes (default: from the CPU count)")
+    start.add_argument("--ci-service", choices=("local", "illm"), default="local",
+                       help="CI service for the merge stage (default: local lanes)")
     start.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
     start.add_argument("--offline", action="store_true", help="use the offline simulator for every model")
+    start.add_argument("--dry-run", action="store_true",
+                       help="rehearse the whole pipeline without touching the repo, the CI service or "
+                            "the train: every stage runs against the simulator and the landing path is "
+                            "reported, never taken")
+    start.add_argument("--preview", action="store_true",
+                       help="serve the dry-run DAG preview UI showing waves, parallel tasks, "
+                            "critical path and live ETAs")
+    start.add_argument("--base-path", default="",
+                       help="mount the dashboard under a URL prefix, such as /jbi/preview, when a "
+                            "reverse proxy forwards it. The prefix is stripped before routing, so "
+                            "the page's relative links keep working.")
+    start.add_argument("--publish-preview", action="store_true",
+                       help="answer the read-only preview and health routes without a browser "
+                            "session, so a proxy that holds its own authentication can forward "
+                            "them. Every other route still needs a session or the machine token.")
+    start.add_argument("--registry", type=Path, default=None,
+                       help="write a small JSON record of this run (port, base path, DAG, run id) "
+                            "so another service can find the preview. Defaults to "
+                            "~/.tangram-dev/jbi-preview.json for a preview run.")
     start.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
     start.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
 
@@ -65,6 +88,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     send.add_argument("type")
     send.add_argument("payload", nargs="?", default="{}")
     send.add_argument("--run-dir", type=Path)
+    resume = sub.add_parser("resume", help="reopen a stored run and continue from stored task states")
+    resume.add_argument("run_dir", nargs="?", type=Path)
+    resume.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
+    resume.add_argument("--ci-service", choices=("local", "illm"), default=None,
+                        help="override CI service on resume")
+    resume.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
+    resume.add_argument("--offline", action="store_true", help="use the offline simulator for every model")
+    resume.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
+    resume.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
+    resume.add_argument("--if-exists", action="store_true", help="exit 0 cleanly when no stored run exists")
     return parser.parse_args(argv)
 
 
@@ -88,46 +121,173 @@ def latest_run_dir() -> Path:
     return runs[-1]
 
 
+def prepare_resume(store: Store) -> list[str]:
+    """Reconcile stored task states so an interrupted run continues cleanly on reopen."""
+    from . import rigor
+    from .store import Changes
+
+    changes = Changes()
+    if store.read("/run/stopping") is not None:
+        changes.replace("run", "stopping", None)
+    if store.read("/run/busy") is not None:
+        changes.replace("run", "busy", None)
+
+    plan = store.read("/plan") or {}
+    config = store.read("/config") or {"rigor": "high", "profile": "balanced"}
+    tasks = plan.get("tasks") or {}
+    resumed_tasks: list[str] = []
+
+    for tid in plan.get("order") or list(tasks):
+        task = tasks.get(tid)
+        if not isinstance(task, dict):
+            continue
+        status = task.get("status")
+        if status in ("running", "verifying", "queued", "merging", "paused"):
+            resume_after = task.get("resume_after")
+            if resume_after is None:
+                level, _ = rigor.effective(task, config)
+                stages = task.get("stages") or {}
+                last_passed: str | None = None
+                for stage in rigor.pipeline(level):
+                    if stage.role == "merge":
+                        break
+                    if (stages.get(stage.name) or {}).get("status") == "passed":
+                        last_passed = stage.name
+                    else:
+                        break
+                resume_after = last_passed
+            changes.set("plan", "tasks", tid, "status", "ready")
+            changes.set("plan", "tasks", tid, "resume_after", resume_after)
+            resumed_tasks.append(tid)
+        elif status == "blocked":
+            deps = task.get("deps") or []
+            if deps and all((tasks.get(d) or {}).get("status") == "merged" for d in deps):
+                changes.set("plan", "tasks", tid, "status", "ready")
+                resumed_tasks.append(tid)
+
+    store.log("run", f"Run resumed ({len(resumed_tasks)} task(s) ready)",
+              extra=changes, etype="run.config")
+    return resumed_tasks
+
+
 # ---- the run -------------------------------------------------------------------------
 
 class Run:
     """One dashboard process: the store, the engine, the runtime and the listeners."""
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, *, resume_dir: Path | None = None):
         self.args = args
-        self.run_id = "r-" + datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.dir = HOME / "runs" / self.run_id
-        self.dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.dir, 0o700)
         self.stopped = threading.Event()
         self.stop_requested = threading.Event()     # the first SIGINT or SIGTERM sets it
         self.stop_mode: str | None = None
 
-        mode = "existing" if args.repo else "new"
-        target = str(args.repo.expanduser().resolve()) if args.repo else str(Path.home() / slug(args.name, "app"))
-        if args.repo and not (Path(target) / ".git").exists():
-            raise SystemExit(f"{target} is not a git repository.")
-        name = Path(target).name if args.repo else slug(args.name, "app")
-        tmux = f"tmux -L jbi-{self.run_id} attach"
-        initial = protocol.initial_state(self.run_id, now(), name=name, mode=mode, target=target,
-                                         max_sessions=args.max_sessions, lanes=args.lanes or default_lanes(),
-                                         tmux=tmux)
-        self.store = Store(self.dir / "run.db", initial)
-        self._seed_accounts(args.offline)
+        if resume_dir is not None:
+            self.dir = Path(resume_dir).expanduser().resolve()
+            if not (self.dir / "run.db").is_file():
+                raise SystemExit(f"No stored run database at {self.dir / 'run.db'}.")
+            self.store = Store(self.dir / "run.db")
+            self.run_id = str(self.store.read("/run/id") or self.dir.name)
+            if getattr(args, "offline", False):
+                self._seed_accounts(True)
+            prepare_resume(self.store)
+        else:
+            self.run_id = "r-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.dir = HOME / "runs" / self.run_id
+            self.dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.dir, 0o700)
+            mode = "existing" if args.repo else "new"
+            target = str(args.repo.expanduser().resolve()) if args.repo else str(Path.home() / slug(args.name, "app"))
+            if args.repo and not (Path(target) / ".git").exists():
+                raise SystemExit(f"{target} is not a git repository.")
+            name = Path(target).name if args.repo else slug(args.name, "app")
+            tmux = f"tmux -L jbi-{self.run_id} attach"
+            initial = protocol.initial_state(self.run_id, now(), name=name, mode=mode, target=target,
+                                             max_sessions=args.max_sessions, lanes=args.lanes or default_lanes(),
+                                             tmux=tmux)
+            self.store = Store(self.dir / "run.db", initial)
+            self._seed_accounts(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False))
+            if getattr(args, "dry_run", False) or getattr(args, "preview", False):
+                from .store import Changes as _Changes
+                cfg_changes = _Changes()
+                if getattr(args, "dry_run", False):
+                    # A dry run rehearses the whole pipeline and never lands anything.
+                    # The simulator answers every model, the CI service is the local
+                    # lane, and the merge stage reports what it would do.
+                    cfg_changes.set("config", "dry_run", True).set("config", "ci_service", "local")
+                if getattr(args, "preview", False):
+                    cfg_changes.set("config", "preview", True)
+                self.store.commit("config", cfg_changes, {})
 
-        completer = make_completer(self.store, offline=args.offline)
+        completer = make_completer(
+            self.store,
+            offline=bool(getattr(args, "offline", False) or getattr(args, "dry_run", False)),
+        )
         self.engine = Engine(self.store, completer)
         self.runtime = self._runtime()
         self.engine.runtime = self.runtime
+        if resume_dir is not None:
+            phase = self.store.read("/run/phase")
+            if phase == "execute":
+                self.runtime.start_execution()
+            elif phase == "bootstrap" and self.store.read("/bootstrap/status") == "running":
+                self.runtime.start_bootstrap()
+        elif getattr(args, "dag", None):
+            load_payload: dict = {
+                "path": str(args.dag.expanduser().resolve()),
+                "start": bool(getattr(args, "start", False)),
+            }
+            if (getattr(args, "dry_run", False) or getattr(args, "preview", False)) and not getattr(args, "repo", None):
+                from . import worktrees as wt
+                rehearsal_repo = self.dir / "preview-repo"
+                wt.init_repo(rehearsal_repo)
+                if wt.head(rehearsal_repo) is None:
+                    (rehearsal_repo / "README.md").write_text("# Dry-run preview repository\n")
+                    wt.commit_all(rehearsal_repo, "Initial preview commit")
+                load_payload["target"] = str(rehearsal_repo)
+            self.engine.submit({"id": "cli-dag", "type": "plan.load", "payload": load_payload})
 
         tailnet = None if args.no_tailscale else netinfo.detect_tailscale()
         self.auth = Auth()
+        public_paths = frozenset()
+        if getattr(args, "publish_preview", False):
+            public_paths = frozenset({"/api/v1/preview", "/api/v1/health"})
         self.app = App(self.store, self.engine, self.auth,
                        extra_info=lambda: {"pid": os.getpid(), "run_dir": str(self.dir)},
-                       link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified])
+                       link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified],
+                       base_path=getattr(args, "base_path", "") or "",
+                       public_paths=public_paths)
         self.server = Server(self.app, netinfo.hosts(tailnet), args.port).start()
         self.links = netinfo.links(self.server.port, self.run_id, tailnet)
         Control(self.links[0].url, self.auth.token, self.run_id, os.getpid()).save(self.dir / "control.json")
+        self._publish_registry(args)
+
+    def _publish_registry(self, args) -> None:
+        """Record where this run's preview is, so a proxy can forward to it.
+
+        The record carries no token: the proxy authenticates its own callers and
+        needs only the address. A preview run publishes by default; any other run
+        publishes only when --registry names a path.
+        """
+        path = getattr(args, "registry", None)
+        if path is None:
+            if not getattr(args, "preview", False):
+                return
+            path = Path.home() / ".tangram-dev" / "jbi-preview.json"
+        path = Path(path).expanduser()
+        dag = getattr(args, "dag", None)
+        record = {
+            "url": f"http://127.0.0.1:{self.server.port}{self.app.base_path}",
+            "port": self.server.port,
+            "base_path": self.app.base_path,
+            "run_id": self.run_id,
+            "pid": os.getpid(),
+            "dag": str(dag.expanduser().resolve()) if dag else None,
+            "preview": bool(getattr(args, "preview", False)),
+            "published": sorted(self.app.public_paths),
+            "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2) + "\n")
 
     def _seed_accounts(self, offline: bool) -> None:
         from . import providers
@@ -143,7 +303,8 @@ class Run:
         from .supervisor import Supervisor
         # The supervisor reads the repository from state.run.target, which the user sets in
         # the stack step. Offline runs enable only the simulator account, so selection picks it.
-        return Supervisor(self.store, RunHooks(self), self.dir, parent_pid=os.getpid())
+        return Supervisor(self.store, RunHooks(self), self.dir, parent_pid=os.getpid(),
+                          ci_service=getattr(self.args, "ci_service", "local"))
 
     def link_lines(self) -> list[str]:
         lines = []
@@ -253,8 +414,8 @@ def signal_handler(run: Run, kill=hard_kill):
     return on_signal
 
 
-def serve(args: argparse.Namespace) -> int:
-    run = Run(args)
+def serve(args: argparse.Namespace, *, resume_dir: Path | None = None) -> int:
+    run = Run(args, resume_dir=resume_dir)
     banner(run)
     if args.open:
         import webbrowser
@@ -272,6 +433,22 @@ def serve(args: argparse.Namespace) -> int:
     print(f"Run stopped ({run.stop_mode}). The record stays in {run.dir}")
     run.close()
     return 0
+
+
+def resume_command(args: argparse.Namespace) -> int:
+    target_dir = getattr(args, "run_dir", None)
+    if target_dir is None:
+        runs = sorted((HOME / "runs").glob("r-*"), key=lambda p: p.stat().st_mtime)
+        if not runs:
+            if getattr(args, "if_exists", False):
+                print("No stored run found; exiting cleanly.")
+                return 0
+            raise SystemExit("No run found. Start one with: just-build-it")
+        target_dir = runs[-1]
+    elif not (Path(target_dir).expanduser() / "run.db").is_file() and getattr(args, "if_exists", False):
+        print(f"No stored run at {target_dir}; exiting cleanly.")
+        return 0
+    return serve(args, resume_dir=target_dir)
 
 
 def run_client(run_dir: Path | None) -> Client:
@@ -312,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command in ("status", "links", "send"):
         return client_command(args)
+    if args.command == "resume":
+        return resume_command(args)
     return serve(args)
 
 

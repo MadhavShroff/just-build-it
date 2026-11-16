@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from . import architecture, planner, providers, protocol, stack, waves
+from . import architecture, ci_adapter, dag_loader, planner, providers, protocol, stack, waves
 from .contracts import Runtime
 from .llm import Completer, CompletionError
 from .protocol import ProtocolError
@@ -30,6 +30,7 @@ class Engine:
         self._lock = threading.RLock()
         self.debug_log = Path(store.path).parent / providers.DEBUG_LOG
         self._handlers: dict[str, Handler] = {
+            "plan.load": self._plan_load,
             "intake.import": self._intake_import, "intake.say": self._intake_say,
             "intake.detail": self._intake_detail, "intake.finish": self._intake_finish,
             "stack.revise": self._stack_revise, "stack.accept": self._stack_accept,
@@ -37,7 +38,8 @@ class Engine:
             "run.configure": self._run_configure,
             "run.start": self._run_start, "task.override": self._task_override,
             "task.retry": self._task_control, "task.pause": self._task_control,
-            "task.resume": self._task_control, "decision.answer": self._decision_answer,
+            "task.resume": self._task_control, "ci.notice": self._ci_notice,
+            "decision.answer": self._decision_answer,
             "account.set": self._account_set, "account.probe": self._account_probe,
             "architecture.refresh": self._architecture_refresh, "run.stop": self._run_stop,
         }
@@ -102,6 +104,37 @@ class Engine:
         return self.runtime
 
     # ---- intake ----------------------------------------------------------------------
+
+    def _plan_load(self, ctype: str, payload: dict) -> None:
+        if not payload.get("path") and not payload.get("text"):
+            raise ProtocolError("payload_invalid", "plan.load needs 'path' or 'text'.")
+        if payload.get("text"):
+            text = payload["text"]
+            is_json = (payload.get("path") or "").lower().endswith(".json") or text.lstrip().startswith(("{", "["))
+            doc = dag_loader.parse_dag_json(text) if is_json else dag_loader.validate(dag_loader.parse(text))
+        else:
+            doc = dag_loader.load_document(Path(payload["path"]))
+        revision = self.store.read("/plan/revision", 0) + 1
+        plan = waves.compile_plan(doc, revision)
+        name = doc.get("project") or self.store.read("/run/name")
+        prd = {"name": name or "", "components": []}
+        plan.update(rough_prd="", prd=prd)
+        graph = architecture.initial(prd, plan)
+        changes = (Changes().replace("plan", plan).replace("architecture", graph)
+                   .replace("bootstrap", "status", "passed"))
+        if name:
+            changes.replace("run", "name", name)
+        if payload.get("target"):
+            changes.replace("run", "target", str(Path(payload["target"]).expanduser()))
+        elif doc.get("repo") and not self.store.read("/run/target"):
+            changes.replace("run", "target", str(Path(doc["repo"]).expanduser()))
+        if doc.get("mode") in ("new", "existing"):
+            changes.replace("run", "mode", doc["mode"])
+        self.store.log("plan", f"Plan ready: {len(plan['order'])} tasks in {len(plan['waves'])} waves",
+                       extra=changes, etype="plan.updated", revision=plan["revision"])
+        self._phase("execute", "Plan loaded")
+        if payload.get("start", True) and self.runtime is not None:
+            self.runtime.start_execution()
 
     def _intake_say(self, ctype: str, payload: dict) -> None:
         self._say("user", payload["text"])
@@ -236,6 +269,24 @@ class Engine:
     def _task_control(self, ctype: str, payload: dict) -> None:
         self._task(payload["task"])
         self._require_runtime().control(payload["task"], ctype.split(".", 1)[1])
+
+    def _ci_notice(self, ctype: str, payload: dict) -> None:
+        notice = {**(payload.get("data") or {}), **{k: v for k, v in payload.items() if k != "data"}}
+        verdict = notice.get("verdict")
+        if verdict not in protocol.CI_VERDICTS:
+            raise ProtocolError("payload_invalid", "ci.notice needs a valid 'verdict'.", field="verdict")
+        tid = ci_adapter.match_task(self.store.read("/plan"), notice)
+        if self.runtime is not None and callable(getattr(self.runtime, "ci_notice", None)):
+            self.runtime.ci_notice(tid, notice)
+            return
+        if verdict in ("green", "merged"):
+            sha = notice.get("merge_sha") or notice.get("head_sha") or self.store.read(f"/plan/tasks/{tid}/commit")
+            self.store.commit("task.status", Changes().set("plan", "tasks", tid, "status", "merged")
+                              .set("plan", "tasks", tid, "commit", sha), {"task": tid})
+        else:
+            findings = ci_adapter.format_failure_findings(notice)
+            self.store.commit("task.status", Changes().set("plan", "tasks", tid, "findings", findings),
+                              {"task": tid})
 
     def _decision_answer(self, ctype: str, payload: dict) -> None:
         decision = self.store.read(f"/decisions/{payload['decision']}")

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
-from . import PROTOCOL_VERSION, __version__, models, protocol, rigor
+from . import PROTOCOL_VERSION, __version__, metrics as metrics_mod, models, protocol, rigor, waves
 from .engine import Engine
 from .protocol import ProtocolError
 from .store import Store, iter_sse
@@ -63,11 +63,21 @@ class App:
     """Everything a request handler needs. One instance per run."""
 
     def __init__(self, store: Store, engine: Engine, auth: Auth, *, extra_info: Callable[[], dict] | None = None,
-                 link_bases: Callable[[], list[dict]] | None = None):
+                 link_bases: Callable[[], list[dict]] | None = None,
+                 metrics_sources: metrics_mod.MetricsSources | None = None,
+                 base_path: str = "", public_paths: frozenset[str] = frozenset()):
         self.store, self.engine, self.auth = store, engine, auth
         self.extra_info = extra_info or (lambda: {})
         # The verified base URLs ({label, url}) that sign-in links may point at.
         self.link_bases = link_bases or (lambda: [])
+        self.metrics_sources = metrics_sources
+        # A reverse proxy may mount the dashboard under a prefix, such as
+        # /jbi/preview. The prefix is stripped before routing, so every relative
+        # link and every fetch() in the page keeps working unchanged.
+        self.base_path = "/" + base_path.strip("/") if base_path.strip("/") else ""
+        # Read-only routes a proxy may fetch without a browser session. The proxy
+        # holds the machine token itself; the browser never sees it.
+        self.public_paths = public_paths
         self.shutdown = threading.Event()
 
     def schema(self) -> dict:
@@ -94,18 +104,29 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def _dispatch(self, method: str) -> None:
             url = urlsplit(self.path)
             query = {k: v[-1] for k, v in parse_qs(url.query).items()}
-            route = (method, url.path)
+            path = url.path
+            route = (method, path)
             try:
-                if url.path.startswith("/api/"):
+                if app.base_path:
+                    if path == app.base_path:
+                        path = "/"
+                    elif path.startswith(app.base_path + "/"):
+                        path = path[len(app.base_path):]
+                    else:
+                        # Outside the mount there is no dashboard. Answer, never
+                        # drop the connection.
+                        raise ProtocolError("not_found", f"No endpoint {method} {url.path}.")
+                    route = (method, path)
+                if path.startswith("/api/"):
                     self._check_protocol()
                     handler = API.get(route)
                     if handler is None:
                         raise ProtocolError("not_found", f"No endpoint {method} {url.path}.")
-                    if route not in PUBLIC:
+                    if route not in PUBLIC and path not in app.public_paths:
                         self._authenticate(write=(method == "POST" and route != ("POST", "/api/v1/session")))
                     handler(self, query)
                 elif method == "GET":
-                    self._static(url.path)
+                    self._static(path)
                 else:
                     raise ProtocolError("not_found", f"No endpoint {method} {url.path}.")
             except ProtocolError as error:
@@ -207,7 +228,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             if session is None:
                 raise ProtocolError("unauthenticated", "This link was already used or is not valid. "
                                                        "Ask the CLI for a new link.")
-            cookie = f"{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/"
+            cookie = (f"{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; "
+                      f"Path={app.base_path or '/'}/".replace("//", "/"))
             self._json(200, {"protocol": PROTOCOL_VERSION, "ok": True}, {"Set-Cookie": cookie})
 
         def state(self, query: dict) -> None:
@@ -249,6 +271,25 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                      for base in app.link_bases()]
             self._json(200, {"protocol": PROTOCOL_VERSION, "links": links})
 
+        def metrics(self, query: dict) -> None:
+            run_dir = Path(app.store.path).parent if getattr(app.store, "path", None) else None
+            snapshot = metrics_mod.collect_metrics(app.metrics_sources, run_dir=run_dir)
+            self._json(200, {"protocol": PROTOCOL_VERSION, "metrics": snapshot})
+
+        def preview(self, query: dict) -> None:
+            seq, doc = app.store.snapshot()
+            summary = waves.describe_preview(
+                doc.get("plan") or {},
+                doc.get("config") or {},
+                doc.get("sessions") or {},
+            )
+            self._json(200, {
+                "protocol": PROTOCOL_VERSION,
+                "seq": seq,
+                "run": doc.get("run") or {},
+                "preview": summary,
+            })
+
     API: dict[tuple[str, str], Callable] = {
         ("GET", "/api/v1/health"): Handler.health,
         ("POST", "/api/v1/session"): Handler.session,
@@ -258,8 +299,15 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         ("GET", "/api/v1/events.json"): Handler.events_json,
         ("POST", "/api/v1/commands"): Handler.commands,
         ("POST", "/api/v1/links"): Handler.links,
+        ("GET", "/api/v1/metrics"): Handler.metrics,
+        ("GET", "/api/v1/preview"): Handler.preview,
     }
-    PUBLIC = {("GET", "/api/v1/health"), ("POST", "/api/v1/session")}
+    PUBLIC = {
+        ("GET", "/api/v1/health"),
+        ("POST", "/api/v1/session"),
+        ("GET", "/api/v1/metrics"),
+        ("GET", "/api/v1/preview"),
+    }
     return Handler
 
 

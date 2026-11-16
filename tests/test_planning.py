@@ -539,7 +539,7 @@ class BootstrapTests(unittest.TestCase):
 
 class SkillTests(unittest.TestCase):
     NAMES = ("brief-task", "verify-outside", "review-diff", "security-scan", "architecture-update",
-             "bootstrap-repo", "ci-lane", "only-latest", "board-truth")
+             "bootstrap-repo", "ci-lane", "only-latest", "board-truth", "dev-pipeline")
 
     def test_every_skill(self):
         for name in self.NAMES:

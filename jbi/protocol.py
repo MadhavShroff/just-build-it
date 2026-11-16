@@ -17,9 +17,10 @@ RIGOR_LEVELS = ("vibe", "medium", "high", "xhigh")
 PROFILES = ("max", "balanced", "economy", "micro")
 DETAIL_LEVELS = ("user", "guided", "delegate")
 STOP_MODES = ("quit", "standdown", "finish", "kill")
+CI_VERDICTS = ("red", "void", "merge-blocked", "green", "merged")
 TASK_STATUSES = ("blocked", "ready", "running", "verifying", "queued",
                  "merging", "merged", "failed", "paused", "decision", "skipped")
-TASK_ID = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+TASK_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 COMMAND_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 ANY_PHASE = PHASES
 
@@ -81,6 +82,12 @@ _TEXT = Field("string", max_length=20000)
 _TASK = Field("task")
 
 COMMANDS: dict[str, Command] = {c.type: c for c in (
+    Command("plan.load", ("intake", "stack", "bootstrap", "configure"),
+            "Load a typed task DAG and move the run to execute.",
+            {"path": Field("string", required=False, max_length=1024),
+             "text": Field("string", required=False, max_length=200000),
+             "target": Field("string", required=False, max_length=1024),
+             "start": Field("bool", required=False)}),
     Command("intake.import", ("intake",), "Import a task list in any format.", {"text": _TEXT}),
     Command("intake.say", ("intake",), "Send one message to the planning chat.", {"text": _TEXT}),
     Command("intake.detail", ("intake",), "Choose how much detail the user gives.",
@@ -96,13 +103,28 @@ COMMANDS: dict[str, Command] = {c.type: c for c in (
     Command("bootstrap.retry", ("bootstrap",), "Run bootstrap again after it failed."),
     Command("run.configure", ("configure", "execute"), "Set the rigor level and model profile.",
             {"rigor": _enum(RIGOR_LEVELS), "profile": _enum(PROFILES)}),
-    Command("run.start", ("configure",), "Start the build."),
+    Command("run.start", ("configure", "execute"), "Start the build."),
     Command("task.override", ("configure", "execute"), "Override rigor, profile or model for one task.",
             {"task": _TASK, "rigor": _enum(RIGOR_LEVELS, False), "profile": _enum(PROFILES, False),
              "model": Field("string", required=False, max_length=120)}),
     Command("task.retry", ("execute",), "Retry a failed or paused task.", {"task": _TASK}),
     Command("task.pause", ("execute",), "Pause a task after its current stage.", {"task": _TASK}),
     Command("task.resume", ("execute",), "Resume a paused task.", {"task": _TASK}),
+    Command("ci.notice", ("execute",), "Deliver a structured CI verdict or failure notice.",
+            {"task": Field("task", required=False),
+             "schema": Field("string", required=False, max_length=80),
+             "job_id": Field("string", required=False, max_length=120),
+             "pr_number": Field("int", required=False),
+             "head_sha": Field("string", required=False, max_length=64),
+             "develop_sha": Field("string", required=False, max_length=64),
+             "verdict": _enum(CI_VERDICTS, False),
+             "failed_gates": Field("list", required=False),
+             "evidence_url": Field("string", required=False, max_length=2048),
+             "first_failure_excerpt": Field("string", required=False, max_length=20000),
+             "owner_slot": Field("string", required=False, max_length=64),
+             "retry_allowed": Field("bool", required=False),
+             "merge_sha": Field("string", required=False, max_length=64),
+             "data": Field("object", required=False)}),
     Command("decision.answer", ANY_PHASE, "Answer an open decision.",
             {"decision": Field("string", max_length=64), "answer": Field("string", max_length=4000)}),
     Command("account.set", ANY_PHASE, "Enable or disable a provider, optionally with an API key.",
@@ -175,6 +197,18 @@ def _check(ctype: str, name: str, spec: Field, value: Any) -> Any:
         if not isinstance(value, bool):
             raise fail("must be true or false")
         return value
+    if spec.kind == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise fail("must be an integer")
+        return value
+    if spec.kind == "list":
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise fail("must be a list of strings")
+        return list(value)
+    if spec.kind == "object":
+        if not isinstance(value, dict):
+            raise fail("must be an object")
+        return dict(value)
     if not isinstance(value, str):
         raise fail("must be a string")
     if spec.kind == "enum" and value not in spec.choices:
