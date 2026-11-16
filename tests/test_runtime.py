@@ -237,12 +237,25 @@ class DirectivesAreDry(unittest.TestCase):
                                  f"times in prompt {index + 1}, not once")
 
     def test_no_step_declaration_holds_a_common_instruction(self):
+        """A step block holds no part of a common instruction, not only no whole one.
+
+        A whole-string check was the first version and it let a FRAGMENT through: a
+        step block could carry "Edit only the owned paths." without the rest and no
+        test failed (found 2026-11-17 while mutating this guard). So every SENTENCE
+        of a common instruction is checked, and a sentence of 20 characters or more
+        must not appear in a step block.
+        """
         from jbi import briefs
-        step_texts = [text for _n, text in briefs.STAGE_DIRECTIVES.values()]
-        step_texts += [text for _n, text in briefs.ROLE_DIRECTIVES.values()]
+        step_texts = [("stage", text) for _n, text in briefs.STAGE_DIRECTIVES.values()]
+        step_texts += [("role", text) for _n, text in briefs.ROLE_DIRECTIVES.values()]
         for _number, common in briefs.COMMON:
-            for step in step_texts:
-                self.assertNotIn(common, step, f"the step block repeats the common instruction {common!r}")
+            sentences = [s.strip() for s in common.split(". ") if len(s.strip()) >= 20]
+            sentences.append(common)
+            for where, step in step_texts:
+                for sentence in sentences:
+                    self.assertNotIn(sentence, step,
+                                     f"the {where} block repeats part of a common instruction: "
+                                     f"{sentence!r}")
 
     def test_the_common_block_is_declared_once_in_the_source(self):
         from jbi import briefs
