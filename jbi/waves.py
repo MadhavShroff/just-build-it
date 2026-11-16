@@ -35,7 +35,7 @@ EFFORT_ETA_SECONDS: dict[str, int] = {
 OPTIONAL_TASK_META = (
     "node", "batch", "owner", "path", "spec", "deliverable",
     "effort", "eta_s", "estimated_seconds", "consumers", "prTag", "prTitle", "number",
-    "upstream_deps",
+    "upstream_deps", "spec_details", "contracts", "invariants", "test_cases", "done_criteria",
 )
 
 

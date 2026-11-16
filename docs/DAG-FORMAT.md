@@ -49,6 +49,11 @@ The loader validates file syntax, schema fields, identifier syntax, owned paths,
 | `batch` | JSON | string | Optional | Batch identifier within the parent node (for example `"B1"`). |
 | `effort` | JSON | string | Optional | Estimated effort tier (`"XS"`, `"S"`, `"M"`, `"L"`, `"XL"`). |
 | `eta_s` | JSON | integer | Optional | Explicit estimated duration in seconds. |
+| `spec_details` | JSON | `list[str]` \| string | Optional | Self-contained specification context, frame corrections, and founder decisions for smaller models. |
+| `contracts` | JSON | `list[str]` | Optional | Exact interfaces, ports, collections, indexes, and HTTP routes implemented in this batch. |
+| `invariants` | JSON | `list[str]` | Optional | Security, transaction, authority, and failure-handling invariants enforced in this batch. |
+| `test_cases` | JSON | `list[str]` | Optional | EARS test case IDs and required assertions covered by this batch. |
+| `done_criteria` | JSON | `list[str]` | Optional | Explicit completion checklist and forbidden shortcuts for this batch. |
 | `subtasks` / `batches` | JSON | `list[object]` | Optional | Ordered child batch tasks inside a parent node. |
 
 ### 2.3 Subtask / Batch Fields (`subtasks` or `batches`)
