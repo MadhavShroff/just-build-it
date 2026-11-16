@@ -57,6 +57,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--ci-service", choices=("local", "illm"), default="local",
                        help="CI service for the merge stage (default: local lanes)")
     start.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
+    start.add_argument("--provider", default="agy", choices=("agy", "openai-compatible", "claude", "codex"),
+                       help="the provider that dispatches agent stages. Default agy: the standing order of "
+                            "2026-11-13 puts no Claude model in any subagent. Name claude only when the "
+                            "founder asks for it for this run.")
     start.add_argument("--offline", action="store_true", help="use the offline simulator for every model")
     start.add_argument("--dry-run", action="store_true",
                        help="rehearse the whole pipeline without touching the repo, the CI service or "
@@ -205,7 +209,8 @@ class Run:
                                              max_sessions=args.max_sessions, lanes=args.lanes or default_lanes(),
                                              tmux=tmux)
             self.store = Store(self.dir / "run.db", initial)
-            self._seed_accounts(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False))
+            self._seed_accounts(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False),
+                                agent_provider=getattr(args, "provider", "agy"))
             if getattr(args, "dry_run", False) or getattr(args, "preview", False):
                 from .store import Changes as _Changes
                 cfg_changes = _Changes()
@@ -289,13 +294,18 @@ class Run:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record, indent=2) + "\n")
 
-    def _seed_accounts(self, offline: bool) -> None:
+    def _seed_accounts(self, offline: bool, agent_provider: str = "agy") -> None:
+        """Enable the provider that dispatches agents.
+
+        FOUNDER ORDER 2026-11-13: no Claude model in any subagent. The default
+        is therefore agy, not claude. A Claude run needs the founder to name it.
+        """
         from . import providers
         from .store import Changes
         changes = Changes()
         for name in providers.catalog()["providers"]:
             account = providers.blank_account(name)
-            account["enabled"] = name == "simulator" if offline else name in ("claude", "simulator")
+            account["enabled"] = name == "simulator" if offline else name in (agent_provider, "simulator")
             changes.set("accounts", name, account)
         self.store.commit("account.status", changes)
 

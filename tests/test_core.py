@@ -598,6 +598,43 @@ class DocsAndSlugTest(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout), [planner.slug(t, "app") for t in samples])
 
 
+class NodeRoutingTest(unittest.TestCase):
+    """A DAG node may pin its provider and model (founder order 2026-11-17)."""
+
+    def test_a_node_override_reaches_model_selection(self):
+        from jbi import dag_loader, models
+        doc = {"tasks": [{"id": "X1", "title": "t", "goal": "g", "override": {
+            "provider": "agy", "model": "gemini-4-argon-high"}}]}
+        path = Path(tempfile.mkdtemp()) / "d.json"
+        path.write_text(json.dumps(doc))
+        task, = dag_loader.load_tasks(path)
+        state = {"config": {"profile": "balanced"}, "accounts": {}}
+        choice = models.select(state, "implement", task=task)
+        self.assertEqual((choice.provider, choice.model), ("agy", "gemini-4-argon-high"))
+
+    def test_a_model_without_a_provider_is_refused(self):
+        """A model id alone does not name the CLI that serves it, so refuse it.
+
+        A silent fall back to the cascade is the dangerous case: a node meant for
+        agy would run elsewhere and nothing would say so.
+        """
+        from jbi import dag_loader
+        doc = {"tasks": [{"id": "X1", "title": "t", "goal": "g", "override": {"model": "gemini-4-argon-high"}}]}
+        path = Path(tempfile.mkdtemp()) / "d.json"
+        path.write_text(json.dumps(doc))
+        with self.assertRaises(dag_loader.Invalid) as caught:
+            dag_loader.load_tasks(path)
+        self.assertIn("needs override.provider", str(caught.exception))
+
+    def test_an_unknown_provider_is_refused(self):
+        from jbi import dag_loader
+        doc = {"tasks": [{"id": "X1", "title": "t", "goal": "g", "override": {"provider": "openai"}}]}
+        path = Path(tempfile.mkdtemp()) / "d.json"
+        path.write_text(json.dumps(doc))
+        with self.assertRaises(dag_loader.Invalid):
+            dag_loader.load_tasks(path)
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
