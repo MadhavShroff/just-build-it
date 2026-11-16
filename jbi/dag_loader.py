@@ -105,7 +105,60 @@ def _normalize_json_node(node: Any) -> dict[str, Any]:
     out.setdefault("deps", [])
     out.setdefault("owns", [])
     out.setdefault("components", [])
+    _validate_override(out)
     return out
+
+
+# A node may pin the model and provider its stages run on (founder order
+# 2026-11-17: "a way to attach a particular dag node to a particular model and
+# provider"). It is a routing choice, never a speed choice: the scheduler still
+# defaults to the cascade, and an override names one provider for one node.
+_OVERRIDE_KEYS = ("prefer", "pin", "profile")
+_PROVIDERS = ("agy", "claude", "codex", "openai-compatible", "simulator")
+
+
+def _validate_override(node: dict[str, Any]) -> None:
+    """Refuse a malformed override, so a typo cannot silently fall back to the cascade.
+
+    A silent fallback is the dangerous case: a node meant for agy would run on
+    whatever the cascade names, and nothing would say so.
+    """
+    override = node.get("override")
+    if override is None:
+        return
+    tid = node.get("id") or "?"
+    if not isinstance(override, dict):
+        raise Invalid(f"task {tid}: override must be an object, not {type(override).__name__}")
+    unknown = sorted(set(override) - set(_OVERRIDE_KEYS))
+    if unknown:
+        raise Invalid(f"task {tid}: override names unknown key(s) {', '.join(unknown)}; "
+                      f"allowed: {', '.join(_OVERRIDE_KEYS)}")
+    prefer, pin = override.get("prefer"), override.get("pin")
+    if prefer is not None and pin is not None:
+        raise Invalid(f"task {tid}: override holds both prefer and pin; a task takes one "
+                      f"or the other, because a pin is a hard rule and a preference is not")
+    if prefer is not None:
+        if not isinstance(prefer, list) or not prefer:
+            raise Invalid(f"task {tid}: override.prefer must be a non-empty list")
+        for item in prefer:
+            if not isinstance(item, dict) or not item.get("provider"):
+                raise Invalid(f"task {tid}: each override.prefer entry needs a provider")
+            _check_provider(tid, item.get("provider"), "prefer")
+    if pin is not None:
+        if not isinstance(pin, dict):
+            raise Invalid(f"task {tid}: override.pin must be an object")
+        _check_provider(tid, pin.get("provider"), "pin")
+        if not isinstance(pin.get("model"), str) or not pin["model"].strip():
+            raise Invalid(f"task {tid}: override.pin needs a model, because a pin waits for "
+                          f"one exact model rather than a tier")
+    if override.get("profile") is not None and not isinstance(override["profile"], str):
+        raise Invalid(f"task {tid}: override.profile must be a string")
+
+
+def _check_provider(tid: str, provider: Any, where: str) -> None:
+    if not isinstance(provider, str) or provider not in _PROVIDERS:
+        raise Invalid(f"task {tid}: override.{where} provider {provider!r} is not one of "
+                      f"{', '.join(_PROVIDERS)}")
 
 
 def expand_node_subtasks(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
