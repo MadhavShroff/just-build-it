@@ -54,6 +54,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
     start.add_argument("--max-sessions", type=int, default=3, help="agents that run at the same time")
     start.add_argument("--lanes", type=int, default=0, help="CI lanes (default: from the CPU count)")
+    start.add_argument("--ci-service", choices=("local", "illm"), default="local",
+                       help="CI service for the merge stage (default: local lanes)")
     start.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
     start.add_argument("--offline", action="store_true", help="use the offline simulator for every model")
     start.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
@@ -149,7 +151,8 @@ class Run:
         from .supervisor import Supervisor
         # The supervisor reads the repository from state.run.target, which the user sets in
         # the stack step. Offline runs enable only the simulator account, so selection picks it.
-        return Supervisor(self.store, RunHooks(self), self.dir, parent_pid=os.getpid())
+        return Supervisor(self.store, RunHooks(self), self.dir, parent_pid=os.getpid(),
+                          ci_service=getattr(self.args, "ci_service", "local"))
 
     def link_lines(self) -> list[str]:
         lines = []

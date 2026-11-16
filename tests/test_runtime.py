@@ -563,6 +563,41 @@ class ReviewFindings(unittest.TestCase):
         self.assertEqual(wt.head(worktree, "HEAD"), base_sha)
         self.assertFalse((worktree / "src" / "unowned.py").exists())
 
+    def test_10_external_ci_handover_pushes_creates_pr_and_calls_illm(self):
+        from jbi import ci_adapter as ci_mod
+        repo = self.tmp / "ci_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        base_sha = wt.commit_all(repo, "base")
+        t = task("a", owns=["src/a.py"])
+        sup, store, hooks = self.supervisor(repo, [t])
+        sup.ci_service = "illm"
+        worktree = wt.create_worktree(repo, "a", base_sha, sup.run_dir / "worktrees")
+        (worktree / "src").mkdir(exist_ok=True)
+        (worktree / "src" / "a.py").write_text("x = 1\n")
+        head_sha = wt.commit_all(worktree, "a: implement attempt 1")
+        sup._task_update("a", commit=head_sha)
+        calls: list[list[str]] = []
+
+        def fake_runner(argv, cwd):
+            calls.append(list(argv))
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(argv, 0, "https://github.com/org/repo/pull/812\n", "")
+            if argv[:4] == ["illm", "--json", "ci", "ready"]:
+                threading.Timer(0.05, lambda: sup._merged(MergeJob("a", "jbi/a", "vibe", worktree), head_sha)).start()
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued", "pr": 812}), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sup.ci_adapter = ci_mod.CIAdapter(runner=fake_runner)
+        ok = sup._merge("a", "vibe", worktree)
+        self.assertTrue(ok)
+        self.assertEqual(store.read("/plan/tasks/a/pr_number"), 812)
+        self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
+        self.assertTrue(any(c[:3] == ["gh", "pr", "create"] and "--draft" in c for c in calls))
+        self.assertIn(["illm", "--json", "ci", "ready", "812", "--head", head_sha], calls)
+
 
 if __name__ == "__main__":
     unittest.main()

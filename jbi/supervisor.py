@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, briefs, models, rigor, waves, worktrees as wt
+from . import agents, briefs, ci_adapter as ci_mod, models, rigor, waves, worktrees as wt
 from .contracts import Hooks
 from .lanes import Lanes, MergeJob
 from .shim import Groups, alive, process_start, run_command
@@ -92,12 +92,15 @@ class Session:
 
 class Supervisor:
     def __init__(self, store: Store, hooks: Hooks, run_dir: Path, repo: Path | None = None, *,
-                 parent_pid: int | None = None, use_tmux: bool = True):
+                 parent_pid: int | None = None, use_tmux: bool = True,
+                 ci_service: str | None = None, ci_adapter: ci_mod.CIAdapter | None = None):
         """`repo` pins the repository for tests. A real run leaves it None: the repository is
         always `state.run.target`, which the user can change until bootstrap starts."""
         self.store, self.hooks = store, hooks
         self.run_dir, self._repo = Path(run_dir), Path(repo) if repo else None
         self.parent_pid = parent_pid or os.getpid()
+        self.ci_service = ci_service or store.read("/config/ci_service") or "local"
+        self.ci_adapter = ci_adapter or ci_mod.CIAdapter()
         run_id = store.read("/run/id")
         self.tmux = Tmux(f"jbi-{run_id}", self.run_dir, self.parent_pid)
         self.tmux.available = self.tmux.available and use_tmux
@@ -112,6 +115,7 @@ class Supervisor:
         self._running: dict[str, threading.Thread] = {}
         self._merge_done: dict[str, threading.Event] = {}
         self._merge_ok: dict[str, bool] = {}
+        self._merge_notes: dict[str, list[str]] = {}
         self._waves_done: set[int] = set()
         self._all_merged = False
         self._scheduler: threading.Thread | None = None
@@ -350,7 +354,9 @@ class Supervisor:
             code, out = result.returncode, result.output
             return code == 0, f"exit {'timeout' if code is None else code}\n{out[-2000:]}", None
         if stage.role == "merge":
-            return self._merge(tid, level, worktree), "merged", None
+            ok = self._merge(tid, level, worktree)
+            notes = self._merge_notes.pop(tid, None)
+            return ok, "merged" if ok else ("\n".join(notes) if notes else "merge failed"), None
         return self._agent_stage(task, stage, worktree, findings)
 
     def _agent_stage(self, task: dict, stage: rigor.Stage, worktree: Path,
@@ -387,7 +393,21 @@ class Supervisor:
     def _merge(self, tid: str, level: str, worktree: Path) -> bool:
         done = threading.Event()
         self._merge_done[tid] = done
-        self.lanes.submit(MergeJob(tid, f"jbi/{tid}", level, worktree))
+        service = self.store.read("/config/ci_service") or self.ci_service
+        if service == "illm":
+            task = self.store.read(f"/plan/tasks/{tid}")
+            try:
+                handover = self.ci_adapter.handover(self.repo, task, base=self.branch)
+            except ci_mod.CIAdapterError as error:
+                self._merge_failed(MergeJob(tid, f"jbi/{tid}", level, worktree), [str(error)])
+                return self._merge_ok.pop(tid, False)
+            self._task_update(tid, pr_number=handover.pr_number, commit=handover.head_sha)
+            if not done.is_set():
+                self._task_update(tid, status="merging")
+            self.store.log("lane", f"{tid} handed over to illm ci ready #{handover.pr_number} @ {handover.head_sha[:10]}",
+                           task=tid)
+        else:
+            self.lanes.submit(MergeJob(tid, f"jbi/{tid}", level, worktree))
         while not done.wait(0.2):
             if self._stopping in ("quit", "kill", "standdown"):
                 return False
@@ -402,14 +422,17 @@ class Supervisor:
             patch = None
         self.hooks.task_merged(job.task, sha, patch)
         self._merge_ok[job.task] = True
-        self._merge_done[job.task].set()
+        if job.task in self._merge_done:
+            self._merge_done[job.task].set()
         self._progress()
         self.wake()
 
     def _merge_failed(self, job: MergeJob, notes: list[str]) -> None:
         self._merge_ok[job.task] = False
+        self._merge_notes[job.task] = list(notes)
         self.store.log("lane", f"{job.task} failed in a lane: {notes[0] if notes else ''}", task=job.task)
-        self._merge_done[job.task].set()
+        if job.task in self._merge_done:
+            self._merge_done[job.task].set()
 
     def _block_dependents(self, skipped: str) -> None:
         plan = self.store.read("/plan")
