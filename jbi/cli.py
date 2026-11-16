@@ -272,6 +272,13 @@ class Run:
         if path is None:
             if not getattr(args, "preview", False):
                 return
+            # A test must never publish to the live record. A suite run under pytest or
+            # unittest inherits no --registry, so without this guard it overwrote the
+            # founder's dashboard record with a temp dag and a dead pid (2026-11-17, and
+            # again the same day from a branch cut before the first fix). An explicit
+            # --registry still publishes, so a real preview and its test can both work.
+            if os.environ.get("PYTEST_CURRENT_TEST") or "unittest" in sys.modules:
+                return
             path = Path.home() / ".tangram-dev" / "jbi-preview.json"
         path = Path(path).expanduser()
         dag = getattr(args, "dag", None)
