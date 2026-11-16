@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from . import architecture, dag_loader, planner, providers, protocol, stack, waves
+from . import architecture, ci_adapter, dag_loader, planner, providers, protocol, stack, waves
 from .contracts import Runtime
 from .llm import Completer, CompletionError
 from .protocol import ProtocolError
@@ -38,7 +38,8 @@ class Engine:
             "run.configure": self._run_configure,
             "run.start": self._run_start, "task.override": self._task_override,
             "task.retry": self._task_control, "task.pause": self._task_control,
-            "task.resume": self._task_control, "decision.answer": self._decision_answer,
+            "task.resume": self._task_control, "ci.notice": self._ci_notice,
+            "decision.answer": self._decision_answer,
             "account.set": self._account_set, "account.probe": self._account_probe,
             "architecture.refresh": self._architecture_refresh, "run.stop": self._run_stop,
         }
@@ -268,6 +269,24 @@ class Engine:
     def _task_control(self, ctype: str, payload: dict) -> None:
         self._task(payload["task"])
         self._require_runtime().control(payload["task"], ctype.split(".", 1)[1])
+
+    def _ci_notice(self, ctype: str, payload: dict) -> None:
+        notice = {**(payload.get("data") or {}), **{k: v for k, v in payload.items() if k != "data"}}
+        verdict = notice.get("verdict")
+        if verdict not in protocol.CI_VERDICTS:
+            raise ProtocolError("payload_invalid", "ci.notice needs a valid 'verdict'.", field="verdict")
+        tid = ci_adapter.match_task(self.store.read("/plan"), notice)
+        if self.runtime is not None and callable(getattr(self.runtime, "ci_notice", None)):
+            self.runtime.ci_notice(tid, notice)
+            return
+        if verdict in ("green", "merged"):
+            sha = notice.get("merge_sha") or notice.get("head_sha") or self.store.read(f"/plan/tasks/{tid}/commit")
+            self.store.commit("task.status", Changes().set("plan", "tasks", tid, "status", "merged")
+                              .set("plan", "tasks", tid, "commit", sha), {"task": tid})
+        else:
+            findings = ci_adapter.format_failure_findings(notice)
+            self.store.commit("task.status", Changes().set("plan", "tasks", tid, "findings", findings),
+                              {"task": tid})
 
     def _decision_answer(self, ctype: str, payload: dict) -> None:
         decision = self.store.read(f"/decisions/{payload['decision']}")

@@ -138,6 +138,7 @@ POST /api/v1/commands
 | `task.retry` | execute | `task`: id |
 | `task.pause` | execute | `task`: id |
 | `task.resume` | execute | `task`: id |
+| `ci.notice` | execute | optional `task`: id, `pr_number`: int, `head_sha`: string, `verdict`: string, `job_id`: string, `failed_gates`: list, `evidence_url`: string, `first_failure_excerpt`: string, `data`: object |
 | `decision.answer` | any | `decision`: id, `answer`: string |
 | `account.set` | any | `provider`: id, `enabled`: bool, optional `api_key`: string |
 | `account.probe` | any | `provider`: id |

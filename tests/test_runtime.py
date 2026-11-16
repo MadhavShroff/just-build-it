@@ -598,6 +598,65 @@ class ReviewFindings(unittest.TestCase):
         self.assertTrue(any(c[:3] == ["gh", "pr", "create"] and "--draft" in c for c in calls))
         self.assertIn(["illm", "--json", "ci", "ready", "812", "--head", head_sha], calls)
 
+    def test_11_ci_notice_failure_wakes_task_and_rebriefs_with_structured_findings(self):
+        from jbi import briefs, ci_adapter as ci_mod
+        from jbi.engine import Engine
+        repo = self.tmp / "notice_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+        t = task("a", owns=["src/a.txt"])
+        sup, store, hooks = self.supervisor(repo, [t])
+        store.commit("p", Changes().replace("run", "phase", "execute"))
+        sup.ci_service = "illm"
+        engine = Engine(store, completer=None, runtime=sup)
+        ready_calls = 0
+
+        def fake_runner(argv, cwd):
+            nonlocal ready_calls
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([{"number": 812}]) if ready_calls else "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(argv, 0, "812\n", "")
+            if argv[:4] == ["illm", "--json", "ci", "ready"]:
+                ready_calls += 1
+                sha = argv[6]
+                if ready_calls == 1:
+                    threading.Timer(0.05, lambda: engine.submit({
+                        "id": "n-1",
+                        "type": "ci.notice",
+                        "payload": {
+                            "schema": "illm.ci.failure.v1",
+                            "job_id": "20261116-183000-l0-gA",
+                            "pr_number": 812,
+                            "head_sha": sha,
+                            "verdict": "red",
+                            "failed_gates": ["backend-unit", "authority"],
+                            "evidence_url": "file:///tmp/ev/result.json",
+                            "first_failure_excerpt": "412: FAIL src/auth/authority.spec.ts",
+                            "retry_allowed": True,
+                        },
+                    })).start()
+                else:
+                    threading.Timer(0.05, lambda: engine.submit({
+                        "id": "n-2",
+                        "type": "ci.notice",
+                        "payload": {"pr_number": 812, "head_sha": sha, "verdict": "merged", "merge_sha": sha},
+                    })).start()
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sup.ci_adapter = ci_mod.CIAdapter(runner=fake_runner)
+        sup.start_execution()
+        self.assertTrue(hooks.merged_event.wait(60), store.read("/plan/tasks/a"))
+        self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
+        self.assertEqual(store.read("/plan/tasks/a/attempts"), 1)
+        second_brief = briefs.brief_path(sup.run_dir, "a", "implement", 1).read_text()
+        self.assertIn("20261116-183000-l0-gA", second_brief)
+        self.assertIn("backend-unit, authority", second_brief)
+        self.assertIn("file:///tmp/ev/result.json", second_brief)
+        self.assertIn("412: FAIL src/auth/authority.spec.ts", second_brief)
+
 
 if __name__ == "__main__":
     unittest.main()

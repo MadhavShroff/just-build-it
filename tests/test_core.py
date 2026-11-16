@@ -393,6 +393,31 @@ class EngineTest(unittest.TestCase):
             time.sleep(0.02)
         self.assertIn("claude: exit 2. The CLI call failed.", self.store.read("/timeline")[-1]["text"])
 
+    def test_ci_notice_matches_pr_and_head_and_records_structured_findings(self):
+        plan = waves.compile_plan([task("core")], 1)
+        plan["tasks"]["core"]["pr_number"] = 812
+        plan["tasks"]["core"]["commit"] = "ec95b9dbd0123456789abcdef0123456789abcde"
+        self.store.commit("plan.updated", Changes().replace("plan", plan).replace("run", "phase", "execute"))
+        self.send("ci.notice", {
+            "schema": "illm.ci.failure.v1",
+            "job_id": "20261116-183000-l0-gA",
+            "pr_number": 812,
+            "head_sha": "ec95b9dbd0123456789abcdef0123456789abcde",
+            "verdict": "red",
+            "failed_gates": ["backend-unit", "authority"],
+            "evidence_url": "file:///tmp/result.json",
+            "first_failure_excerpt": "412: FAIL src/auth/authority.spec.ts",
+            "retry_allowed": True,
+        })
+        findings = "\n".join(self.store.read("/plan/tasks/core/findings"))
+        self.assertIn("20261116-183000-l0-gA", findings)
+        self.assertIn("backend-unit, authority", findings)
+        self.assertIn("file:///tmp/result.json", findings)
+        self.assertIn("412: FAIL src/auth/authority.spec.ts", findings)
+        with self.assertRaises(ProtocolError) as caught:
+            self.send("ci.notice", {"pr_number": 812, "head_sha": "wrong-sha", "verdict": "red"})
+        self.assertEqual(caught.exception.code, "conflict")
+
 
 class SignalTest(unittest.TestCase):
     """Finding 9: the first SIGINT or SIGTERM stands down; any later one kills at once."""

@@ -434,6 +434,20 @@ class Supervisor:
         if job.task in self._merge_done:
             self._merge_done[job.task].set()
 
+    def ci_notice(self, tid: str, notice: dict) -> None:
+        verdict = notice.get("verdict")
+        worktree = self.run_dir / "worktrees" / tid
+        level = self.store.read("/config/rigor") or "high"
+        job = MergeJob(tid, f"jbi/{tid}", level, worktree)
+        if verdict in ("green", "merged"):
+            sha = str(notice.get("merge_sha") or notice.get("head_sha")
+                      or self.store.read(f"/plan/tasks/{tid}/commit") or "")
+            self._merged(job, sha)
+            return
+        findings = ci_mod.format_failure_findings(notice)
+        self._task_update(tid, findings=findings)
+        self._merge_failed(job, findings)
+
     def _block_dependents(self, skipped: str) -> None:
         plan = self.store.read("/plan")
         changes = Changes()
