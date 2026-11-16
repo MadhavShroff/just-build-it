@@ -46,7 +46,11 @@ def normalize(task: dict) -> dict:
         "deps": list(task.get("deps", [])), "acceptance": task["acceptance"].strip(),
         "owns": list(task.get("owns", [])), "components": list(task.get("components", [])),
         "wave": 0, "status": "blocked", "stage": None, "attempts": 0,
-        "override": {}, "branch": f"jbi/{task['id']}", "commit": None, "receipt": None,
+        # A DAG node's routing override must survive compilation. The supervisor
+        # reads the compiled plan, so an override dropped here is an override the
+        # runtime never sees: a pinned node would run on the cascade instead.
+        "override": dict(task.get("override") or {}),
+        "branch": f"jbi/{task['id']}", "commit": None, "receipt": None,
     }
     for key in OPTIONAL_TASK_META:
         if key in task and task[key] is not None:
@@ -152,10 +156,16 @@ def compile_plan(tasks: list[dict] | dict, revision: int = 1) -> dict:
 
 
 def ready_tasks(plan: dict) -> list[str]:
-    """Tasks whose dependencies are all merged and that have not started."""
+    """Tasks whose dependencies are all merged and that have not started.
+
+    `waiting-model` is eligible again: a task that waits for a pinned model is
+    not started and not failed, so the next pump must offer it to the scheduler
+    again. The supervisor re-checks the pin each time, so a task that is still
+    blocked simply waits again.
+    """
     tasks = plan.get("tasks", {})
     return [tid for tid in plan.get("order", [])
-            if tasks[tid]["status"] in ("blocked", "ready")
+            if tasks[tid]["status"] in ("blocked", "ready", "waiting-model")
             and all(tasks[d]["status"] == DONE for d in tasks[tid]["deps"])]
 
 

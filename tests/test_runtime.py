@@ -14,11 +14,11 @@ import unittest
 import uuid
 from pathlib import Path
 
-from jbi import protocol, waves, worktrees as wt
+from jbi import briefs, protocol, waves, worktrees as wt
 from jbi.lanes import Lanes, MergeJob
 from jbi.shim import Groups
 from jbi.store import Changes, Store
-from jbi.supervisor import Supervisor
+from jbi.supervisor import WINDOW_NAME, Supervisor
 
 HAS_TMUX = shutil.which("tmux") is not None
 
@@ -124,6 +124,161 @@ class Admission(RunFixture):
         self.assertTrue(self.hooks.stopped_event.wait(20))
 
 
+class StepWindows(RunFixture):
+    """REQUIREMENT 1.1 to 1.6: one step, one window, closed and verified gone.
+
+    Every assertion here reads the tmux server, not the runtime's own record. A
+    runtime that only SAYS it closed a window passes no test in this class.
+    """
+
+    def record_opens(self, sup):
+        """Wrap `tmux.open` to note the live step-window ids when each window opens."""
+        opened, live_before = [], []
+        original = sup.tmux.open
+        step_ids = lambda: {wid for wid, name in sup.tmux._windows().items()
+                            if WINDOW_NAME.match(name)}
+
+        def recording_open(name, argv):
+            live_before.append(step_ids())
+            window = original(name, argv)
+            opened.append(window)
+            return window
+
+        sup.tmux.open = recording_open
+        return opened, live_before
+
+    def test_two_serial_stages_use_two_windows_and_the_first_is_gone_before_the_second(self):
+        """One task, two SEQUENTIAL steps: the second window opens after the first is gone.
+
+        The four review steps of one task run at the same time by founder rule
+        2026-11-16, so a test over a whole high-rigor run cannot assert "no earlier
+        window is live". This test drives two steps one after the other and reads
+        the tmux server between them.
+        """
+        if not HAS_TMUX:
+            self.skipTest("tmux is not installed")
+        sup = self.make([task("a")], rigor="vibe")
+        opened, live_before = self.record_opens(sup)
+        cmd = ["true"]
+        cwd = self.tmp
+        sup.run_session("a", "implement", cmd, cwd, "simulator", "sim-s", 0)
+        sup.run_session("a", "verify", cmd, cwd, "simulator", "sim-s", 0)
+        ids = [w.wid for w in opened if w is not None]
+        self.assertEqual(len(ids), 2, "two steps must open two windows")
+        self.assertNotEqual(ids[0], ids[1], "each step needs its own window")
+        self.assertNotIn(ids[0], live_before[1],
+                         f"window {ids[0]} was still live when the second step started")
+        self.assertNotIn(ids[0], sup.tmux._windows(), "the first window must be gone")
+
+    def test_two_stages_use_two_windows(self):
+        if not HAS_TMUX:
+            self.skipTest("tmux is not installed")
+        sup = self.make([task("a")], rigor="medium")
+        opened, _live = self.record_opens(sup)
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
+        ids = [w.wid for w in opened if w is not None]
+        self.assertGreaterEqual(len(ids), 2, "one task with agent stages must open two windows")
+        self.assertEqual(len(set(ids)), len(ids), "each step needs its own window")
+        names = [w.name for w in opened if w is not None and WINDOW_NAME.match(w.name)]
+        self.assertEqual(names[0], names[1], "one task and one provider keep one name pattern")
+
+    def test_every_step_window_is_closed_when_the_task_ends(self):
+        if not HAS_TMUX:
+            self.skipTest("tmux is not installed")
+        sup = self.make([task("a")], rigor="medium")
+        opened, _live = self.record_opens(sup)
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
+        leftover = [w for w in opened
+                    if w is not None and WINDOW_NAME.match(w.name) and w.wid in sup.tmux._windows()]
+        self.assertEqual(leftover, [], "a step window must not outlive its step")
+        # REQUIREMENT 1.6: only the receipt survives. The step scratch files are gone.
+        self.assertEqual(sorted(p.name for p in (sup.run_dir / "sessions").glob("*")), [],
+                         "session scratch files must be reclaimed")
+        self.assertTrue(briefs.receipt_path(sup.run_dir, "a", "implement", 0).exists(),
+                        "the receipt is the one thing that survives")
+
+    def test_window_name_matches_the_required_pattern(self):
+        sup = self.make([task("a"), task("b"), task("c", deps=["a", "b"])], rigor="vibe")
+        for tid in ("a", "b", "c"):
+            name = sup.window_name(tid, "agy")
+            self.assertRegex(name, r"^[a-z0-9-]+-wave\d+-task\d+-[a-z-]+$")
+        # wave 1 holds a and b; c is task 1 of wave 2.
+        self.assertEqual(sup.window_name("b", "agy"), "t-wave1-task2-agy")
+        self.assertEqual(sup.window_name("c", "agy"), "t-wave2-task1-agy")
+
+    def test_dag_name_is_lowercased_with_hyphens(self):
+        sup = self.make([task("a")], rigor="vibe")
+        self.store.commit("run.name", Changes().set("plan", "prd", {"name": "Waves 4"}), {})
+        self.assertEqual(sup.window_name("a", "openai-compatible"),
+                         "waves-4-wave1-task1-openai-compatible")
+
+
+class DirectivesAreDry(unittest.TestCase):
+    """REQUIREMENT 3.3, 3.5 and 3.6: the common block is declared once, never copied.
+
+    3.6 says a directive that repeats a common instruction is a defect. Requirement
+    4.3 then says the render JOINS the common block to the step block, so each
+    assembled prompt legitimately holds the common text once. The defect this class
+    catches is a SECOND copy: one in the common block and one in the step block, or
+    a copy written into a step declaration in the source.
+    """
+
+    def test_no_common_instruction_is_copied_into_any_prompt(self):
+        from jbi import briefs, rigor
+        sample = {"id": "a", "title": "A", "goal": "build a", "acceptance": "true", "owns": ["src/a.py"]}
+        prompts = [briefs.render(task=sample, role=stage.role, stage=stage.name, attempt=0,
+                                 receipt=Path("/tmp/r")) for stage in rigor.pipeline("high")]
+        for _number, text in briefs.COMMON:
+            for index, prompt in enumerate(prompts):
+                self.assertEqual(prompt.count(text), 1,
+                                 f"common instruction {text!r} appears {prompt.count(text)} "
+                                 f"times in prompt {index + 1}, not once")
+
+    def test_no_step_declaration_holds_a_common_instruction(self):
+        """A step block holds no part of a common instruction, not only no whole one.
+
+        A whole-string check was the first version and it let a FRAGMENT through: a
+        step block could carry "Edit only the owned paths." without the rest and no
+        test failed (found 2026-11-17 while mutating this guard). So every SENTENCE
+        of a common instruction is checked, and a sentence of 20 characters or more
+        must not appear in a step block.
+        """
+        from jbi import briefs
+        step_texts = [("stage", text) for _n, text in briefs.STAGE_DIRECTIVES.values()]
+        step_texts += [("role", text) for _n, text in briefs.ROLE_DIRECTIVES.values()]
+        for _number, common in briefs.COMMON:
+            sentences = [s.strip() for s in common.split(". ") if len(s.strip()) >= 20]
+            sentences.append(common)
+            for where, step in step_texts:
+                for sentence in sentences:
+                    self.assertNotIn(sentence, step,
+                                     f"the {where} block repeats part of a common instruction: "
+                                     f"{sentence!r}")
+
+    def test_the_common_block_is_declared_once_in_the_source(self):
+        from jbi import briefs
+        source = Path(briefs.__file__).read_text()
+        for _number, text in briefs.COMMON:
+            self.assertEqual(source.count(text), 1,
+                             f"common instruction {text!r} is written {source.count(text)} "
+                             f"times in {briefs.__file__}")
+
+    def test_the_step_block_carries_only_the_step_instruction(self):
+        from jbi import briefs
+        sample = {"id": "a", "title": "A", "goal": "build a", "acceptance": "true"}
+        implement = briefs.render(task=sample, role="implement", stage="implement", attempt=0,
+                                  receipt=Path("/tmp/r"))
+        dry_run = briefs.render(task=sample, role="review", stage="dry-run", attempt=0,
+                                receipt=Path("/tmp/r"))
+        # One numbered step line each, and each line is false of the other step.
+        self.assertIn("Step 8.", implement)
+        self.assertNotIn("Step 7.", implement)
+        self.assertIn("Step 7.", dry_run)
+        self.assertNotIn("Step 8.", dry_run)
+
+
 class Runs(RunFixture):
     def test_dry_run_rehearses_the_landing_path_and_merges_nothing(self):
         """A dry run walks the whole pipeline and never lands anything.
@@ -155,7 +310,7 @@ class Runs(RunFixture):
         self.assertIn(("wave", 2), self.hooks.calls)
         self.assertEqual(self.store.read("/telemetry/tokens_in"), 240)
         if HAS_TMUX:
-            self.assertEqual(self.store.read("/sessions/s-a-implement-1/window"), "a:implement")
+            self.assertEqual(self.store.read("/sessions/s-a-implement-1/window"), "t-wave1-task1-simulator")
 
     def test_high_run_merges(self):
         sup = self.make([task("a"), task("b")], rigor="high")
@@ -170,7 +325,118 @@ class Runs(RunFixture):
         self.assertTrue(all(s["status"] == "passed" for s in stages.values()))
         for rname in ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
                       "test-audit", "methodology-audit", "dry-run"):
-            self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result", "model": "sim-l"})
+            # The stage record names the provider that ran the stage, so a reader
+            # can see which one ran each step (founder order 2026-11-17).
+            self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result",
+                                             "model": "sim-l", "provider": "simulator"})
+
+
+class ReviewFanout(RunFixture):
+    """The four reviews run AT THE SAME TIME, not one after another.
+
+    FOUNDER RULE 2026-11-16 and the founder's 2026-11-17 correction: stages 4, 5,
+    6 and 7 are one parallel group, so the pipeline is 9 sequential steps and not
+    12. A test that only checks the four stages were RECORDED proves nothing about
+    timing: four sequential calls record exactly the same four rows. This test
+    holds each review at a barrier until all four have arrived, so it can only
+    pass when all four are in flight together.
+    """
+
+    def test_all_four_reviews_are_in_flight_at_once(self):
+        sup = self.make([task("a")], rigor="high")
+        FANOUT = ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3")
+        barrier = threading.Barrier(4, timeout=20)
+        arrived, lock = [], threading.Lock()
+        original = sup._agent_stage
+
+        def agent_stage(task_, stage, worktree, findings, *, discard=True):
+            # Only the four fan-out stages, not the later audits that also carry
+            # role "review": those are separate sequential steps, not this group.
+            if stage.name in FANOUT:
+                with lock:
+                    arrived.append(stage.name)
+                # Blocks until FOUR reviews have reached this point. If the reviews
+                # ran one at a time, the first would time out here and the test fails.
+                barrier.wait()
+            return original(task_, stage, worktree, findings, discard=discard)
+
+        sup._agent_stage = agent_stage
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
+        self.assertEqual(sorted(set(arrived)), sorted(FANOUT),
+                         "not all four review stages ran: %r" % arrived)
+
+    def test_a_review_group_is_one_sequential_step(self):
+        """The pipeline is 9 steps, because the four reviews are one step."""
+        from jbi import rigor
+        stages = rigor.PIPELINES["high"]
+        names = [s.name for s in stages]
+        self.assertEqual(len(names), 12, names)
+        review_names = [s.name for s in rigor.review_stages()]
+        self.assertEqual(review_names,
+                         ["review-cascade", "review-ds-1", "review-ds-2", "review-ds-3"])
+        # The four are adjacent in the pipeline: nothing sits between them, so they
+        # form the one group the supervisor fans out.
+        first = names.index("review-cascade")
+        self.assertEqual(names[first:first + 4], review_names,
+                         "the review stages are not adjacent, so they cannot be one group")
+        self.assertEqual(len(names) - (len(review_names) - 1), 9,
+                         "the sequential step count is not 9")
+
+
+class PinnedTaskWaits(RunFixture):
+    """A pinned task WAITS for its model instead of running somewhere else.
+
+    FOUNDER ORDER 2026-11-17: a pin is a hard rule. A task that pins a model runs
+    on that model or waits. It never falls back to the cascade.
+    """
+
+    def pin(self, provider="claude", model="claude-opus-5-5"):
+        self.store.commit("plan", Changes().set(
+            "plan", "tasks", "a", "override", {"pin": {"provider": provider, "model": model}}), {})
+
+    def test_a_pinned_task_waits_and_starts_no_agent(self):
+        sup = self.make([task("a", owns=["src/a.txt"])], rigor="vibe")
+        self.pin()                       # claude is not enabled; only the simulator is
+        started: list[tuple] = []
+        original = sup.run_session
+
+        def run_session(tid, role, cmd, cwd, provider, model, attempt):
+            started.append((tid, role, provider))
+            return original(tid, role, cmd, cwd, provider, model, attempt)
+
+        sup.run_session = run_session
+        sup.start_execution()
+        self.assertTrue(wait_for(lambda: self.status("a") == "waiting-model", 20),
+                        self.store.read("/plan/tasks/a"))
+        self.assertEqual(started, [], "a pinned task started an agent while its model was unavailable")
+        self.assertIn("claude", self.store.read("/plan/tasks/a/waiting_reason"))
+        self.assertIsNone(self.store.read("/plan/tasks/a/commit"), "a waiting task committed work")
+        sup.stop("quit")
+        self.assertTrue(self.hooks.stopped_event.wait(20))
+
+    def test_the_same_task_runs_once_the_provider_is_enabled(self):
+        sup = self.make([task("a", owns=["src/a.txt"])], rigor="vibe")
+        self.pin()
+        sup.start_execution()
+        self.assertTrue(wait_for(lambda: self.status("a") == "waiting-model", 20),
+                        self.store.read("/plan/tasks/a"))
+        # The claude CLI is not installed in the test box, so the agent stage is
+        # stubbed. The merge stage runs for real, so the task lands. This test
+        # proves ADMISSION after the provider becomes usable, not the claude CLI.
+        real = sup._run_stage
+
+        def run_stage(task_, stage, level, worktree, findings):
+            if stage.role == "merge":
+                return real(task_, stage, level, worktree, findings)
+            return True, "ok", "claude-opus-5-5"
+
+        sup._run_stage = run_stage
+        self.store.commit("account.status", Changes().set(
+            "accounts", "claude", {"label": "Claude", "enabled": True, "status": "ok"}), {})
+        sup.wake()
+        self.assertTrue(wait_for(lambda: self.status("a") == "merged", 60),
+                        self.store.read("/plan/tasks/a"))
 
 
 class Failures(RunFixture):
@@ -924,7 +1190,13 @@ class ReviewFindings(unittest.TestCase):
             '    acceptance: "true"\n'
             '    owns: ["src/cli.py"]\n'
         )
-        args = cli.parse_args(["--dag", str(dag_file), "--dry-run", "--preview", "--no-tailscale", "--no-menu"])
+        # --registry is REQUIRED here. Without it the preview run publishes to
+        # ~/.tangram-dev/jbi-preview.json, which is the LIVE registry the board
+        # proxy reads: a test would repoint the founder's dashboard at a fixture
+        # DAG named preview_dag.yaml (found 2026-11-17 00:19).
+        registry = self.tmp / "test-jbi-preview.json"
+        args = cli.parse_args(["--dag", str(dag_file), "--dry-run", "--preview", "--no-tailscale",
+                               "--no-menu", "--registry", str(registry)])
         run = cli.Run(args)
         self.addCleanup(run.close)
         self.addCleanup(lambda: (run.runtime.stop("kill"), run.stopped.wait(20)))
