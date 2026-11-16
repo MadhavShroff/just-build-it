@@ -269,7 +269,8 @@ class Supervisor:
         with self._lock:
             self.sessions[sid] = session
         self.store.commit("session.status", Changes().set("sessions", sid, {
-            "task": task, "role": role, "model": model, "window": window, "window_id": session.window_id,
+            "task": task, "role": role, "provider": provider, "model": model,
+            "window": window, "window_id": session.window_id,
             "status": "running", "started": now(),
             "note": None if window else "tmux is missing; the shim runs as a direct child"}),
             {"session": sid, "task": task})
@@ -411,11 +412,18 @@ class Supervisor:
             return
         with self._lock:
             plan, config = self.store.read("/plan"), self.store.read("/config")
+            state = self.store.snapshot()[1]
             running = [t for t, th in self._running.items() if th.is_alive()]
             for tid in waves.ready_tasks(plan):
                 if len(running) >= config["max_sessions"]:
                     break
                 if tid in running or waves.owns_conflict(plan, tid, running):
+                    continue
+                # A task that waits for a pinned model is offered again on every
+                # pump. Skip it here while the pin still blocks, so a wait costs no
+                # thread and no write. The moment the provider is usable the task
+                # is admitted and starts.
+                if plan["tasks"][tid]["status"] == "waiting-model" and models.blocked(state, plan["tasks"][tid]):
                     continue
                 thread = threading.Thread(target=self._run_task, args=(tid,), name=f"jbi-{tid}", daemon=True)
                 self._running[tid] = thread
@@ -441,8 +449,32 @@ class Supervisor:
             except Exception:
                 pass
 
+    def _stage_provider(self, tid: str, stage: str, attempt: int) -> str | None:
+        """The provider that ran one stage, read from its session record.
+
+        The stage record names the provider so a reader can see which one ran each
+        stage. The session record already holds it, so the stage tuple that
+        `_run_stage` returns keeps its shape.
+        """
+        return self.store.read(f"/sessions/s-{tid}-{stage}-{attempt + 1}/provider")
+
     def _run_task_body(self, tid: str) -> None:
         task = self.store.read(f"/plan/tasks/{tid}")
+        # A PINNED task waits for its model. FOUNDER ORDER 2026-11-17: a pin is a
+        # hard rule, so a task that pins a model runs on that model or waits. It
+        # never falls back to the cascade. The check sits before the worktree is
+        # made and before the first stage runs, so a waiting task starts no agent
+        # and leaves nothing behind. The task is not failed: the scheduler admits
+        # it again on a later pump, once the provider is usable.
+        reason = models.blocked(self.store.snapshot()[1], task)
+        if reason:
+            # Write only on a change. The scheduler offers a waiting task again on
+            # every pump, and a write on each pump would wake the scheduler again
+            # and spin. An unchanged wait is silent.
+            if task.get("status") != "waiting-model" or task.get("waiting_reason") != reason:
+                self._task_update(tid, status="waiting-model", waiting_reason=reason)
+                self.store.log("task", f"{tid} waits: {reason}", task=tid)
+            return
         base = wt.head(self.repo, self.branch)
         if base is None:
             raise wt.GitError(f"base branch {self.branch} has no commit")
@@ -466,7 +498,10 @@ class Supervisor:
                 self.store.commit("task.stage", Changes()
                                   .set("plan", "tasks", tid, "stages", {**(task.get("stages") or {}),
                                        stage.name: {"status": "passed" if ok else "failed",
-                                                    "detail": detail[:2000], "model": model}}), {"task": tid})
+                                                    "detail": detail[:2000], "model": model,
+                                                    "provider": self._stage_provider(
+                                                        tid, stage.name, task.get("attempts", 0))}}),
+                                  {"task": tid})
             if ok:
                 if stage.role == "merge":
                     self._reclaim_worktree(tid, worktree)
@@ -565,6 +600,7 @@ class Supervisor:
                     "status": "passed" if s_ok else "failed",
                     "detail": s_detail[:2000],
                     "model": s_model,
+                    "provider": self._stage_provider(tid, s.name, task.get("attempts", 0)),
                 }
             self.store.commit("task.stage", Changes().set("plan", "tasks", tid, "stages", recorded),
                               {"task": tid})

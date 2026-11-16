@@ -202,17 +202,18 @@ An `api_key` goes to the keychain. The server never echoes the key, never stores
 
 `run.busy` is `null` when no model work runs. While the planner works on a model call, `run.busy` is `{label, since}`: `label` names the step for the user, and `since` is the start time. A `run.config` event sets and clears it. A second model command during this time gets `409 conflict`.
 
-A task `status` is one of `blocked`, `ready`, `running`, `verifying`, `queued`, `merging`, `merged`, `failed`, `paused`, `decision`, or `skipped`. `skipped` means the user chose to skip the task. A skipped task has no merge commit, and its dependents stay `blocked`.
+A task `status` is one of `blocked`, `ready`, `running`, `verifying`, `queued`, `merging`, `merged`, `failed`, `paused`, `decision`, `skipped`, or `waiting-model`. `skipped` means the user chose to skip the task. A skipped task has no merge commit, and its dependents stay `blocked`. `waiting-model` means the task pins a model that is not available. A waiting task starts no agent and is not failed. The scheduler offers it again on a later pump, and it starts when the pinned provider becomes usable.
 
 The runtime also writes these task fields:
 
 | Field | Meaning |
 |---|---|
-| `stages` | Each stage name maps to `{status, detail, model}`. |
+| `stages` | Each stage name maps to `{status, detail, model, provider}`. |
 | `attempts` | Failed attempts so far. Two failures move the implementer up one tier. |
 | `attempt_history` | One entry for each attempt, kept across retries for escalation. |
 | `resume_after` | The stage after which a paused task continues. |
 | `blocked_reason` | Why a task cannot start, for example `dependency core was skipped`. |
+| `waiting_reason` | Why a task waits for its model, for example `pinned to claude / claude-opus-5-5, which is not available`. |
 
 `bootstrap.branch` names the repository branch that tasks merge into. A new repository uses `main`. An existing repository keeps its own current branch.
 

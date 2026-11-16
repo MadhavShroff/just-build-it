@@ -19,7 +19,8 @@ DETAIL_LEVELS = ("user", "guided", "delegate")
 STOP_MODES = ("quit", "standdown", "finish", "kill")
 CI_VERDICTS = ("red", "void", "merge-blocked", "green", "merged")
 TASK_STATUSES = ("blocked", "ready", "running", "verifying", "queued",
-                 "merging", "merged", "failed", "paused", "decision", "skipped")
+                 "merging", "merged", "failed", "paused", "decision", "skipped",
+                 "waiting-model")
 TASK_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 COMMAND_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 ANY_PHASE = PHASES

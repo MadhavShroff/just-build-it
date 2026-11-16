@@ -312,7 +312,10 @@ class Runs(RunFixture):
         self.assertTrue(all(s["status"] == "passed" for s in stages.values()))
         for rname in ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
                       "test-audit", "methodology-audit", "dry-run"):
-            self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result", "model": "sim-l"})
+            # The stage record names the provider that ran the stage, so a reader
+            # can see which one ran each step (founder order 2026-11-17).
+            self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result",
+                                             "model": "sim-l", "provider": "simulator"})
 
 
 class ReviewFanout(RunFixture):
@@ -366,6 +369,61 @@ class ReviewFanout(RunFixture):
                          "the review stages are not adjacent, so they cannot be one group")
         self.assertEqual(len(names) - (len(review_names) - 1), 9,
                          "the sequential step count is not 9")
+
+
+class PinnedTaskWaits(RunFixture):
+    """A pinned task WAITS for its model instead of running somewhere else.
+
+    FOUNDER ORDER 2026-11-17: a pin is a hard rule. A task that pins a model runs
+    on that model or waits. It never falls back to the cascade.
+    """
+
+    def pin(self, provider="claude", model="claude-opus-5-5"):
+        self.store.commit("plan", Changes().set(
+            "plan", "tasks", "a", "override", {"pin": {"provider": provider, "model": model}}), {})
+
+    def test_a_pinned_task_waits_and_starts_no_agent(self):
+        sup = self.make([task("a", owns=["src/a.txt"])], rigor="vibe")
+        self.pin()                       # claude is not enabled; only the simulator is
+        started: list[tuple] = []
+        original = sup.run_session
+
+        def run_session(tid, role, cmd, cwd, provider, model, attempt):
+            started.append((tid, role, provider))
+            return original(tid, role, cmd, cwd, provider, model, attempt)
+
+        sup.run_session = run_session
+        sup.start_execution()
+        self.assertTrue(wait_for(lambda: self.status("a") == "waiting-model", 20),
+                        self.store.read("/plan/tasks/a"))
+        self.assertEqual(started, [], "a pinned task started an agent while its model was unavailable")
+        self.assertIn("claude", self.store.read("/plan/tasks/a/waiting_reason"))
+        self.assertIsNone(self.store.read("/plan/tasks/a/commit"), "a waiting task committed work")
+        sup.stop("quit")
+        self.assertTrue(self.hooks.stopped_event.wait(20))
+
+    def test_the_same_task_runs_once_the_provider_is_enabled(self):
+        sup = self.make([task("a", owns=["src/a.txt"])], rigor="vibe")
+        self.pin()
+        sup.start_execution()
+        self.assertTrue(wait_for(lambda: self.status("a") == "waiting-model", 20),
+                        self.store.read("/plan/tasks/a"))
+        # The claude CLI is not installed in the test box, so the agent stage is
+        # stubbed. The merge stage runs for real, so the task lands. This test
+        # proves ADMISSION after the provider becomes usable, not the claude CLI.
+        real = sup._run_stage
+
+        def run_stage(task_, stage, level, worktree, findings):
+            if stage.role == "merge":
+                return real(task_, stage, level, worktree, findings)
+            return True, "ok", "claude-opus-5-5"
+
+        sup._run_stage = run_stage
+        self.store.commit("account.status", Changes().set(
+            "accounts", "claude", {"label": "Claude", "enabled": True, "status": "ok"}), {})
+        sup.wake()
+        self.assertTrue(wait_for(lambda: self.status("a") == "merged", 60),
+                        self.store.read("/plan/tasks/a"))
 
 
 class Failures(RunFixture):
