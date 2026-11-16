@@ -102,6 +102,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     resume.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
     resume.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
     resume.add_argument("--if-exists", action="store_true", help="exit 0 cleanly when no stored run exists")
+    budget = sub.add_parser("budget", help="set or show one CPU and memory budget for a whole process tree")
+    budget_sub = budget.add_subparsers(dest="budget_command")
+    budget_set = budget_sub.add_parser("set", help="set the budget on a process and its whole tree")
+    budget_set.add_argument("pid", type=int)
+    budget_set.add_argument("--cpus", type=float, required=True)
+    budget_set.add_argument("--mem-gib", type=float, required=True)
+    budget_mode = budget_set.add_mutually_exclusive_group()
+    budget_mode.add_argument("--graceful", dest="graceful", action="store_true",
+                             help="lower the ceiling and let work finish (default)")
+    budget_mode.add_argument("--force", dest="force", action="store_true",
+                             help="apply now and kill the tree's own processes until it fits")
+    budget_set.add_argument("--deadline-s", dest="deadline_s", type=float, default=30.0,
+                            help="the graceful deadline in seconds (default: 30)")
+    budget_show = budget_sub.add_parser("show", help="print the kernel account of a tree")
+    budget_show.add_argument("pid", type=int)
     return parser.parse_args(argv)
 
 
@@ -501,6 +516,9 @@ def main(argv: list[str] | None = None) -> int:
         return client_command(args)
     if args.command == "resume":
         return resume_command(args)
+    if args.command == "budget":
+        from . import budget
+        return budget.main(args)
     return serve(args)
 
 
