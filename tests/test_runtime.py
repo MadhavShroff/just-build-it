@@ -833,6 +833,42 @@ class ReviewFindings(unittest.TestCase):
         pool = ceremony.WindowPool(run_dir / "window_pool.json")
         self.assertEqual(pool.get("work1")["status"], "free")
 
+    def test_14_cli_resume_reopens_stored_run_and_finishes_remaining_tasks(self):
+        from jbi import cli
+        repo = self.tmp / "resume_repo"
+        run_dir = self.tmp / "r-20261116-resume"
+        run_dir.mkdir(parents=True)
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+
+        state = protocol.initial_state("r-20261116-resume", "now", name="demo", mode="existing",
+                                       target=str(repo), max_sessions=2, lanes=1, tmux="")
+        state["config"]["rigor"] = "vibe"
+        state["run"]["phase"] = "execute"
+        state["bootstrap"]["status"] = "passed"
+        state["bootstrap"]["branch"] = "main"
+        state["accounts"] = {"simulator": {"label": "Simulator", "enabled": True, "status": "ok"}}
+        plan = waves.compile_plan([task("a", owns=["src/a.txt"]), task("b", deps=["a"], owns=["src/b.txt"])], 1)
+        plan["tasks"]["a"]["status"] = "merged"
+        plan["tasks"]["a"]["stages"] = {"implement": {"status": "passed", "detail": "ok", "model": "sim-s"},
+                                        "merge": {"status": "passed", "detail": "merged", "model": None}}
+        plan["tasks"]["b"]["status"] = "running"
+        state["plan"] = plan
+        store = Store(run_dir / "run.db", state)
+        store.close()
+
+        args = cli.parse_args(["resume", str(run_dir), "--offline", "--no-tailscale", "--no-menu"])
+        resumed = cli.Run(args, resume_dir=run_dir)
+        self.addCleanup(resumed.close)
+        self.addCleanup(lambda: (resumed.runtime.stop("kill"), resumed.stopped.wait(20)))
+        self.assertTrue(wait_for(lambda: resumed.store.read("/run/phase") == "complete", 60),
+                        resumed.store.read("/plan/tasks"))
+        self.assertEqual(resumed.store.read("/plan/tasks/a/status"), "merged")
+        self.assertEqual(resumed.store.read("/plan/tasks/b/status"), "merged")
+        resumed.engine.submit({"id": "stop-resumed", "type": "run.stop", "payload": {"mode": "quit"}})
+        self.assertTrue(resumed.stopped.wait(20))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -801,5 +801,67 @@ class ServerTest(unittest.TestCase):
         self.assertIsNone(m["window_pool"]["free_count"])
 
 
+class InstallAndResumeTest(unittest.TestCase):
+    def test_prepare_resume_restores_in_flight_and_unblocked_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            plan = waves.compile_plan([task("a"), task("b", "a"), task("c")], 1)
+            plan["tasks"]["a"]["status"] = "merged"
+            plan["tasks"]["a"]["stages"] = {"implement": {"status": "passed"}, "merge": {"status": "passed"}}
+            plan["tasks"]["b"]["status"] = "blocked"
+            plan["tasks"]["c"]["status"] = "verifying"
+            plan["tasks"]["c"]["stages"] = {
+                "implement": {"status": "passed"},
+                "acceptance": {"status": "passed"},
+                "verify": {"status": "running"},
+            }
+            store.commit("plan.updated", Changes()
+                         .replace("plan", plan)
+                         .replace("run", "phase", "execute")
+                         .replace("run", "stopping", {"mode": "standdown", "since": "now"})
+                         .replace("run", "busy", {"label": "Thinking", "since": "now"}))
+            resumed = cli.prepare_resume(store)
+            self.assertEqual(sorted(resumed), ["b", "c"])
+            self.assertIsNone(store.read("/run/stopping"))
+            self.assertIsNone(store.read("/run/busy"))
+            self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
+            self.assertEqual(store.read("/plan/tasks/b/status"), "ready")
+            self.assertEqual(store.read("/plan/tasks/c/status"), "ready")
+            self.assertEqual(store.read("/plan/tasks/c/resume_after"), "acceptance")
+            store.close()
+            args = cli.parse_args(["resume", "--if-exists", "--no-menu", "--no-tailscale"])
+            self.assertEqual((args.command, args.if_exists, args.no_menu, args.no_tailscale),
+                             ("resume", True, True, True))
+
+    def test_install_and_uninstall_scripts_render_unit_and_enable_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            ctl_log = Path(tmp) / "systemctl.log"
+            fake_ctl = Path(tmp) / "fake-systemctl"
+            fake_ctl.write_text(f"#!/usr/bin/env bash\necho \"$*\" >> {str(ctl_log)!r}\n")
+            fake_ctl.chmod(0o755)
+            env = {**os.environ, "HOME": str(fake_home), "SYSTEMCTL": str(fake_ctl)}
+
+            inst = subprocess.run(["bash", str(ROOT / "install.sh")], cwd=str(ROOT), env=env,
+                                  capture_output=True, text=True, check=False)
+            self.assertEqual(inst.returncode, 0, inst.stderr or inst.stdout)
+            unit_file = fake_home / ".config" / "systemd" / "user" / "just-build-it.service"
+            self.assertTrue(unit_file.is_file())
+            unit_text = unit_file.read_text()
+            self.assertIn(f"WorkingDirectory={ROOT}", unit_text)
+            self.assertIn("ExecStart=/usr/bin/python3 -m jbi resume --if-exists --no-menu --no-tailscale", unit_text)
+            self.assertTrue((fake_home / ".local" / "bin" / "just-build-it").is_symlink())
+            self.assertIn("--user daemon-reload", ctl_log.read_text())
+            self.assertIn("--user enable just-build-it.service", ctl_log.read_text())
+
+            uninst = subprocess.run(["bash", str(ROOT / "uninstall.sh"), "--purge"], cwd=str(ROOT), env=env,
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(uninst.returncode, 0, uninst.stderr or uninst.stdout)
+            self.assertFalse(unit_file.exists())
+            self.assertFalse((fake_home / ".local" / "bin" / "just-build-it").exists())
+            self.assertFalse((fake_home / ".just-build-it").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

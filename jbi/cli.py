@@ -69,6 +69,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     send.add_argument("type")
     send.add_argument("payload", nargs="?", default="{}")
     send.add_argument("--run-dir", type=Path)
+    resume = sub.add_parser("resume", help="reopen a stored run and continue from stored task states")
+    resume.add_argument("run_dir", nargs="?", type=Path)
+    resume.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
+    resume.add_argument("--ci-service", choices=("local", "illm"), default=None,
+                        help="override CI service on resume")
+    resume.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
+    resume.add_argument("--offline", action="store_true", help="use the offline simulator for every model")
+    resume.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
+    resume.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
+    resume.add_argument("--if-exists", action="store_true", help="exit 0 cleanly when no stored run exists")
     return parser.parse_args(argv)
 
 
@@ -92,38 +102,103 @@ def latest_run_dir() -> Path:
     return runs[-1]
 
 
+def prepare_resume(store: Store) -> list[str]:
+    """Reconcile stored task states so an interrupted run continues cleanly on reopen."""
+    from . import rigor
+    from .store import Changes
+
+    changes = Changes()
+    if store.read("/run/stopping") is not None:
+        changes.replace("run", "stopping", None)
+    if store.read("/run/busy") is not None:
+        changes.replace("run", "busy", None)
+
+    plan = store.read("/plan") or {}
+    config = store.read("/config") or {"rigor": "high", "profile": "balanced"}
+    tasks = plan.get("tasks") or {}
+    resumed_tasks: list[str] = []
+
+    for tid in plan.get("order") or list(tasks):
+        task = tasks.get(tid)
+        if not isinstance(task, dict):
+            continue
+        status = task.get("status")
+        if status in ("running", "verifying", "queued", "merging", "paused"):
+            resume_after = task.get("resume_after")
+            if resume_after is None:
+                level, _ = rigor.effective(task, config)
+                stages = task.get("stages") or {}
+                last_passed: str | None = None
+                for stage in rigor.pipeline(level):
+                    if stage.role == "merge":
+                        break
+                    if (stages.get(stage.name) or {}).get("status") == "passed":
+                        last_passed = stage.name
+                    else:
+                        break
+                resume_after = last_passed
+            changes.set("plan", "tasks", tid, "status", "ready")
+            changes.set("plan", "tasks", tid, "resume_after", resume_after)
+            resumed_tasks.append(tid)
+        elif status == "blocked":
+            deps = task.get("deps") or []
+            if deps and all((tasks.get(d) or {}).get("status") == "merged" for d in deps):
+                changes.set("plan", "tasks", tid, "status", "ready")
+                resumed_tasks.append(tid)
+
+    store.log("run", f"Run resumed ({len(resumed_tasks)} task(s) ready)",
+              extra=changes, etype="run.config")
+    return resumed_tasks
+
+
 # ---- the run -------------------------------------------------------------------------
 
 class Run:
     """One dashboard process: the store, the engine, the runtime and the listeners."""
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, *, resume_dir: Path | None = None):
         self.args = args
-        self.run_id = "r-" + datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.dir = HOME / "runs" / self.run_id
-        self.dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.dir, 0o700)
         self.stopped = threading.Event()
         self.stop_requested = threading.Event()     # the first SIGINT or SIGTERM sets it
         self.stop_mode: str | None = None
 
-        mode = "existing" if args.repo else "new"
-        target = str(args.repo.expanduser().resolve()) if args.repo else str(Path.home() / slug(args.name, "app"))
-        if args.repo and not (Path(target) / ".git").exists():
-            raise SystemExit(f"{target} is not a git repository.")
-        name = Path(target).name if args.repo else slug(args.name, "app")
-        tmux = f"tmux -L jbi-{self.run_id} attach"
-        initial = protocol.initial_state(self.run_id, now(), name=name, mode=mode, target=target,
-                                         max_sessions=args.max_sessions, lanes=args.lanes or default_lanes(),
-                                         tmux=tmux)
-        self.store = Store(self.dir / "run.db", initial)
-        self._seed_accounts(args.offline)
+        if resume_dir is not None:
+            self.dir = Path(resume_dir).expanduser().resolve()
+            if not (self.dir / "run.db").is_file():
+                raise SystemExit(f"No stored run database at {self.dir / 'run.db'}.")
+            self.store = Store(self.dir / "run.db")
+            self.run_id = str(self.store.read("/run/id") or self.dir.name)
+            if getattr(args, "offline", False):
+                self._seed_accounts(True)
+            prepare_resume(self.store)
+        else:
+            self.run_id = "r-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.dir = HOME / "runs" / self.run_id
+            self.dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.dir, 0o700)
+            mode = "existing" if args.repo else "new"
+            target = str(args.repo.expanduser().resolve()) if args.repo else str(Path.home() / slug(args.name, "app"))
+            if args.repo and not (Path(target) / ".git").exists():
+                raise SystemExit(f"{target} is not a git repository.")
+            name = Path(target).name if args.repo else slug(args.name, "app")
+            tmux = f"tmux -L jbi-{self.run_id} attach"
+            initial = protocol.initial_state(self.run_id, now(), name=name, mode=mode, target=target,
+                                             max_sessions=args.max_sessions, lanes=args.lanes or default_lanes(),
+                                             tmux=tmux)
+            self.store = Store(self.dir / "run.db", initial)
+            self._seed_accounts(args.offline)
 
-        completer = make_completer(self.store, offline=args.offline)
+        completer = make_completer(self.store, offline=bool(getattr(args, "offline", False)))
         self.engine = Engine(self.store, completer)
         self.runtime = self._runtime()
         self.engine.runtime = self.runtime
-        if getattr(args, "dag", None):
+        if resume_dir is not None:
+            phase = self.store.read("/run/phase")
+            if phase == "execute":
+                self.runtime.start_execution()
+            elif phase == "bootstrap" and self.store.read("/bootstrap/status") == "running":
+                self.runtime.start_bootstrap()
+        elif getattr(args, "dag", None):
             self.engine.submit({"id": "cli-dag", "type": "plan.load",
                                 "payload": {"path": str(args.dag.expanduser().resolve()),
                                             "start": bool(getattr(args, "start", False))}})
@@ -262,8 +337,8 @@ def signal_handler(run: Run, kill=hard_kill):
     return on_signal
 
 
-def serve(args: argparse.Namespace) -> int:
-    run = Run(args)
+def serve(args: argparse.Namespace, *, resume_dir: Path | None = None) -> int:
+    run = Run(args, resume_dir=resume_dir)
     banner(run)
     if args.open:
         import webbrowser
@@ -281,6 +356,22 @@ def serve(args: argparse.Namespace) -> int:
     print(f"Run stopped ({run.stop_mode}). The record stays in {run.dir}")
     run.close()
     return 0
+
+
+def resume_command(args: argparse.Namespace) -> int:
+    target_dir = getattr(args, "run_dir", None)
+    if target_dir is None:
+        runs = sorted((HOME / "runs").glob("r-*"), key=lambda p: p.stat().st_mtime)
+        if not runs:
+            if getattr(args, "if_exists", False):
+                print("No stored run found; exiting cleanly.")
+                return 0
+            raise SystemExit("No run found. Start one with: just-build-it")
+        target_dir = runs[-1]
+    elif not (Path(target_dir).expanduser() / "run.db").is_file() and getattr(args, "if_exists", False):
+        print(f"No stored run at {target_dir}; exiting cleanly.")
+        return 0
+    return serve(args, resume_dir=target_dir)
 
 
 def run_client(run_dir: Path | None) -> Client:
@@ -321,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command in ("status", "links", "send"):
         return client_command(args)
+    if args.command == "resume":
+        return resume_command(args)
     return serve(args)
 
 
