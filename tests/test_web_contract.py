@@ -154,6 +154,18 @@ class TestWebContract(unittest.TestCase):
             self.assertIsNone(match, f"{source.relative_to(WEB)} talks HTTP ({match and match.group(0)}); "
                                      "only js/api.js may")
 
+    def test_metrics_ui_is_mounted_and_renders_unavailable_path(self) -> None:
+        index_html = (WEB / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="phase-metrics"', index_html)
+        metrics_js = (JS / "metrics.js").read_text(encoding="utf-8")
+        self.assertIn("unavailable", metrics_js)
+        self.assertIn("Tokens per day", metrics_js)
+        self.assertIn("PRs merged per day", metrics_js)
+        self.assertIn("Tasks completed per day", metrics_js)
+        self.assertIn("Tokens per task, average", metrics_js)
+        self.assertIn("Time per task, average", metrics_js)
+        self.assertNotIn("send(", metrics_js, "metrics.js must not invoke any LLM or write command")
+
     @unittest.skipIf(shutil.which("node") is None, "node is not installed")
     def test_patch_js_matches_jsonpatch(self) -> None:
         from jbi import jsonpatch

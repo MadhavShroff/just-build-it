@@ -50,6 +50,11 @@ export class Client {
     return this.#request('POST', '/api/v1/commands', { id: commandId(), type, payload });
   }
 
+  /** Read the deterministic metrics snapshot (no LLM). */
+  metrics() {
+    return this.#request('GET', '/api/v1/metrics');
+  }
+
   async #exchangeKey() {
     const match = location.hash.match(/(?:^#|&)k=([^&]+)/);
     if (!match) return;

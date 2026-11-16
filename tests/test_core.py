@@ -656,6 +656,150 @@ class ServerTest(unittest.TestCase):
             body = error.read()
         self.assertNotIn(b"root:", body)
 
+    def test_metrics_endpoint_reads_all_six_sources_with_no_llm(self):
+        import sqlite3
+        from jbi import ceremony, metrics, worktrees as wt
+        root = Path(self.tmp.name) / "metrics_fx"
+        glm_dir = root / "glm-proxy"
+        claude_dir = root / "claude" / "proj1"
+        workspace = root / "workspace"
+        train_hist = root / "ci-train" / "history.jsonl"
+        board_db = root / "board.db"
+        ledger_path = root / "task_ledger.jsonl"
+        pool_path = root / "window_pool.json"
+
+        glm_dir.mkdir(parents=True)
+        (glm_dir / "gemini-usage.jsonl").write_text(
+            json.dumps({"ts": "2026-11-15T10:00:00Z", "input_tokens": 1000, "output_tokens": 200}) + "\n"
+            + json.dumps({"ts": "2026-11-16T11:00:00Z", "input_tokens": 500, "output_tokens": 100}) + "\n"
+        )
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "sess1.jsonl").write_text(
+            json.dumps({
+                "type": "assistant",
+                "timestamp": "2026-11-16T12:00:00Z",
+                "message": {"usage": {"input_tokens": 300, "cache_read_input_tokens": 700, "output_tokens": 50}},
+            }) + "\n"
+        )
+
+        ledger = ceremony.TaskLedger(ledger_path)
+        ledger.record_done(
+            task="D01", title="Core", window="work1", pr_number=801, head_sha="aaa111",
+            attempts=1, tokens=1200, started_at="2026-11-15T10:00:00Z",
+            completed_at="2026-11-15T10:02:00Z", duration_s=120.0,
+        )
+        ledger.record_done(
+            task="D02", title="API", window="work2", pr_number=802, head_sha="bbb222",
+            attempts=2, tokens=2400, started_at="2026-11-16T10:00:00Z",
+            completed_at="2026-11-16T10:04:00Z", duration_s=240.0,
+        )
+
+        wt.init_repo(workspace)
+        (workspace / "a.txt").write_text("1\n")
+        wt.commit_all(workspace, "[work1] First feature (#801)")
+        (workspace / "b.txt").write_text("2\n")
+        sha2 = wt.commit_all(workspace, "[work2] Second feature (#802)")
+        wt.git(workspace, "update-ref", "refs/remotes/origin/develop", sha2)
+
+        train_hist.parent.mkdir(parents=True)
+        train_hist.write_text(
+            json.dumps({
+                "train_id": "20261116-135337-l1-gB",
+                "lane": 1,
+                "prs": [812],
+                "head_sha": "deadbeef1234",
+                "verdict": "running",
+            }) + "\n"
+            + json.dumps({
+                "record": "merge",
+                "train_id": "20261116-135407-l3-gB",
+                "input_key": "k1",
+                "stamped": "2026-11-16T14:40:00Z",
+                "merge": {
+                    "attempted": False,
+                    "state": "green-waiting-other-lanes",
+                    "stopped": "merge-serialized",
+                    "other_lanes": ["lane 1 gate 6040"],
+                },
+            }) + "\n"
+        )
+
+        with sqlite3.connect(str(board_db)) as conn:
+            conn.execute("CREATE TABLE todo_items (id INTEGER PRIMARY KEY, state TEXT)")
+            conn.executemany(
+                "INSERT INTO todo_items (state) VALUES (?)",
+                [("todo",), ("doing",), ("halted",), ("done",), ("done",), ("dropped",)],
+            )
+
+        pool = ceremony.WindowPool(pool_path, windows=("work1", "work2"))
+        pool.mark_busy("work1", "D03", title="UI metrics", pr_number=815, head_sha="c0ffee12", ci_status="submitted")
+
+        self.server.app.metrics_sources = metrics.MetricsSources(
+            glm_proxy_dir=glm_dir,
+            claude_projects_dir=root / "claude",
+            task_ledger_path=ledger_path,
+            workspace_repo=workspace,
+            ci_train_history=train_hist,
+            board_db=board_db,
+            window_registry_path=pool_path,
+            days=14,
+        )
+        status, body = self.call("GET", "/api/v1/metrics")
+        self.assertEqual(status, 200)
+        m = body["metrics"]
+        self.assertTrue(m["tokens"]["available"])
+        self.assertEqual(m["tokens"]["total"], 1200 + 600 + 1050)
+        self.assertEqual(m["averages"]["tokens_per_task"], 1800.0)
+        self.assertEqual(m["averages"]["time_per_task_s"], 180.0)
+        self.assertTrue(m["prs_merged"]["available"])
+        self.assertEqual(m["prs_merged"]["total"], 2)
+        self.assertTrue(m["ci_train"]["available"])
+        self.assertEqual(m["ci_train"]["train_state"], "green-waiting-other-lanes")
+        self.assertEqual(len(m["ci_train"]["lanes"]), 1)
+        self.assertEqual(len(m["ci_train"]["held_greens"]), 1)
+        self.assertTrue(m["board"]["available"])
+        self.assertEqual((m["board"]["open_rows"], m["board"]["done_rows"]), (3, 2))
+        self.assertTrue(m["window_pool"]["available"])
+        self.assertEqual((m["window_pool"]["busy_count"], m["window_pool"]["free_count"]), (1, 1))
+        self.assertEqual(m["right_now"]["busy_windows"][0]["task"], "D03")
+        self.assertEqual({p["pr_number"] for p in m["right_now"]["prs_in_ci"]}, {815, 812})
+
+    def test_metrics_missing_sources_report_unavailable_with_path_and_no_invented_numbers(self):
+        from jbi import metrics
+        missing = Path(self.tmp.name) / "does-not-exist"
+        self.server.app.metrics_sources = metrics.MetricsSources(
+            glm_proxy_dir=missing / "glm",
+            claude_projects_dir=missing / "claude",
+            task_ledger_path=missing / "task_ledger.jsonl",
+            workspace_repo=missing / "workspace",
+            ci_train_history=missing / "history.jsonl",
+            board_db=missing / "board.db",
+            window_registry_path=missing / "window_pool.json",
+        )
+        status, body = self.call("GET", "/api/v1/metrics")
+        self.assertEqual(status, 200)
+        m = body["metrics"]
+        for section, expected_subpath in (
+            ("tokens", "glm"),
+            ("task_ledger", "task_ledger.jsonl"),
+            ("prs_merged", "workspace"),
+            ("ci_train", "history.jsonl"),
+            ("board", "board.db"),
+            ("window_pool", "window_pool.json"),
+        ):
+            with self.subTest(section=section):
+                self.assertFalse(m[section]["available"])
+                self.assertEqual(m[section]["status"], "unavailable")
+                self.assertIn(expected_subpath, m[section]["path"])
+        self.assertIsNone(m["tokens"]["total"])
+        self.assertIsNone(m["averages"]["tokens_per_task"])
+        self.assertIsNone(m["averages"]["time_per_task_s"])
+        self.assertIsNone(m["prs_merged"]["total"])
+        self.assertIsNone(m["board"]["open_rows"])
+        self.assertIsNone(m["board"]["done_rows"])
+        self.assertIsNone(m["window_pool"]["busy_count"])
+        self.assertIsNone(m["window_pool"]["free_count"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
-from . import PROTOCOL_VERSION, __version__, models, protocol, rigor
+from . import PROTOCOL_VERSION, __version__, metrics as metrics_mod, models, protocol, rigor
 from .engine import Engine
 from .protocol import ProtocolError
 from .store import Store, iter_sse
@@ -63,11 +63,13 @@ class App:
     """Everything a request handler needs. One instance per run."""
 
     def __init__(self, store: Store, engine: Engine, auth: Auth, *, extra_info: Callable[[], dict] | None = None,
-                 link_bases: Callable[[], list[dict]] | None = None):
+                 link_bases: Callable[[], list[dict]] | None = None,
+                 metrics_sources: metrics_mod.MetricsSources | None = None):
         self.store, self.engine, self.auth = store, engine, auth
         self.extra_info = extra_info or (lambda: {})
         # The verified base URLs ({label, url}) that sign-in links may point at.
         self.link_bases = link_bases or (lambda: [])
+        self.metrics_sources = metrics_sources
         self.shutdown = threading.Event()
 
     def schema(self) -> dict:
@@ -249,6 +251,11 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                      for base in app.link_bases()]
             self._json(200, {"protocol": PROTOCOL_VERSION, "links": links})
 
+        def metrics(self, query: dict) -> None:
+            run_dir = Path(app.store.path).parent if getattr(app.store, "path", None) else None
+            snapshot = metrics_mod.collect_metrics(app.metrics_sources, run_dir=run_dir)
+            self._json(200, {"protocol": PROTOCOL_VERSION, "metrics": snapshot})
+
     API: dict[tuple[str, str], Callable] = {
         ("GET", "/api/v1/health"): Handler.health,
         ("POST", "/api/v1/session"): Handler.session,
@@ -258,8 +265,9 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         ("GET", "/api/v1/events.json"): Handler.events_json,
         ("POST", "/api/v1/commands"): Handler.commands,
         ("POST", "/api/v1/links"): Handler.links,
+        ("GET", "/api/v1/metrics"): Handler.metrics,
     }
-    PUBLIC = {("GET", "/api/v1/health"), ("POST", "/api/v1/session")}
+    PUBLIC = {("GET", "/api/v1/health"), ("POST", "/api/v1/session"), ("GET", "/api/v1/metrics")}
     return Handler
 
 

@@ -36,6 +36,7 @@ This file is normative. `jbi/protocol.py` implements it. `GET /api/v1/schema` se
 | `POST` | `/api/v1/commands` | Submit a command. |
 | `POST` | `/api/v1/links` | Bearer token only. Returns `{protocol, links: [{label, url}]}`: one fresh one-time sign-in link per verified listener. |
 | `GET` | `/api/v1/schema` | Command and event catalog. |
+| `GET` | `/api/v1/metrics` | Deterministic metrics snapshot (tokens, task ledger, merged PRs, CI train, board rows, window pool). No LLM call. |
 | `GET` | `/api/v1/health` | Readiness. No authentication. Returns `{protocol, ok, run_id, version}`. `version` is the server's release string. |
 
 ## State read

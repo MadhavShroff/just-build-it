@@ -12,6 +12,7 @@ import { mountBootstrap } from './bootstrap.js';
 import { mountConfigure } from './configure.js';
 import { mountBoard } from './board.js';
 import { mountTaskDrawer } from './task-drawer.js';
+import { mountMetrics } from './metrics.js';
 
 const THEME_KEY = 'jbi-theme';
 
@@ -34,13 +35,39 @@ function main() {
   const splash = document.getElementById('splash');
   const splashText = document.getElementById('splash-text');
   const sections = [...document.querySelectorAll('.phase')];
+  const metricsSection = document.getElementById('phase-metrics');
+  const metricsPage = mountMetrics(ctx, metricsSection);
   let mounted = false;
+  let showingMetrics = location.pathname === '/metrics' || location.hash === '#metrics';
+
+  function syncSections() {
+    if (showingMetrics) {
+      splash.hidden = true;
+      for (const section of sections) section.hidden = section !== metricsSection;
+      metricsPage.refresh();
+      return;
+    }
+    if (!store.state?.run) return;
+    splash.hidden = true;
+    const phase = store.state.run.phase;
+    for (const section of sections) {
+      const show = section.dataset.phase.split(' ').includes(phase);
+      if (section.hidden === show) section.hidden = !show;
+    }
+    document.body.dataset.phase = phase;
+  }
+
+  function toggleMetrics() {
+    showingMetrics = !showingMetrics;
+    syncSections();
+  }
 
   function mountViews() {
     mounted = true;
     const accounts = mountAccounts(ctx);
     const header = mountHeader(ctx, {
       onAccounts: accounts.open,
+      onMetrics: toggleMetrics,
       onTheme: () => {
         const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
         localStorage.setItem(THEME_KEY, next);
@@ -63,19 +90,18 @@ function main() {
     mountConfigure(ctx, byId('phase-configure'));
     mountBoard(ctx, byId('phase-board'), { onOpenTask: tasks.open });
 
-    store.subscribe(['run'], (state) => {
-      splash.hidden = true;
-      for (const section of sections) {
-        const show = section.dataset.phase.split(' ').includes(state.run.phase);
-        if (section.hidden === show) section.hidden = !show;
-      }
-      document.body.dataset.phase = state.run.phase;
+    store.subscribe(['run'], () => {
+      syncSections();
     });
+  }
+
+  if (showingMetrics) {
+    syncSections();
   }
 
   store.subscribe(['$connection'], () => {
     const value = store.local.connection;
-    if (value === 'unauthenticated') {
+    if (value === 'unauthenticated' && !showingMetrics) {
       splash.hidden = false;
       for (const section of sections) section.hidden = true;
       document.getElementById('run-name').textContent = 'Signed out';

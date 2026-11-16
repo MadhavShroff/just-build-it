@@ -5,6 +5,7 @@ import { h, reconcile, setText, beat, elapsed, relativeTime, compactNumber, mone
 import { icon } from './icons.js';
 import { mountDag } from './dag.js';
 import { mountArchitecture } from './architecture.js';
+import { mountMetrics } from './metrics.js';
 import { LANE_TONE, TASK_TONE, act, errorSlot, payloadFor, pill, toast } from './ui.js';
 
 const RECENT_ENDED = 2;   // ended sessions that stay visible after the running ones
@@ -19,7 +20,8 @@ export function mountBoard(ctx, root, { onOpenTask }) {
   const views = h('div', { class: 'segmented', role: 'tablist', 'aria-label': 'Board view' });
   const dagPane = h('div', { class: 'board-pane dag-pane', role: 'tabpanel' });
   const archPane = h('div', { class: 'board-pane arch-pane', role: 'tabpanel', hidden: true });
-  const main = h('section', { class: 'card board-main' }, h('div', { class: 'board-main-head' }, views, counts), dagPane, archPane);
+  const metricsPane = h('div', { class: 'board-pane metrics-pane', role: 'tabpanel', hidden: true });
+  const main = h('section', { class: 'card board-main' }, h('div', { class: 'board-main-head' }, views, counts), dagPane, archPane, metricsPane);
 
   const sessions = h('div', { class: 'sessions', tabindex: '0', role: 'group', 'aria-label': 'Agent sessions' });
   const sessionEdges = trackOverflow(sessions);   // edge fades while more sessions sit off screen
@@ -46,7 +48,7 @@ export function mountBoard(ctx, root, { onOpenTask }) {
         h('section', { class: 'card timeline-card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('clock'), 'Timeline')), timeline))));
 
   // ---- view tabs ------------------------------------------------------------------
-  const tabs = [['dag', 'Task graph', 'dag'], ['architecture', 'Architecture', 'graph']];
+  const tabs = [['dag', 'Task graph', 'dag'], ['architecture', 'Architecture', 'graph'], ['metrics', 'Metrics', 'bolt']];
   for (const [id, label, iconName] of tabs) {
     views.append(h('button', { class: 'segment', type: 'button', role: 'tab', 'data-view': id, onclick: () => ctx.store.setLocal({ board: id }) }, icon(iconName, { size: 14 }), label));
   }
@@ -54,13 +56,16 @@ export function mountBoard(ctx, root, { onOpenTask }) {
   dag.controls.classList.add('dag-zoom');
   main.firstChild.append(dag.controls);   // the task graph zoom sits in the board head
   const arch = mountArchitecture(ctx, archPane, { onOpenTask });
+  const metricsView = mountMetrics(ctx, metricsPane);
   ctx.store.subscribe(['$board'], () => {
     const view = ctx.store.local.board;
     for (const button of views.children) button.setAttribute('aria-selected', String(button.dataset.view === view));
     dagPane.hidden = view !== 'dag';
     archPane.hidden = view !== 'architecture';
+    metricsPane.hidden = view !== 'metrics';
     dag.controls.hidden = view !== 'dag';
-    requestAnimationFrame(view === 'architecture' ? arch.fit : dag.fit);
+    if (view === 'metrics') metricsView.refresh();
+    else requestAnimationFrame(view === 'architecture' ? arch.fit : dag.fit);
   });
 
   copy.addEventListener('click', async () => {

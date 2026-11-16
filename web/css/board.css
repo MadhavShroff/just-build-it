@@ -283,6 +283,34 @@ body[data-phase="complete"] .progress span { background: var(--green); }
 .settings-option-desc { font-size: var(--text-xs); color: var(--text-3); }
 .settings-foot { font-size: var(--text-xs); color: var(--text-3); padding: 8px 10px 4px; }
 
+/* ---- metrics view ------------------------------------------------------------------ */
+
+.phase-metrics { padding-top: var(--space-6); padding-bottom: var(--space-6); }
+.phase-metrics > * { max-width: 1480px; margin-left: auto; margin-right: auto; }
+.metrics-pane { overflow-y: auto; padding: var(--space-4); }
+.metrics-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-5); flex-wrap: wrap; }
+.metrics-actions { display: flex; align-items: center; gap: var(--space-3); }
+.metrics-stamp { font-size: var(--text-xs); }
+.metrics-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: var(--space-3); margin-bottom: var(--space-5); }
+.metrics-tile-sub { font-size: var(--text-xs); overflow-wrap: anywhere; }
+.metrics-grid-now { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--space-4); margin-bottom: var(--space-5); align-items: start; }
+.metrics-grid-time { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--space-4); align-items: start; }
+.metrics-list, .metrics-chart-body { display: grid; gap: var(--space-2); }
+.metrics-subhead { font-size: var(--text-xs); overflow-wrap: anywhere; margin-bottom: 4px; }
+.metrics-row { padding: 10px 12px; border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-card); display: grid; gap: 4px; }
+.metrics-row-top { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: var(--text-sm); }
+.metrics-row-sub { font-size: var(--text-xs); overflow-wrap: anywhere; }
+.metrics-task-label { font-weight: 600; overflow-wrap: break-word; }
+.metrics-unavailable { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-radius: 8px; background: var(--surface-sunken); font-size: var(--text-xs); }
+.metrics-path { overflow-wrap: anywhere; color: var(--text-2); }
+.metrics-error { overflow-wrap: anywhere; }
+.metrics-sub-unavail { margin-bottom: var(--space-2); }
+.metrics-series { display: grid; gap: 6px; }
+.metrics-bar-row { display: grid; grid-template-columns: 88px minmax(0, 1fr) auto; align-items: center; gap: 10px; font-size: var(--text-xs); }
+.metrics-bar-track { height: 8px; border-radius: var(--radius-full); background: var(--surface-sunken); overflow: hidden; }
+.metrics-bar-fill { display: block; height: 100%; border-radius: inherit; background: var(--accent-grad); }
+.metrics-bar-value { font-weight: 600; min-width: 48px; text-align: right; }
+
 /* ---- responsive -------------------------------------------------------------------- */
 
 @media (max-width: 1200px) {
