@@ -734,6 +734,105 @@ class ReviewFindings(unittest.TestCase):
         self.assertEqual([e["task"] for e in entries], ["a", "b"])
         self.assertEqual([e["tokens"] for e in entries], [3000, 500])
 
+    def test_13_ceremony_main_runs_end_to_end_with_illm_mailbox_notice(self):
+        import sqlite3
+        from jbi import briefs, ceremony
+        repo = self.tmp / "main_repo"
+        run_dir = self.tmp / "main_run"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        wt.commit_all(repo, "base")
+
+        dag_file = self.tmp / "plan.yaml"
+        dag_file.write_text(
+            'project: "demo"\n'
+            'repo: "./demo"\n'
+            'mode: "existing"\n'
+            'waves: "auto"\n'
+            'tasks:\n'
+            '  - id: "D01"\n'
+            '    title: "Build core"\n'
+            '    goal: "Provide core"\n'
+            '    deps: []\n'
+            '    acceptance: "true"\n'
+            '    owns: ["src/core.py"]\n'
+        )
+        board_db = self.tmp / "board.db"
+        with sqlite3.connect(str(board_db)) as conn:
+            conn.execute("CREATE TABLE sb_messages (id INTEGER PRIMARY KEY, from_slot TEXT, to_slot TEXT, text TEXT)")
+        illm_state = self.tmp / "illm_state"
+        queue_dir = illm_state / "mailboxes" / "main" / "queue"
+        queue_dir.mkdir(parents=True)
+        submit_count = 0
+
+        def fake_runner(argv, cwd):
+            nonlocal submit_count
+            if argv[:2] == ["ticket", "start"] or argv[:2] == ["sb", "send"]:
+                worktree = run_dir / "worktrees" / "D01"
+                (worktree / "src").mkdir(exist_ok=True)
+                (worktree / "src" / "core.py").write_text(f"v = {submit_count + 1}\n")
+                rec_path = briefs.receipt_path(run_dir, "D01", "implement", submit_count)
+                rec_path.parent.mkdir(parents=True, exist_ok=True)
+                rec_path.write_text("BRIEF D01 | uncommitted | PASS\ntokens: 800\n")
+                return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+            if argv[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(argv, 0, "910\n", "")
+            if argv[:4] == ["illm", "--json", "ci", "submit"]:
+                submit_count += 1
+                sha = argv[6]
+                if submit_count == 1:
+                    (queue_dir / "1001-red.json").write_text(json.dumps({
+                        "id": "1001-red",
+                        "from": "ci",
+                        "to": "main",
+                        "type": "failed",
+                        "job": "j-red-1",
+                        "text": "CI red on unit",
+                        "data": {
+                            "schema": "illm.ci.failure.v1",
+                            "job_id": "j-red-1",
+                            "pr_number": 910,
+                            "head_sha": sha,
+                            "verdict": "red",
+                            "failed_gates": ["unit"],
+                            "first_failure_excerpt": "FAIL src/core.spec.py",
+                        },
+                    }))
+                else:
+                    (queue_dir / "1002-green.json").write_text(json.dumps({
+                        "id": "1002-green",
+                        "from": "ci",
+                        "to": "main",
+                        "type": "done",
+                        "job": "j-green-2",
+                        "text": "PR #910 merged",
+                        "data": {
+                            "pr_number": 910,
+                            "head_sha": sha,
+                            "verdict": "merged",
+                            "merge_sha": sha,
+                        },
+                    }))
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        rc = ceremony.main(
+            ["--dag", str(dag_file), "--repo", str(repo), "--run-dir", str(run_dir), "--windows", "work1"],
+            runner=fake_runner,
+            board_db=board_db,
+            illm_state_dir=illm_state,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(submit_count, 2)
+        entries = ceremony.TaskLedger(run_dir / "task_ledger.jsonl").entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0]["task"], entries[0]["pr_number"], entries[0]["attempts"], entries[0]["tokens"]),
+                         ("D01", 910, 2, 1600))
+        pool = ceremony.WindowPool(run_dir / "window_pool.json")
+        self.assertEqual(pool.get("work1")["status"], "free")
+
 
 if __name__ == "__main__":
     unittest.main()

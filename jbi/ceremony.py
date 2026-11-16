@@ -385,6 +385,112 @@ def poll_sb_receipt(window: str, task_id: str, attempt: int, receipt_file: Path,
         time.sleep(poll_interval)
 
 
+def poll_ci_notice(tid: str, pr_number: int, head_sha: str, attempt: int, *,
+                   run_dir: Path, repo: Path, runner: ci_mod.Runner = ci_mod.default_runner,
+                   illm_state_dir: Path | None = None, timeout: float = 3600.0,
+                   poll_interval: float = 0.2,
+                   seen_notices: set[str] | None = None) -> dict[str, Any]:
+    """Wait for a CI verdict or structured failure notice for `(pr_number, head_sha)`."""
+    state_root = illm_state_dir or Path(
+        os.environ.get("ILLM_STATE_DIR", str(Path.home() / ".local" / "state" / "interface-llm"))
+    )
+    seen = seen_notices if seen_notices is not None else set()
+    deadline = time.monotonic() + timeout
+    while True:
+        # 1. Check run_dir notice file or JSONL queue if present.
+        attempt_file = run_dir / "notices" / f"{tid}-{attempt}.json"
+        if attempt_file.is_file():
+            try:
+                rec = json.loads(attempt_file.read_text(encoding="utf-8"))
+                if isinstance(rec, dict):
+                    return _normalize_ci_notice(rec, pr_number, head_sha)
+            except (OSError, ValueError):
+                pass
+
+        # 2. Check interface-llm mailbox queues on disk.
+        mailboxes = state_root / "mailboxes"
+        if mailboxes.is_dir():
+            for qfile in sorted(mailboxes.glob("*/queue/*.json")):
+                key = str(qfile)
+                if key in seen:
+                    continue
+                try:
+                    rec = json.loads(qfile.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(rec, dict) or rec.get("from") not in (None, "ci"):
+                    continue
+                matched = _match_mailbox_notice(rec, tid, pr_number, head_sha)
+                if matched is not None:
+                    seen.add(key)
+                    return matched
+
+        # 3. Query `illm --json ci status <pr_number>` via runner.
+        res = runner(["illm", "--json", "ci", "status", str(pr_number)], repo)
+        if res.returncode == 0 and (res.stdout or "").strip():
+            try:
+                payload = json.loads(res.stdout.strip())
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                matched = _match_status_payload(payload, pr_number, head_sha)
+                if matched is not None:
+                    return matched
+
+        if time.monotonic() >= deadline:
+            raise CeremonyError(
+                f"Timed out waiting for CI notice for task {tid} PR #{pr_number} @ {head_sha[:10]}."
+            )
+        time.sleep(poll_interval)
+
+
+def _normalize_ci_notice(raw: dict[str, Any], pr_number: int, head_sha: str) -> dict[str, Any]:
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    merged = {**data, **{k: v for k, v in raw.items() if k != "data"}}
+    ntype = str(merged.get("type") or "")
+    verdict = merged.get("verdict")
+    if not verdict:
+        if ntype == "done" or merged.get("status") in ("merged", "green"):
+            verdict = "merged"
+        elif ntype in ("failed", "needs-input") or merged.get("status") in ("red", "failed"):
+            verdict = "red"
+    merged.setdefault("pr_number", pr_number)
+    merged.setdefault("head_sha", head_sha)
+    if verdict:
+        merged["verdict"] = verdict
+    if "first_failure_excerpt" not in merged and isinstance(merged.get("text"), str) and verdict not in ("green", "merged"):
+        merged["first_failure_excerpt"] = merged["text"]
+    return merged
+
+
+def _match_mailbox_notice(rec: dict[str, Any], tid: str, pr_number: int, head_sha: str) -> dict[str, Any] | None:
+    norm = _normalize_ci_notice(rec, pr_number, head_sha)
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    rec_pr = data.get("pr_number") if "pr_number" in data else rec.get("pr_number")
+    rec_sha = data.get("head_sha") if "head_sha" in data else rec.get("head_sha")
+    rec_task = data.get("task") if "task" in data else rec.get("task")
+    text = str(rec.get("text") or "")
+    if rec_pr is not None and int(rec_pr) != int(pr_number):
+        return None
+    if rec_sha and head_sha and str(rec_sha) != str(head_sha):
+        return None
+    if rec_pr is None and rec_task != tid and f"#{pr_number}" not in text and str(pr_number) not in text:
+        return None
+    if norm.get("verdict") in ("green", "merged", "red", "void", "merge-blocked"):
+        return norm
+    return None
+
+
+def _match_status_payload(payload: dict[str, Any], pr_number: int, head_sha: str) -> dict[str, Any] | None:
+    norm = _normalize_ci_notice(payload, pr_number, head_sha)
+    rec_sha = norm.get("head_sha")
+    if rec_sha and head_sha and str(rec_sha) != str(head_sha):
+        return None
+    if norm.get("verdict") in ("green", "merged", "red", "void", "merge-blocked"):
+        return norm
+    return None
+
+
 def _exec_cmd(runner: ci_mod.Runner, argv: list[str], cwd: Path) -> str:
     res = runner(argv, cwd)
     if res.returncode != 0:
@@ -430,8 +536,12 @@ def run_ceremony(
     ledger = ledger or TaskLedger(run_dir / "task_ledger.jsonl")
     ci = ci_adapter or ci_mod.CIAdapter(runner=runner)
     receipt_waiter = wait_receipt or (lambda w, t, a, p: poll_sb_receipt(w, t, a, p))
-    if wait_ci_notice is None:
-        raise CeremonyError("wait_ci_notice is required to receive illm CI verdicts.")
+    seen_notices: set[str] = set()
+    ci_waiter = wait_ci_notice or (
+        lambda t, pr, sha, a: poll_ci_notice(
+            t, pr, sha, a, run_dir=run_dir, repo=repo, runner=runner, seen_notices=seen_notices
+        )
+    )
 
     outcomes: list[TaskOutcome] = []
     has_git = (repo / ".git").exists()
@@ -535,7 +645,7 @@ def run_ceremony(
                              .set("plan", "tasks", tid, "status", "merging"), {"task": tid})
 
             # 8. Wait for the CI verdict; on failure re-brief the SAME window on `sb`.
-            raw_notice = wait_ci_notice(tid, pr_number, head_sha, attempt)
+            raw_notice = ci_waiter(tid, pr_number, head_sha, attempt)
             notice = {**(raw_notice.get("data") or {}), **{k: v for k, v in raw_notice.items() if k != "data"}}
             verdict = str(notice.get("verdict") or "red")
             if verdict not in ("green", "merged"):
@@ -581,7 +691,8 @@ def run_ceremony(
     return CeremonyOutcome(tasks=outcomes)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, runner: ci_mod.Runner = ci_mod.default_runner,
+         board_db: Path | None = None, illm_state_dir: Path | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jbi-ceremony", description="Run the deterministic task ceremony.")
     parser.add_argument("--dag", type=Path, required=True, help="path to task DAG (.json or restricted YAML)")
     parser.add_argument("--repo", type=Path, required=True, help="target git repository")
@@ -590,12 +701,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", default=wt.MAIN, help="base branch for draft PRs")
     args = parser.parse_args(argv)
 
+    run_dir = args.run_dir.expanduser().resolve()
+    repo = args.repo.expanduser().resolve()
     plan = dag_loader.load(args.dag.expanduser().resolve())
     windows = [w.strip() for w in args.windows.split(",") if w.strip()]
-    pool = WindowPool(args.run_dir / "window_pool.json", windows=windows)
-    ledger = TaskLedger(args.run_dir / "task_ledger.jsonl")
-    run_ceremony(plan, pool=pool, ledger=ledger, repo=args.repo.expanduser().resolve(),
-                 run_dir=args.run_dir.expanduser().resolve(), base=args.base)
+    pool = WindowPool(run_dir / "window_pool.json", windows=windows)
+    ledger = TaskLedger(run_dir / "task_ledger.jsonl")
+    seen_notices: set[str] = set()
+    run_ceremony(
+        plan,
+        pool=pool,
+        ledger=ledger,
+        repo=repo,
+        run_dir=run_dir,
+        base=args.base,
+        runner=runner,
+        wait_receipt=lambda w, t, a, p: poll_sb_receipt(w, t, a, p, board_db=board_db),
+        wait_ci_notice=lambda t, pr, sha, a: poll_ci_notice(
+            t, pr, sha, a, run_dir=run_dir, repo=repo, runner=runner,
+            illm_state_dir=illm_state_dir, seen_notices=seen_notices,
+        ),
+    )
     return 0
 
 
