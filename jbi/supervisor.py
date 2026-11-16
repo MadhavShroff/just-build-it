@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, briefs, ci_adapter as ci_mod, models, rigor, waves, worktrees as wt
+from . import agents, briefs, ci_adapter as ci_mod, models, rigor, taskkey, waves, worktrees as wt
 from .contracts import Hooks
 from .lanes import Lanes, MergeJob
 from .shim import Groups, alive, process_start, run_command
@@ -117,6 +117,7 @@ class Supervisor:
         self.identities: dict[str, dict[int, str]] = {}   # sid -> {pid: start time} at spawn
         self.branch: str = wt.MAIN
         self._lock = threading.RLock()
+        self._task_cache = taskkey.WorkCache(self.run_dir, str(run_id or "run"))
         self._wake = threading.Event()
         self._stopping: str | None = None
         self._running: dict[str, threading.Thread] = {}
@@ -319,7 +320,16 @@ class Supervisor:
             stage = rigor.next_stage(level, stage_name)
             if stage is None:
                 return
-            ok, detail, model = self._run_stage(task, stage, level, worktree, findings)
+            key = self._taskkey(tid, stage, base, findings)
+            hit = taskkey.consult(self._task_cache, key, stage, repo=self.repo, worktree=worktree)
+            if hit is not None:
+                ok, detail, model = True, hit.detail, hit.model
+                if stage.name == "implement":
+                    # the reset also moved branch jbi/<tid>, so the merge lands this work
+                    self._task_update(tid, commit=hit.commit)
+                self.store.log("task", f"{tid}: {detail}", task=tid)
+            else:
+                ok, detail, model = self._run_stage(task, stage, level, worktree, findings)
             if self._stopping in ("quit", "kill", "standdown"):
                 return
             if stage.name != rigor.REVIEW_CASCADE_STAGE:
@@ -331,6 +341,7 @@ class Supervisor:
                 if stage.role == "merge":
                     self._progress()
                     return
+                self._record_hit(tid, key, stage, ok, detail, model, worktree)
                 # The four reviews run together inside the cascade stage, so the
                 # loop must skip past the three DeepSeek stages it already ran.
                 stage_name, findings = stage.name, []
@@ -352,6 +363,19 @@ class Supervisor:
             if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
                 self._task_update(tid, resume_after=None)
                 return
+
+    def _taskkey(self, tid: str, stage: rigor.Stage, base: str,
+                 findings: list[str]) -> str | None:
+        """The key of one stage of `tid` (REQUIREMENT-task-keys 2.1)."""
+        tasks = (self.store.read("/plan") or {}).get("tasks") or {}
+        return self._task_cache.key_for(self.repo, tasks, tid, stage, base=base,
+                                        state=self.store.snapshot()[1], findings=findings)
+
+    def _record_hit(self, tid: str, key: str | None, stage: rigor.Stage, ok: bool,
+                    detail: str, model: str | None, worktree: Path) -> None:
+        """Record a PASSED stage under its key (4.1, 4.3). A gate role is never recorded (4.2)."""
+        taskkey.remember(self._task_cache, key, stage, task=tid, worktree=worktree,
+                         ok=ok, detail=detail, model=model)
 
     def _run_stage(self, task: dict, stage: rigor.Stage, level: str, worktree: Path,
                    findings: list[str]) -> tuple[bool, str, str | None]:
