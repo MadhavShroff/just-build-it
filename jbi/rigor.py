@@ -42,6 +42,16 @@ def review_stages() -> tuple[Stage, ...]:
               for i, name in enumerate(REVIEW_DEEPSEEK_STAGES, start=1)))
 
 
+TEST_AUDIT_STAGE = "test-audit"
+METHODOLOGY_AUDIT_STAGE = "methodology-audit"
+DRY_RUN_STAGE = "dry-run"
+PRE_MERGE_AUDIT_STAGES: tuple[Stage, ...] = (
+    Stage(TEST_AUDIT_STAGE, "review", "Test audit"),
+    Stage(METHODOLOGY_AUDIT_STAGE, "review", "Methodology audit"),
+    Stage(DRY_RUN_STAGE, "review", "Dry run"),
+)
+
+
 PIPELINES: dict[str, tuple[Stage, ...]] = {
     "vibe": _stages(("implement", "implement", "Implement"), ("merge", "merge", "Merge")),
     "medium": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
@@ -50,11 +60,14 @@ PIPELINES: dict[str, tuple[Stage, ...]] = {
     "high": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
                     ("verify", "verify", "Verify"),
                     *((s.name, s.role, s.label) for s in review_stages()),
-                    ("security", "security", "Security scan"), ("merge", "merge", "Train merge")),
+                    ("security", "security", "Security scan"),
+                    *((s.name, s.role, s.label) for s in PRE_MERGE_AUDIT_STAGES),
+                    ("merge", "merge", "Train merge")),
     "xhigh": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
                      ("verify", "verify", "Verify"),
                      *((s.name, s.role, s.label) for s in review_stages()),
                      ("security", "security", "Security audit"),
+                     *((s.name, s.role, s.label) for s in PRE_MERGE_AUDIT_STAGES),
                      ("merge", "merge", "Train merge")),
 }
 

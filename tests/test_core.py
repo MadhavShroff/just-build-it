@@ -231,11 +231,32 @@ class RigorTest(unittest.TestCase):
     def test_vibe_has_no_checks_and_xhigh_has_four_reviews(self):
         self.assertEqual([s.role for s in rigor.pipeline("vibe")], ["implement", "merge"])
         # FOUNDER RULE 2026-11-16: every review step runs four reviews, one on the
-        # cascade-active model and three independent DeepSeek agents.
-        self.assertEqual([s.role for s in rigor.pipeline("xhigh")].count("review"), 4)
-        self.assertEqual([s.name for s in rigor.pipeline("xhigh") if s.role == "review"],
+        # cascade-active model and three independent DeepSeek agents, plus pre-merge
+        # test-audit, methodology-audit, and dry-run stages on high and xhigh.
+        self.assertEqual([s.name for s in rigor.pipeline("medium") if s.role == "review"],
                          ["review-cascade", "review-ds-1", "review-ds-2", "review-ds-3"])
+        for level in ("high", "xhigh"):
+            self.assertEqual(
+                [s.name for s in rigor.pipeline(level) if s.role == "review"],
+                [
+                    "review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
+                    "test-audit", "methodology-audit", "dry-run",
+                ],
+            )
+            self.assertEqual([s.name for s in rigor.pipeline(level)[-4:]],
+                             ["test-audit", "methodology-audit", "dry-run", "merge"])
         self.assertEqual(rigor.LEVELS["vibe"]["lane_checks"], ())
+
+    def test_pre_merge_audit_stage_briefs(self):
+        from jbi import briefs
+        sample = task("a", owns=("src/a.py",))
+        t_brief = briefs.render(task=sample, role="review", stage="test-audit", attempt=0, receipt=Path("/tmp/r"))
+        m_brief = briefs.render(task=sample, role="review", stage="methodology-audit", attempt=0, receipt=Path("/tmp/r"))
+        d_brief = briefs.render(task=sample, role="review", stage="dry-run", attempt=0, receipt=Path("/tmp/r"))
+        self.assertIn("confirm they actually prove the behaviour", t_brief)
+        self.assertIn("tg work:ready", m_brief)
+        self.assertIn("no attribution lines, no --amend, atomic commits", m_brief)
+        self.assertIn("in-weight rehearsal of the app itself", d_brief)
 
     def test_escalation_moves_the_implementer_up(self):
         self.assertEqual(rigor.tier_for("economy", "implement", 0), "S")

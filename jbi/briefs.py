@@ -23,6 +23,23 @@ ROLE_GOALS = {
     "bootstrap": "Set up the repository only. Write no feature code.",
 }
 
+STAGE_GOALS = {
+    "test-audit": (
+        "Review the tests the app produced and confirm they actually prove the behaviour, "
+        "not just that they pass. Do not edit files."
+    ),
+    "methodology-audit": (
+        "Check the built app against our way of doing and landing code: branch + draft PR, "
+        "the work contract headings, tg work:ready, the train, squash merge, no attribution lines, "
+        "no --amend, atomic commits. Do not edit files."
+    ),
+    "dry-run": (
+        "Run an in-weight rehearsal of the app itself: take the built app and walk it through "
+        "the real landing path without merging, and report whether it would work in practice and "
+        "whether it maps to our way. Do not edit files."
+    ),
+}
+
 RULES = (
     "Work only inside the current directory, the task worktree.",
     "Edit only the owned paths. Do not commit; the runtime commits for you.",
@@ -51,7 +68,8 @@ def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
            findings: list[str] | None = None, goal: str | None = None) -> str:
     """The brief text for one stage of one task, clipped to MAX_LINES."""
     lines = [f"# Brief {task['id']} — {stage} (attempt {attempt + 1})", "",
-             "## Goal", goal or task.get("goal", ""), "", ROLE_GOALS.get(role, ""), ""]
+             "## Goal", goal or task.get("goal", ""), "",
+             STAGE_GOALS.get(stage) or ROLE_GOALS.get(role, ""), ""]
     if task.get("title"):
         lines[2:2] = [f"Task: {task['title']}", ""]
     lines += ["## Owns", *(f"- {p}" for p in task.get("owns") or ["(no declared paths)"]), ""]

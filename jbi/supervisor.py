@@ -390,7 +390,7 @@ class Supervisor:
 
         def one(stage: rigor.Stage) -> None:
             try:
-                got = self._agent_stage(task, stage, worktree, findings)
+                got = self._agent_stage(task, stage, worktree, findings, discard=False)
             except Exception as error:          # one review failing never hides the others
                 got = (False, f"{type(error).__name__}: {error}", None)
             with lock:
@@ -423,7 +423,7 @@ class Supervisor:
         return passed, detail, models or None
 
     def _agent_stage(self, task: dict, stage: rigor.Stage, worktree: Path,
-                     findings: list[str]) -> tuple[bool, str, str | None]:
+                     findings: list[str], *, discard: bool = True) -> tuple[bool, str, str | None]:
         tid, attempt = task["id"], task.get("attempts", 0)
         state = self.store.snapshot()[1]
         choice = models.select(state, stage.role, task=task, attempts=attempt)
@@ -445,7 +445,7 @@ class Supervisor:
                     return False, f"modified unowned path {', '.join(unowned)}", choice.model
             sha = wt.commit_all(worktree, f"{tid}: implement attempt {attempt + 1}")
             self._task_update(tid, commit=sha or wt.head(worktree, "HEAD"), receipt=str(receipt))
-        elif stage.role != "review":
+        elif discard:
             wt.discard_changes(worktree)        # verifiers and reviewers never edit code
         if result is None:
             return False, f"no valid receipt (exit {session.status.get('exit_code')})", choice.model
