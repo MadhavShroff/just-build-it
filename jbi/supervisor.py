@@ -368,6 +368,12 @@ class Supervisor:
             return False, f"stopped by {self._stopping}", choice.model
         result = briefs.parse_receipt(receipt)
         if stage.role == "implement":
+            owns = task.get("owns") or []
+            if owns:
+                unowned = [p for p in wt.dirty_paths(worktree) if not wt.path_owned(p, owns)]
+                if unowned:
+                    wt.discard_changes(worktree)
+                    return False, f"modified unowned path {', '.join(unowned)}", choice.model
             sha = wt.commit_all(worktree, f"{tid}: implement attempt {attempt + 1}")
             self._task_update(tid, commit=sha or wt.head(worktree, "HEAD"), receipt=str(receipt))
         else:

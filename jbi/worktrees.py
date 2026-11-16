@@ -7,8 +7,10 @@ temporary detached worktree, then fast-forwards `main` to the squash commit.
 
 from __future__ import annotations
 
+import fnmatch
 import subprocess
 from pathlib import Path
+from typing import Iterable
 
 MAIN = "main"
 IDENTITY = ("-c", "user.name=just-build-it", "-c", "user.email=jbi@localhost")
@@ -61,6 +63,44 @@ def commit_all(path: Path, message: str) -> str | None:
         return None
     git(path, "commit", "-q", "--no-verify", "-m", message)
     return git(path, "rev-parse", "HEAD")
+
+
+def dirty_paths(worktree: Path) -> list[str]:
+    """Return every modified, added, deleted, renamed, or untracked path in `worktree`."""
+    out = git(worktree, "status", "--porcelain", "-uall")
+    if not out:
+        return []
+    paths: list[str] = []
+    for raw in out.splitlines():
+        parts = raw.lstrip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        rest = parts[1].strip()
+        for item in (rest.split(" -> ") if " -> " in rest else [rest]):
+            clean = item.strip().strip('"').lstrip("./")
+            if clean and clean not in paths:
+                paths.append(clean)
+    return paths
+
+
+def path_owned(path: str, owns: Iterable[str]) -> bool:
+    """Return True when `path` matches at least one owned path, directory prefix, or glob."""
+    normalized = path.strip().lstrip("./")
+    if normalized == ".jbi/architecture.patch.json":
+        return True
+    for raw in owns:
+        pattern = raw.strip().lstrip("./").rstrip("/")
+        if not pattern:
+            continue
+        if normalized == pattern or normalized.startswith(pattern + "/"):
+            return True
+        if pattern.endswith("/**"):
+            prefix = pattern[:-3].rstrip("/")
+            if not prefix or normalized == prefix or normalized.startswith(prefix + "/"):
+                return True
+        if any(ch in pattern for ch in "*?[") and fnmatch.fnmatchcase(normalized, pattern):
+            return True
+    return False
 
 
 def create_worktree(repo: Path, task: str, base: str, root: Path) -> Path:

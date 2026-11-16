@@ -534,6 +534,35 @@ class ReviewFindings(unittest.TestCase):
         self.assertTrue(wait_for(lambda: store.read("/bootstrap/status") == "failed"
                                  and hooks.calls.count(("bootstrap", False)) == 2, 10))
 
+    def test_9_diff_ownership_enforcement_discards_unowned_edits(self):
+        from jbi import briefs, rigor
+        repo = self.tmp / "own_repo"
+        wt.init_repo(repo)
+        (repo / "README").write_text("base\n")
+        base_sha = wt.commit_all(repo, "base")
+        t = task("a", owns=["src/owned.py"])
+        sup, store, hooks = self.supervisor(repo, [t])
+        worktree = wt.create_worktree(repo, "a", base_sha, sup.run_dir / "worktrees")
+
+        def bad_session(tid, role, cmd, cwd, provider, model, attempt):
+            (cwd / "src").mkdir(exist_ok=True)
+            (cwd / "src" / "owned.py").write_text("ok = True\n")
+            (cwd / "src" / "unowned.py").write_text("bad = True\n")
+            rec = briefs.receipt_path(sup.run_dir, tid, role, attempt)
+            rec.parent.mkdir(parents=True, exist_ok=True)
+            rec.write_text(f"BRIEF {tid} | uncommitted | PASS\ndone\n")
+            return type("S", (), {"status": {"exit_code": 0}})()
+
+        sup.run_session = bad_session
+        ok, detail, _ = sup._agent_stage(store.read("/plan/tasks/a"), rigor.pipeline("vibe")[0],
+                                         worktree, [])
+        self.assertFalse(ok)
+        self.assertIn("modified unowned path", detail)
+        self.assertIn("src/unowned.py", detail)
+        self.assertEqual(wt.dirty_paths(worktree), [])
+        self.assertEqual(wt.head(worktree, "HEAD"), base_sha)
+        self.assertFalse((worktree / "src" / "unowned.py").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
