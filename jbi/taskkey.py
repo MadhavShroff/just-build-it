@@ -112,6 +112,10 @@ def task_key(repo: Path | str, task: dict, base: str, choice, *, level: str, sta
     The base commit is an argument because it scopes the file content (2.2). The base
     commit id is not itself a field: a merge moves the base without changing an owned
     file, and 3.2 forbids folding an input in to make a hit more likely.
+
+    `findings` is an input too. It is the text a failed attempt returned, so a retry
+    that carries new findings has a new key and re-runs. That keeps 3.1 true for the
+    one input a retry adds.
     """
     paths = sorted({p for p in (_owned(o) for o in (task.get("owns") or ())) if p})
     hashes = _hashes(Path(repo), base, paths)
@@ -186,14 +190,6 @@ class WorkCache:
                 pass
             raise
 
-    def delete(self) -> None:
-        """5.3: a deleted cache makes the next run correct, only slower."""
-        with self._lock:
-            try:
-                self.path.unlink()
-            except OSError:
-                pass
-
     # ---- the key for one task and stage ----------------------------------------------
 
     def key_for(self, repo: Path | str, tasks: dict, tid: str, stage, *, base: str,
@@ -230,14 +226,21 @@ class WorkCache:
         if not _is_commit(repo, commit):
             return None                      # 3.1: the recorded work is gone, so it is unknown
         if stage.name == "implement":
-            wt.discard_changes(worktree)
+            if wt.dirty_paths(worktree):
+                # 3.1: the worktree holds uncommitted work. Its content is an input the
+                # key does not hash, so it reads as CHANGED. A hit never discards it.
+                return None
+            # A detached checkout moves no branch. A branch checkout moves branch
+            # jbi/<task>, so the merge stage lands exactly this work.
             wt.git(worktree, "reset", "-q", "--hard", str(commit))
-            detail = f"cache hit: implement reused run {entry.get('run')} at {str(commit)[:10]}"
+            # 4.3: the record names the key and the run the result came from.
+            detail = (f"cache hit key {str(key)[:12]} run {entry.get('run')}: "
+                      f"implement reused {str(commit)[:10]}")
         else:
             # A later stage is a hit only against the exact tree it passed on.
             if wt.head(worktree, "HEAD") != commit:
                 return None
-            detail = str(entry.get("detail") or "cache hit")
+            detail = f"cache hit key {str(key)[:12]} run {entry.get('run')}: {entry.get('detail') or ''}"
         self._bump(key)
         return Hit(str(key), stage.name, str(entry.get("run")), commit, detail, entry.get("model"))
 

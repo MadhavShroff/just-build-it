@@ -3,6 +3,10 @@
 Every test changes real state. 6.2 edits and commits a file on disk. 6.5 runs the
 real supervisor and counts a real acceptance-command run. 6.6 removes the recorded
 commit object from the repository and proves the task RE-RAN.
+
+The tests also cover the rules a reader would otherwise trust on the docstring: 2.2
+(the model, the rigor level and each dependency key), 2.3, 2.5, 3.1, 4.1, 4.2, 4.3,
+5.1 and 5.3.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import json
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -140,6 +145,28 @@ class Keys(unittest.TestCase):
                                choice(), level="vibe", stage=IMPLEMENT)
         self.assertEqual(one, two, "the owns order changed the key")
 
+    def test_4_2_a_seeded_gate_entry_never_hits(self):
+        """4.2, 5.1 and 6.5: seed each gate stage under its OWN key, then prove no hit.
+
+        A gate that could hit would land unverified code. This seeds the cache with
+        a valid entry for the exact key each gate stage computes, so a hit is
+        possible, and then requires a miss.
+        """
+        repo = Repo(self)
+        base = repo.commit({"data/x.txt": "x\n"})
+        cache = taskkey.WorkCache(repo.run_dir(), "run-1")
+        gates = [ACCEPTANCE, MERGE, rigor.stage("high", "verify"),
+                 rigor.stage("high", "security"), *rigor.review_stages()]
+        for stage in gates:
+            self.assertFalse(taskkey.cacheable(stage), f"{stage.name} must always run")
+            key = taskkey.task_key(repo.path, task("a", owns=["data/x.txt"]), base, choice(),
+                                   level="vibe", stage=stage)
+            cache.record(key, stage, task="a", worktree=repo.path, detail="seeded", model=None)
+            self.assertIsNotNone(cache.lookup(key), f"{stage.name}: the seed did not land")
+            self.assertIsNone(taskkey.consult(cache, key, stage, repo=repo.path,
+                                              worktree=repo.path),
+                              f"a seeded {stage.name} entry read as a hit")
+
     def test_normalise_leaves_no_rule_behind(self):
         """2.6: trim the ends, collapse whitespace runs, change no word and no case."""
         self.assertEqual(taskkey.normalise("  Build \n  The\tTHING  "), "Build The THING")
@@ -232,6 +259,20 @@ class CacheSafety(unittest.TestCase):
                             "commit", "the test did not remove the commit")
         self.assertIsNone(cache.before(key, IMPLEMENT, repo=repo.path, worktree=repo.path),
                           "a vanished commit still read as a hit")
+    def test_uncommitted_work_is_an_unknown_input(self):
+        """3.1: a dirty worktree is work the key does not hash, so a hit never discards it."""
+        repo = Repo(self)
+        base = repo.commit({"data/x.txt": "x\n"})
+        cache = taskkey.WorkCache(repo.run_dir(), "run-1")
+        key = taskkey.task_key(repo.path, task("a", owns=["data/x.txt"]), base, choice(),
+                               level="vibe", stage=IMPLEMENT)
+        cache.record(key, IMPLEMENT, task="a", worktree=repo.path, detail="d", model=None)
+        self.assertIsNotNone(cache.before(key, IMPLEMENT, repo=repo.path, worktree=repo.path))
+        (repo.path / "half-done.txt").write_text("unsaved work\n")
+        self.assertIsNone(cache.before(key, IMPLEMENT, repo=repo.path, worktree=repo.path),
+                          "a hit discarded uncommitted work")
+        self.assertTrue((repo.path / "half-done.txt").exists(), "the hit deleted the work")
+
     def test_5_3_a_broken_cache_file_is_a_miss(self):
         """5.3: a cache that cannot be read makes the next run correct, only slower."""
         repo = Repo(self)
@@ -263,6 +304,7 @@ class Run(unittest.TestCase):
         self.runs += 1
         run_dir = self.tmp / f"run-{self.runs}"
         run_dir.mkdir(parents=True)
+        self.last_run = run_dir
         if share is not None and (share / taskkey.CACHE_NAME).exists():
             shutil.copy(share / taskkey.CACHE_NAME, run_dir / taskkey.CACHE_NAME)
         state = protocol.initial_state(f"t-{uuid.uuid4().hex[:8]}", "now", name="t",
@@ -278,9 +320,27 @@ class Run(unittest.TestCase):
         return sup, store, hooks
 
     def merged(self, sup, hooks, store, tid: str = "a", timeout: float = 90) -> None:
+        """Run until the task merges. A task that stops short fails here, fast."""
         sup.start_execution()
-        self.assertTrue(hooks.merged_event.wait(timeout), store.read("/timeline"))
-        self.assertEqual(store.read(f"/plan/tasks/{tid}/status"), "merged")
+        deadline, status, events, seen = time.monotonic() + timeout, None, {}, False
+        while time.monotonic() < deadline:
+            status = store.read(f"/plan/tasks/{tid}/status")
+            events = store.read("/plan/tasks/%s/stages" % tid) or {}
+            # The lane callback sets status "merged" BEFORE the task thread commits
+            # the merge stage record (supervisor._progress says so). Wait for both.
+            if status in ("failed", "skipped", "decision"):
+                break                              # a terminal state, so stop waiting
+            if status == "merged" and "merge" in events:
+                break
+            thread = sup._running.get(tid)
+            if thread is not None:
+                seen = seen or thread.is_alive()
+                if seen and not thread.is_alive():
+                    break                          # it ran, then ended: nothing will merge
+            time.sleep(0.05)
+        self.assertEqual(status, "merged", f"{tid} did not merge: {store.read('/timeline')}")
+        self.assertIn("merge", events, "the task merged without a merge stage record")
+        self.assertTrue(hooks.merged_event.wait(timeout), "all_merged never fired")
 
     def drop_worktree(self, run_dir: Path, tid: str = "a") -> None:
         wt.remove_worktree(self.repo, run_dir / "worktrees" / tid)
@@ -288,9 +348,15 @@ class Run(unittest.TestCase):
 
 
 class HitStillGates(Run):
-    """6.5: a cache hit skips work and never a gate."""
+    """6.1 and 6.5: two tasks with identical inputs share one key, and the reuse of
+    that result still runs every gate.
 
-    def test_6_5_a_hit_still_runs_the_acceptance_command_and_the_merge(self):
+    The two tasks differ only in their ID, which no key field covers (2.1), so their
+    keys match. This is the end-to-end arm of 6.1: a real run, a real cache file and
+    a second real run.
+    """
+
+    def test_6_1_and_6_5_a_hit_reuses_the_work_and_runs_every_gate(self):
         log = self.tmp / "accept.log"
         acceptance = f"echo ran >> {log}; true"
         sup, store, hooks = self.supervisor([task("a", acceptance=acceptance)], rigor_name="medium")
@@ -309,6 +375,11 @@ class HitStillGates(Run):
         hits = [row["text"] for row in store2.read("/timeline") or []
                 if row.get("kind") == "task" and "cache hit" in str(row.get("text"))]
         self.assertTrue(hits, "the hit was not recorded (4.3)")
+        # 4.3: the record names the key and the run it reused.
+        entry = json.loads((warm / taskkey.CACHE_NAME).read_text())
+        key = next(iter(entry))
+        self.assertIn(key[:12], hits[0], "the hit record does not name its key (4.3)")
+        self.assertIn(entry[key]["run"], hits[0], "the hit record does not name the reused run (4.3)")
         # 4.2 and 6.5: the acceptance command ran a second time, and the merge landed.
         self.assertEqual(log.read_text().count("ran"), 2,
                          "a cache hit skipped the acceptance command")
@@ -318,48 +389,82 @@ class HitStillGates(Run):
 
 
 class UnknownInputReruns(Run):
-    """6.6: an input the key cannot see makes the task RE-RUN."""
+    """6.6: an input the key cannot see makes the task RE-RUN, never hit (3.1)."""
 
-    def test_6_6_a_gone_recorded_commit_makes_the_task_rerun(self):
+    def _run_and_check(self, warm: Path, tid: str) -> tuple:
+        sup, store, hooks = self.supervisor([task(tid)], rigor_name="vibe", share=warm)
+        self.merged(sup, hooks, store, tid)
+        hits = [row for row in store.read("/timeline") or []
+                if row.get("kind") == "task" and "cache hit" in str(row.get("text"))]
+        sessions = store.read(f"/sessions/s-{tid}-implement-1/status")
+        return hits, sessions
+
+    def test_a_known_input_hits_and_an_unknown_input_reruns(self):
+        """6.6, both arms: the same inputs hit, and a commit that is gone RE-RUNS.
+
+        The hit arm is the control. Without it, a miss proves nothing: a test that
+        only sees a re-run cannot tell a correct unknown-input rule from a cache that
+        never hits at all.
+        """
         sup, store, hooks = self.supervisor([task("a")], rigor_name="vibe")
         self.merged(sup, hooks, store)
         warm = self.tmp / "run-1"
+        self.assertTrue((warm / taskkey.CACHE_NAME).exists(),
+                        "the warm run wrote no cache, so no later run can hit")
         entry = json.loads((warm / taskkey.CACHE_NAME).read_text())
         self.assertTrue(entry, "the first run recorded nothing")
-        implement_commit = next(iter(entry.values()))["commit"]
         self.drop_worktree(warm, "a")
+
+        # ARM 1, the control: the same inputs hit, and no implement session starts.
+        hits, sessions = self._run_and_check(warm, "b")
+        self.assertTrue(hits, "the same inputs did not hit, so the cache is inert")
+        self.assertIsNone(sessions, "a hit started an implement session")
+        self.drop_worktree(self.tmp / "run-2", "b")
+
+        # ARM 2: remove the recorded commit. The key cannot see it, so it means CHANGED.
+        implement_commit = next(iter(entry.values()))["commit"]
         wt.git(self.repo, "reflog", "expire", "--expire=now", "--all", check=False)
         wt.git(self.repo, "gc", "-q", "--prune=now", check=False)
         self.assertNotEqual(wt.git(self.repo, "cat-file", "-t", implement_commit, check=False),
                             "commit", "the test did not remove the recorded commit")
-
-        sup2, store2, hooks2 = self.supervisor([task("b")], rigor_name="vibe", share=warm)
-        self.merged(sup2, hooks2, store2, "b")
-        # A new implement session exists, so the task RE-RAN and did not hit (3.1).
-        self.assertIsNotNone(store2.read("/sessions/s-b-implement-1/status"),
-                             "an unknown input did not re-run the implement stage")
-        hits = [row for row in store2.read("/timeline") or []
-                if row.get("kind") == "task" and "cache hit" in str(row.get("text"))]
+        hits, sessions = self._run_and_check(warm, "c")
+        self.assertTrue(sessions, "an unknown input did not re-run the implement stage (3.1)")
         self.assertEqual(hits, [], "an unknown input reported a cache hit")
 
 
 class DeletedCache(Run):
-    """6.7: deleting the cache gives the same final result."""
+    """6.7 and 5.3: a deleted cache gives the same final result, only slower.
+
+    All three arms run the SAME task, so the code they land is identical and the
+    final tree is a fair comparison. Arm 1 is warm. Arm 2 reads the cache. Arm 3 has
+    no cache and must land the same tree as arm 2.
+    """
+
+    def _run_and_tree(self, run_dir: Path, tid: str, share: bool = False) -> tuple:
+        sup, store, hooks = self.supervisor([task(tid)], rigor_name="vibe",
+                                            share=run_dir if share else None)
+        self.merged(sup, hooks, store, tid)
+        hits = [row for row in store.read("/timeline") or []
+                if row.get("kind") == "task" and "cache hit" in str(row.get("text"))]
+        return wt.git(self.repo, "rev-parse", "main^{tree}"), hits
 
     def test_6_7_deleting_the_cache_keeps_the_final_result(self):
+        warm = self.tmp / "run-1"
         sup, store, hooks = self.supervisor([task("a")], rigor_name="vibe")
         self.merged(sup, hooks, store)
-        warm_tree = wt.git(self.repo, "rev-parse", "main^{tree}")
-        self.drop_worktree(self.tmp / "run-1", "a")
+        self.drop_worktree(warm, "a")
 
-        sup2, store2, hooks2 = self.supervisor([task("a")], rigor_name="vibe")
-        self.merged(sup2, hooks2, store2)
-        self.assertEqual(wt.git(self.repo, "rev-parse", "main^{tree}"), warm_tree,
-                         "a cold run changed the final result (5.3)")
-        self.assertEqual(store2.read("/plan/tasks/a/stages")["merge"]["status"], "passed")
-        # The cold run is the control: it proves the cache is what made run 2 fast, and
-        # that removing the cache changes no result (5.3).
+        # ARM 1: the cache is present, so the second run hits the work and merges it.
+        hit_tree, hits = self._run_and_tree(warm, "a", share=True)
+        self.assertTrue(hits, "the second run did not hit, so this arm proves nothing")
+        self.drop_worktree(self.last_run, "a")
 
+        # ARM 2: no cache. The run is cold and lands the SAME tree, only slower (5.3).
+        cold = self.tmp / "run-3"
+        self.assertFalse((cold / taskkey.CACHE_NAME).exists(), "the cold run started warm")
+        cold_tree, cold_hits = self._run_and_tree(cold, "a")
+        self.assertEqual(cold_hits, [], "the cold run hit a cache it did not have")
+        self.assertEqual(cold_tree, hit_tree, "a deleted cache changed the final result (5.3)")
 
 if __name__ == "__main__":
     unittest.main()
