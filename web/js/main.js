@@ -42,9 +42,14 @@ function main() {
   const previewPage = mountPreview(ctx, previewSection, { onOpenTask: (id) => tasksRef?.open(id) });
   const metricsPage = mountMetrics(ctx, metricsSection);
   let mounted = false;
-  let activeOverlay = (location.pathname === '/metrics' || location.hash === '#metrics') ? 'metrics'
-    : (location.pathname === '/preview' || location.hash === '#preview') ? 'preview'
-    : null;
+  // A reverse proxy may mount the dashboard under a prefix, so the overlay is
+  // read from the END of the path as well as the hash. /jbi/preview and
+  // /jbi/preview/#preview both open the preview.
+  const pathTail = (value) => (value || '').split('/').filter(Boolean).pop() || '';
+  const hashParts = (location.hash || '').replace(/^#/, '').split('&');
+  const wantsPreview = hashParts.includes('preview') || pathTail(location.pathname) === 'preview';
+  const wantsMetrics = hashParts.includes('metrics') || pathTail(location.pathname) === 'metrics';
+  let activeOverlay = wantsMetrics ? 'metrics' : wantsPreview ? 'preview' : null;
 
   function syncSections() {
     if (activeOverlay === 'metrics') {
@@ -133,6 +138,12 @@ function main() {
       queueMicrotask(stopWaiting);
     }
   });
+
+  // The preview is read-only and needs no session when the proxy publishes it.
+  // Read it directly, so a signed-out visitor still sees the graph.
+  if (activeOverlay === 'preview') {
+    previewPage.refresh();
+  }
 
   api.start();
 }

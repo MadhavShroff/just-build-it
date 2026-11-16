@@ -633,6 +633,65 @@ class ServerTest(unittest.TestCase):
         status, body = self.call("GET", "/api/v1/state")
         self.assertEqual((status, body["error"]["code"]), (401, "unauthenticated"))
 
+    def test_a_base_path_mounts_the_whole_dashboard_under_a_prefix(self):
+        """A reverse proxy forwards a prefix; the page and its assets still resolve.
+
+        The proxy is the only caller that knows the prefix, so the server strips it
+        before routing. Every relative link in the page then works unchanged.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = new_store(Path(tmp.name))
+        self.addCleanup(store.close)
+        auth = Auth()
+        app = App(store, Engine(store, None, None), auth,
+                  link_bases=lambda: [], base_path="/jbi/preview",
+                  public_paths=frozenset({"/api/v1/preview"}))
+        server = Server(app, ["127.0.0.1"]).start()
+        self.addCleanup(server.stop)
+        base = f"http://127.0.0.1:{server.port}"
+
+        # The bare path is not routed: the prefix is part of the address.
+        with self.assertRaises(urllib.error.HTTPError) as bare:
+            urllib.request.urlopen(base + "/", timeout=5)
+        self.assertEqual(bare.exception.code, 404)
+
+        # The page answers under the prefix, unauthenticated, as a proxy forwards it.
+        with urllib.request.urlopen(base + "/jbi/preview/", timeout=5) as page:
+            self.assertEqual(page.status, 200)
+            self.assertIn(b"just-build-it", page.read())
+
+        # A published read-only route needs no session; state still does.
+        with urllib.request.urlopen(base + "/jbi/preview/api/v1/preview", timeout=5) as preview:
+            self.assertEqual(preview.status, 200)
+        with self.assertRaises(urllib.error.HTTPError) as state:
+            urllib.request.urlopen(base + "/jbi/preview/api/v1/state", timeout=5)
+        self.assertEqual(state.exception.code, 401)
+
+    def test_the_registry_record_names_the_dag_and_carries_no_token(self):
+        """A proxy finds the preview through this file, so it must hold no secret."""
+        from jbi import cli
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "jbi-preview.json"
+
+        class Args:
+            registry = path
+            preview = True
+            dag = Path("/tmp/example-dag.json")
+
+        run = cli.Run.__new__(cli.Run)
+        run.server = type("S", (), {"port": 9999})()
+        run.app = type("A", (), {"base_path": "/jbi/preview", "public_paths": ()})()
+        run.run_id = "r-test"
+        run._publish_registry(Args())
+        record = json.loads(path.read_text())
+        self.assertEqual(record["dag"], "/tmp/example-dag.json")
+        self.assertEqual(record["base_path"], "/jbi/preview")
+        self.assertEqual(record["url"], "http://127.0.0.1:9999/jbi/preview")
+        self.assertNotIn("token", record)
+        self.assertEqual(sorted(record["published"]), [])
+
     def test_a_key_works_once(self):
         key = self.auth.new_key()
         self.assertEqual(self.call("POST", "/api/v1/session", {"key": key})[0], 200)

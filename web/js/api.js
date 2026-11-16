@@ -4,6 +4,22 @@
 const PROTOCOL = '1';
 const MAX_RETRY_MS = 10000;
 
+// A reverse proxy may mount the dashboard under a prefix, such as /jbi/preview.
+// Every request path is built from this base, so the page works at either place.
+// The base is the part of the path before the final segment the server uses for
+// its own routing (/preview, /metrics, or nothing).
+function resolveBase() {
+  const PROXY_MARKER = '/jbi/preview';
+  const path = location.pathname.replace(/\/+$/, '');
+  if (path.endsWith(PROXY_MARKER)) return PROXY_MARKER;
+  return '';
+}
+const BASE = resolveBase();
+
+function apiPath(path) {
+  return BASE + path;
+}
+
 export class ApiError extends Error {
   constructor(status, code, message, details = {}) {
     super(message);
@@ -38,7 +54,7 @@ export class Client {
   async start() {
     try {
       await this.#exchangeKey();
-      this.store.setSchema(await this.#request('GET', '/api/v1/schema'));
+      this.store.setSchema(await this.#request('GET', apiPath('/api/v1/schema')));
       await this.#refetch();
     } catch (error) {
       this.#fail(error);
@@ -47,17 +63,17 @@ export class Client {
 
   /** Submit one command. Resolves with the reply or throws an ApiError. */
   send(type, payload = {}) {
-    return this.#request('POST', '/api/v1/commands', { id: commandId(), type, payload });
+    return this.#request('POST', apiPath('/api/v1/commands'), { id: commandId(), type, payload });
   }
 
   /** Read the deterministic metrics snapshot (no LLM). */
   metrics() {
-    return this.#request('GET', '/api/v1/metrics');
+    return this.#request('GET', apiPath('/api/v1/metrics'));
   }
 
   /** Read the deterministic DAG preview snapshot (no LLM). */
   preview() {
-    return this.#request('GET', '/api/v1/preview');
+    return this.#request('GET', apiPath('/api/v1/preview'));
   }
 
   async #exchangeKey() {
@@ -65,7 +81,7 @@ export class Client {
     if (!match) return;
     history.replaceState(null, '', location.pathname + location.search);
     try {
-      await this.#request('POST', '/api/v1/session', { key: decodeURIComponent(match[1]) });
+      await this.#request('POST', apiPath('/api/v1/session'), { key: decodeURIComponent(match[1]) });
     } catch (error) {
       // A reload reuses a spent key; an existing session cookie may still be valid.
       if (!(error instanceof ApiError && error.code === 'unauthenticated')) throw error;
@@ -74,13 +90,13 @@ export class Client {
 
   async #refetch() {
     this.#close();
-    const body = await this.#request('GET', '/api/v1/state');
+    const body = await this.#request('GET', apiPath('/api/v1/state'));
     this.store.load(body.seq, body.state, body.info || {});
     this.#open();
   }
 
   #open() {
-    const source = new EventSource(`/api/v1/events?after=${this.store.seq}`);
+    const source = new EventSource(apiPath(`/api/v1/events?after=${this.store.seq}`));
     this.#source = source;
     source.addEventListener('open', () => {
       this.#retryMs = 1000;

@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__, netinfo, protocol
@@ -65,6 +65,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--preview", action="store_true",
                        help="serve the dry-run DAG preview UI showing waves, parallel tasks, "
                             "critical path and live ETAs")
+    start.add_argument("--base-path", default="",
+                       help="mount the dashboard under a URL prefix, such as /jbi/preview, when a "
+                            "reverse proxy forwards it. The prefix is stripped before routing, so "
+                            "the page's relative links keep working.")
+    start.add_argument("--publish-preview", action="store_true",
+                       help="answer the read-only preview and health routes without a browser "
+                            "session, so a proxy that holds its own authentication can forward "
+                            "them. Every other route still needs a session or the machine token.")
+    start.add_argument("--registry", type=Path, default=None,
+                       help="write a small JSON record of this run (port, base path, DAG, run id) "
+                            "so another service can find the preview. Defaults to "
+                            "~/.tangram-dev/jbi-preview.json for a preview run.")
     start.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
     start.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
 
@@ -236,12 +248,46 @@ class Run:
 
         tailnet = None if args.no_tailscale else netinfo.detect_tailscale()
         self.auth = Auth()
+        public_paths = frozenset()
+        if getattr(args, "publish_preview", False):
+            public_paths = frozenset({"/api/v1/preview", "/api/v1/health"})
         self.app = App(self.store, self.engine, self.auth,
                        extra_info=lambda: {"pid": os.getpid(), "run_dir": str(self.dir)},
-                       link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified])
+                       link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified],
+                       base_path=getattr(args, "base_path", "") or "",
+                       public_paths=public_paths)
         self.server = Server(self.app, netinfo.hosts(tailnet), args.port).start()
         self.links = netinfo.links(self.server.port, self.run_id, tailnet)
         Control(self.links[0].url, self.auth.token, self.run_id, os.getpid()).save(self.dir / "control.json")
+        self._publish_registry(args)
+
+    def _publish_registry(self, args) -> None:
+        """Record where this run's preview is, so a proxy can forward to it.
+
+        The record carries no token: the proxy authenticates its own callers and
+        needs only the address. A preview run publishes by default; any other run
+        publishes only when --registry names a path.
+        """
+        path = getattr(args, "registry", None)
+        if path is None:
+            if not getattr(args, "preview", False):
+                return
+            path = Path.home() / ".tangram-dev" / "jbi-preview.json"
+        path = Path(path).expanduser()
+        dag = getattr(args, "dag", None)
+        record = {
+            "url": f"http://127.0.0.1:{self.server.port}{self.app.base_path}",
+            "port": self.server.port,
+            "base_path": self.app.base_path,
+            "run_id": self.run_id,
+            "pid": os.getpid(),
+            "dag": str(dag.expanduser().resolve()) if dag else None,
+            "preview": bool(getattr(args, "preview", False)),
+            "published": sorted(self.app.public_paths),
+            "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2) + "\n")
 
     def _seed_accounts(self, offline: bool) -> None:
         from . import providers
