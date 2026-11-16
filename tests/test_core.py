@@ -604,13 +604,28 @@ class NodeRoutingTest(unittest.TestCase):
     def test_a_node_override_reaches_model_selection(self):
         from jbi import dag_loader, models
         doc = {"tasks": [{"id": "X1", "title": "t", "goal": "g", "override": {
-            "provider": "agy", "model": "gemini-4-argon-high"}}]}
+            "prefer": [{"provider": "agy", "model": "gemini-4-argon-high"}]}}]}
         path = Path(tempfile.mkdtemp()) / "d.json"
         path.write_text(json.dumps(doc))
         task, = dag_loader.load_tasks(path)
-        state = {"config": {"profile": "balanced"}, "accounts": {}}
+        state = {"config": {"profile": "balanced"},
+                 "accounts": {"agy": {"enabled": True, "status": "ok"}}}
         choice = models.select(state, "implement", task=task)
         self.assertEqual((choice.provider, choice.model), ("agy", "gemini-4-argon-high"))
+
+    def test_a_preference_falls_through_when_its_provider_is_unavailable(self):
+        """The rule the founder stated: prefer the top providers, else the cascade."""
+        from jbi import dag_loader, models
+        doc = {"tasks": [{"id": "X1", "title": "t", "goal": "g", "override": {
+            "prefer": [{"provider": "agy"}, {"provider": "codex"}]}}]}
+        path = Path(tempfile.mkdtemp()) / "d.json"
+        path.write_text(json.dumps(doc))
+        task, = dag_loader.load_tasks(path)
+        # No provider enabled: the preference cannot be served, so it falls through.
+        state = {"config": {"profile": "balanced"}, "accounts": {}}
+        choice = models.select(state, "implement", task=task)
+        self.assertNotIn(choice.provider, ("agy", "codex"),
+                         "a preference was served although neither provider is enabled")
 
     def test_a_model_without_a_provider_is_refused(self):
         """A model id alone does not name the CLI that serves it, so refuse it.
@@ -624,11 +639,11 @@ class NodeRoutingTest(unittest.TestCase):
         path.write_text(json.dumps(doc))
         with self.assertRaises(dag_loader.Invalid) as caught:
             dag_loader.load_tasks(path)
-        self.assertIn("needs override.provider", str(caught.exception))
+        self.assertIn("unknown key", str(caught.exception))
 
     def test_an_unknown_provider_is_refused(self):
         from jbi import dag_loader
-        doc = {"tasks": [{"id": "X1", "title": "t", "goal": "g", "override": {"provider": "openai"}}]}
+        doc = {"tasks": [{"id": "X1", "title": "t", "goal": "g", "override": {"pin": {"provider": "openai", "model": "m"}}}]}
         path = Path(tempfile.mkdtemp()) / "d.json"
         path.write_text(json.dumps(doc))
         with self.assertRaises(dag_loader.Invalid):

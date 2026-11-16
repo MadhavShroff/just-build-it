@@ -15,8 +15,15 @@ from pathlib import Path
 from . import cascade, rigor
 
 CATALOG_PATH = Path(__file__).parent / "data" / "models.json"
+# The providers a stage can actually dispatch on: agents.command builds an argument
+# list only for these. A provider that can name a model but start no agent is never a
+# routing target, however healthy its account probe reads.
+AGENT_PROVIDERS = ("agy", "claude", "codex", "simulator")
 # The order in which enabled providers are tried. The simulator is always last.
-PREFERENCE = ("claude", "codex", "agy", "openai-compatible", "simulator")
+# agy is FIRST: founder order 2026-11-17 puts the DAG execution nodes on agy, and
+# founder order 2026-11-13 puts no Claude model in any subagent. Claude is kept on
+# the list because a run may name it explicitly; it is not the default.
+PREFERENCE = ("agy", "codex", "claude", "openai-compatible", "simulator")
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,13 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     rung = cascade.read()
     up = usable(state)
 
+    # A provider the scheduler cannot dispatch on is not "usable" for this purpose,
+    # whatever the account probe says. The openai-compatible rung names a model that
+    # the local proxy serves; jbi has no agent command for it, so a run routed there
+    # dies on its first stage ("provider 'openai-compatible' has no agent command",
+    # 7 of 7 tasks, 2026-11-17). Filter to providers that agents.command can start.
+    up = [name for name in up if name in AGENT_PROVIDERS]
+
     # A PIN runs on one model only, and waits for it.
     pinned = override.get("pin")
     if isinstance(pinned, dict) and pinned.get("provider") and pinned.get("model"):
@@ -87,13 +101,13 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
         # None of the preferred providers is usable. Fall through to the cascade,
         # which may name one of them and be rejected by the account probe later.
 
-    if rung is not None and rung.provider and rung.provider != "simulator":
+    if rung is not None and rung.provider in AGENT_PROVIDERS:
         # A stale rung is still the cascade's last word. Using it beats inventing
         # one, and the staleness is visible in the run record.
         model = rung.model or catalog()["providers"][rung.provider]["models"][tier]
         return _choice(rung.provider, model, tier)
 
-    provider = up[0]
+    provider = up[0] if up else "simulator"
     return _choice(provider, catalog()["providers"][provider]["models"][tier], tier)
 
 

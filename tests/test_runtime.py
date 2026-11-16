@@ -173,6 +173,59 @@ class Runs(RunFixture):
             self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result", "model": "sim-l"})
 
 
+class ReviewFanout(RunFixture):
+    """The four reviews run AT THE SAME TIME, not one after another.
+
+    FOUNDER RULE 2026-11-16 and the founder's 2026-11-17 correction: stages 4, 5,
+    6 and 7 are one parallel group, so the pipeline is 9 sequential steps and not
+    12. A test that only checks the four stages were RECORDED proves nothing about
+    timing: four sequential calls record exactly the same four rows. This test
+    holds each review at a barrier until all four have arrived, so it can only
+    pass when all four are in flight together.
+    """
+
+    def test_all_four_reviews_are_in_flight_at_once(self):
+        sup = self.make([task("a")], rigor="high")
+        FANOUT = ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3")
+        barrier = threading.Barrier(4, timeout=20)
+        arrived, lock = [], threading.Lock()
+        original = sup._agent_stage
+
+        def agent_stage(task_, stage, worktree, findings, *, discard=True):
+            # Only the four fan-out stages, not the later audits that also carry
+            # role "review": those are separate sequential steps, not this group.
+            if stage.name in FANOUT:
+                with lock:
+                    arrived.append(stage.name)
+                # Blocks until FOUR reviews have reached this point. If the reviews
+                # ran one at a time, the first would time out here and the test fails.
+                barrier.wait()
+            return original(task_, stage, worktree, findings, discard=discard)
+
+        sup._agent_stage = agent_stage
+        sup.start_execution()
+        self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
+        self.assertEqual(sorted(set(arrived)), sorted(FANOUT),
+                         "not all four review stages ran: %r" % arrived)
+
+    def test_a_review_group_is_one_sequential_step(self):
+        """The pipeline is 9 steps, because the four reviews are one step."""
+        from jbi import rigor
+        stages = rigor.PIPELINES["high"]
+        names = [s.name for s in stages]
+        self.assertEqual(len(names), 12, names)
+        review_names = [s.name for s in rigor.review_stages()]
+        self.assertEqual(review_names,
+                         ["review-cascade", "review-ds-1", "review-ds-2", "review-ds-3"])
+        # The four are adjacent in the pipeline: nothing sits between them, so they
+        # form the one group the supervisor fans out.
+        first = names.index("review-cascade")
+        self.assertEqual(names[first:first + 4], review_names,
+                         "the review stages are not adjacent, so they cannot be one group")
+        self.assertEqual(len(names) - (len(review_names) - 1), 9,
+                         "the sequential step count is not 9")
+
+
 class Failures(RunFixture):
     env = {"JBI_SIM_FAIL": "x:implement:9"}
 
@@ -924,7 +977,13 @@ class ReviewFindings(unittest.TestCase):
             '    acceptance: "true"\n'
             '    owns: ["src/cli.py"]\n'
         )
-        args = cli.parse_args(["--dag", str(dag_file), "--dry-run", "--preview", "--no-tailscale", "--no-menu"])
+        # --registry is REQUIRED here. Without it the preview run publishes to
+        # ~/.tangram-dev/jbi-preview.json, which is the LIVE registry the board
+        # proxy reads: a test would repoint the founder's dashboard at a fixture
+        # DAG named preview_dag.yaml (found 2026-11-17 00:19).
+        registry = self.tmp / "test-jbi-preview.json"
+        args = cli.parse_args(["--dag", str(dag_file), "--dry-run", "--preview", "--no-tailscale",
+                               "--no-menu", "--registry", str(registry)])
         run = cli.Run(args)
         self.addCleanup(run.close)
         self.addCleanup(lambda: (run.runtime.stop("kill"), run.stopped.wait(20)))
