@@ -8,12 +8,23 @@ as its own dependencies are merged (`ready_tasks`).
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
+from . import rigor
 from .protocol import TASK_ID, ProtocolError
 
 REQUIRED = ("id", "title", "goal", "deps", "acceptance")
 DONE = "merged"
+
+STAGE_ETA_SECONDS: dict[str, int] = {
+    "implement": 180,
+    "acceptance": 30,
+    "verify": 60,
+    "review": 45,
+    "security": 45,
+    "merge": 60,
+}
+OWNS_FILE_ETA_SECONDS = 15
 
 
 def normalize(task: dict) -> dict:
@@ -139,3 +150,258 @@ def owns_conflict(plan: dict, tid: str, running: Iterable[str]) -> str | None:
         if other != tid and mine & set(plan["tasks"][other]["owns"]):
             return other
     return None
+
+
+def _stage_wall_seconds(stage: rigor.Stage) -> int:
+    # The three DeepSeek review stages run in parallel with review-cascade.
+    if stage.name in rigor.REVIEW_DEEPSEEK_STAGES:
+        return 0
+    return STAGE_ETA_SECONDS.get(stage.role, 45)
+
+
+def estimate_task_seconds(task: dict[str, Any], config: dict[str, Any] | None = None) -> tuple[int, int]:
+    """Return (total_eta_s, remaining_eta_s) for one task from its rigor pipeline and owned paths."""
+    cfg = {"rigor": "high", "profile": "balanced", **(config or {})}
+    level, _ = rigor.effective(task, cfg)
+    stages = rigor.pipeline(level)
+    owns_bonus = min(120, len(task.get("owns") or ()) * OWNS_FILE_ETA_SECONDS)
+
+    explicit = task.get("eta_s") or task.get("estimated_seconds")
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit > 0:
+        total = int(round(float(explicit)))
+    else:
+        total = sum(_stage_wall_seconds(s) for s in stages) + owns_bonus
+
+    status = task.get("status")
+    if status in (DONE, "skipped"):
+        return total, 0
+
+    recorded = task.get("stages") or {}
+    if not recorded:
+        return total, total
+
+    elapsed_est = 0
+    for stage in stages:
+        wall = _stage_wall_seconds(stage)
+        if stage.role == "implement":
+            wall += owns_bonus
+        st_rec = recorded.get(stage.name)
+        if isinstance(st_rec, dict) and st_rec.get("status") == "passed":
+            elapsed_est += wall
+    remaining = max(5, total - elapsed_est) if status != DONE else 0
+    return total, min(total, remaining)
+
+
+def critical_path(plan: dict[str, Any], durations: dict[str, int] | None = None,
+                  config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Compute the longest-path critical path, earliest/latest times, and per-task slack."""
+    tasks = plan.get("tasks") or {}
+    order = [tid for tid in (plan.get("order") or list(tasks)) if tid in tasks]
+    if not order:
+        return {
+            "path": [],
+            "total_seconds": 0,
+            "earliest_start": {},
+            "earliest_finish": {},
+            "latest_start": {},
+            "latest_finish": {},
+            "slack": {},
+        }
+
+    weights: dict[str, int] = {}
+    for tid in order:
+        if durations is not None and tid in durations:
+            weights[tid] = max(0, int(durations[tid]))
+        else:
+            weights[tid] = estimate_task_seconds(tasks[tid], config)[0]
+
+    topo: list[str] = []
+    seen: set[str] = set()
+    for wave in plan.get("waves") or [order]:
+        for tid in wave:
+            if tid in tasks and tid not in seen:
+                topo.append(tid)
+                seen.add(tid)
+    for tid in order:
+        if tid not in seen:
+            topo.append(tid)
+            seen.add(tid)
+
+    earliest_start: dict[str, int] = {}
+    earliest_finish: dict[str, int] = {}
+    predecessor: dict[str, str | None] = {}
+
+    for tid in topo:
+        deps = [d for d in (tasks[tid].get("deps") or ()) if d in earliest_finish]
+        if not deps:
+            earliest_start[tid] = 0
+            predecessor[tid] = None
+        else:
+            best_dep = max(deps, key=lambda d: (earliest_finish[d], -topo.index(d)))
+            earliest_start[tid] = earliest_finish[best_dep]
+            predecessor[tid] = best_dep
+        earliest_finish[tid] = earliest_start[tid] + weights[tid]
+
+    end_tid = max(topo, key=lambda t: (earliest_finish[t], -topo.index(t)))
+    total_seconds = earliest_finish[end_tid]
+
+    path: list[str] = []
+    cursor: str | None = end_tid
+    while cursor is not None:
+        path.append(cursor)
+        cursor = predecessor.get(cursor)
+    path.reverse()
+
+    dependents: dict[str, list[str]] = {tid: [] for tid in topo}
+    for tid in topo:
+        for dep in tasks[tid].get("deps") or ():
+            if dep in dependents:
+                dependents[dep].append(tid)
+
+    latest_finish: dict[str, int] = {}
+    latest_start: dict[str, int] = {}
+    for tid in reversed(topo):
+        children = dependents[tid]
+        if not children:
+            latest_finish[tid] = total_seconds
+        else:
+            latest_finish[tid] = min(latest_start[c] for c in children)
+        latest_start[tid] = latest_finish[tid] - weights[tid]
+
+    slack = {tid: max(0, latest_start[tid] - earliest_start[tid]) for tid in topo}
+    return {
+        "path": path,
+        "total_seconds": total_seconds,
+        "earliest_start": earliest_start,
+        "earliest_finish": earliest_finish,
+        "latest_start": latest_start,
+        "latest_finish": latest_finish,
+        "slack": slack,
+    }
+
+
+def _wave_wall_seconds(task_ids: list[str], weights: dict[str, int], max_sessions: int) -> int:
+    if not task_ids:
+        return 0
+    vals = sorted((max(0, weights.get(tid, 0)) for tid in task_ids), reverse=True)
+    slots = max(1, int(max_sessions or 1))
+    loads = [0] * min(slots, len(vals))
+    for duration in vals:
+        idx = min(range(len(loads)), key=loads.__getitem__)
+        loads[idx] += duration
+    return max(loads, default=0)
+
+
+def describe_preview(plan: dict[str, Any], config: dict[str, Any] | None = None,
+                     sessions: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the deterministic DAG preview model: waves, parallel groups, critical path, and ETAs."""
+    cfg = {"rigor": "high", "profile": "balanced", "max_sessions": 3, **(config or {})}
+    tasks = plan.get("tasks") or {}
+    order = [tid for tid in (plan.get("order") or list(tasks)) if tid in tasks]
+    raw_waves = plan.get("waves") or ([order] if order else [])
+    max_sessions = int(cfg.get("max_sessions") or 3)
+
+    total_by_task: dict[str, int] = {}
+    rem_by_task: dict[str, int] = {}
+    for tid in order:
+        tot, rem = estimate_task_seconds(tasks[tid], cfg)
+        total_by_task[tid] = tot
+        rem_by_task[tid] = rem
+
+    cp_total = critical_path(plan, total_by_task, cfg)
+    cp_remaining = critical_path(plan, rem_by_task, cfg)
+    cp_set = set(cp_total["path"])
+
+    wave_items: list[dict[str, Any]] = []
+    cumulative_eta = 0
+    cumulative_rem = 0
+    waves_completed = 0
+
+    for number, wave_ids in enumerate(raw_waves, start=1):
+        valid_ids = [tid for tid in wave_ids if tid in tasks]
+        merged_count = sum(1 for tid in valid_ids if tasks[tid].get("status") == DONE)
+        active_count = sum(
+            1 for tid in valid_ids
+            if tasks[tid].get("status") in ("running", "verifying", "queued", "merging")
+        )
+        if valid_ids and merged_count == len(valid_ids):
+            w_status = "merged"
+            waves_completed += 1
+        elif active_count > 0 or (merged_count > 0 and merged_count < len(valid_ids)):
+            w_status = "running"
+        elif any(tasks[tid].get("status") == "ready" for tid in valid_ids):
+            w_status = "ready"
+        else:
+            w_status = "blocked"
+
+        wave_eta_s = _wave_wall_seconds(valid_ids, total_by_task, max_sessions)
+        wave_rem_s = _wave_wall_seconds(valid_ids, rem_by_task, max_sessions)
+        cumulative_eta += wave_eta_s
+        cumulative_rem += wave_rem_s
+
+        wave_tasks: list[dict[str, Any]] = []
+        for tid in valid_ids:
+            t = tasks[tid]
+            parallel_peers = [other for other in valid_ids if other != tid]
+            conflicts = [
+                other for other in parallel_peers
+                if set(t.get("owns") or ()) & set(tasks[other].get("owns") or ())
+            ]
+            true_parallel = [other for other in parallel_peers if other not in conflicts]
+            wave_tasks.append({
+                "id": tid,
+                "title": t.get("title") or tid,
+                "goal": t.get("goal") or "",
+                "status": t.get("status") or "blocked",
+                "stage": t.get("stage"),
+                "stages": t.get("stages") or {},
+                "deps": list(t.get("deps") or ()),
+                "owns": list(t.get("owns") or ()),
+                "wave": number,
+                "attempts": int(t.get("attempts") or 0),
+                "dry_run": bool(t.get("dry_run")),
+                "eta_s": total_by_task[tid],
+                "remaining_eta_s": rem_by_task[tid],
+                "earliest_start_s": cp_total["earliest_start"].get(tid, 0),
+                "earliest_finish_s": cp_total["earliest_finish"].get(tid, 0),
+                "slack_s": cp_total["slack"].get(tid, 0),
+                "critical": tid in cp_set,
+                "parallel": len(true_parallel) > 0,
+                "parallel_with": true_parallel,
+                "owns_conflict_with": conflicts,
+            })
+
+        wave_items.append({
+            "wave": number,
+            "status": w_status,
+            "task_ids": valid_ids,
+            "tasks": wave_tasks,
+            "total_count": len(valid_ids),
+            "merged_count": merged_count,
+            "parallel": len(valid_ids) > 1,
+            "parallel_count": len(valid_ids),
+            "eta_s": wave_eta_s,
+            "remaining_eta_s": wave_rem_s,
+            "cumulative_eta_s": cumulative_eta,
+            "cumulative_remaining_eta_s": cumulative_rem,
+        })
+
+    merged_total = sum(1 for tid in order if tasks[tid].get("status") == DONE)
+    running_total = sum(
+        1 for tid in order
+        if tasks[tid].get("status") in ("running", "verifying", "queued", "merging")
+    )
+    return {
+        "dry_run": bool(cfg.get("dry_run")),
+        "rigor": cfg.get("rigor", "high"),
+        "max_sessions": max_sessions,
+        "total_tasks": len(order),
+        "merged_tasks": merged_total,
+        "running_tasks": running_total,
+        "waves_total": len(wave_items),
+        "waves_completed": waves_completed,
+        "critical_path": cp_total["path"],
+        "critical_path_eta_s": cp_total["total_seconds"],
+        "remaining_eta_s": cp_remaining["total_seconds"],
+        "waves": wave_items,
+    }

@@ -13,6 +13,7 @@ import { mountConfigure } from './configure.js';
 import { mountBoard } from './board.js';
 import { mountTaskDrawer } from './task-drawer.js';
 import { mountMetrics } from './metrics.js';
+import { mountPreview } from './preview.js';
 
 const THEME_KEY = 'jbi-theme';
 
@@ -35,16 +36,27 @@ function main() {
   const splash = document.getElementById('splash');
   const splashText = document.getElementById('splash-text');
   const sections = [...document.querySelectorAll('.phase')];
+  const previewSection = document.getElementById('phase-preview');
   const metricsSection = document.getElementById('phase-metrics');
+  let tasksRef = null;
+  const previewPage = mountPreview(ctx, previewSection, { onOpenTask: (id) => tasksRef?.open(id) });
   const metricsPage = mountMetrics(ctx, metricsSection);
   let mounted = false;
-  let showingMetrics = location.pathname === '/metrics' || location.hash === '#metrics';
+  let activeOverlay = (location.pathname === '/metrics' || location.hash === '#metrics') ? 'metrics'
+    : (location.pathname === '/preview' || location.hash === '#preview') ? 'preview'
+    : null;
 
   function syncSections() {
-    if (showingMetrics) {
+    if (activeOverlay === 'metrics') {
       splash.hidden = true;
       for (const section of sections) section.hidden = section !== metricsSection;
       metricsPage.refresh();
+      return;
+    }
+    if (activeOverlay === 'preview') {
+      splash.hidden = true;
+      for (const section of sections) section.hidden = section !== previewSection;
+      previewPage.refresh();
       return;
     }
     if (!store.state?.run) return;
@@ -57,17 +69,21 @@ function main() {
     document.body.dataset.phase = phase;
   }
 
-  function toggleMetrics() {
-    showingMetrics = !showingMetrics;
+  function toggleOverlay(which) {
+    activeOverlay = activeOverlay === which ? null : which;
     syncSections();
   }
 
   function mountViews() {
     mounted = true;
+    if (!activeOverlay && store.state?.config?.preview) {
+      activeOverlay = 'preview';
+    }
     const accounts = mountAccounts(ctx);
     const header = mountHeader(ctx, {
       onAccounts: accounts.open,
-      onMetrics: toggleMetrics,
+      onPreview: () => toggleOverlay('preview'),
+      onMetrics: () => toggleOverlay('metrics'),
       onTheme: () => {
         const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
         localStorage.setItem(THEME_KEY, next);
@@ -83,6 +99,7 @@ function main() {
     });
 
     const tasks = mountTaskDrawer(ctx);
+    tasksRef = tasks;
     const byId = (id) => document.getElementById(id);
     mountIntake(ctx, byId('phase-intake'));
     mountStack(ctx, byId('phase-stack'));
@@ -95,13 +112,13 @@ function main() {
     });
   }
 
-  if (showingMetrics) {
+  if (activeOverlay) {
     syncSections();
   }
 
   store.subscribe(['$connection'], () => {
     const value = store.local.connection;
-    if (value === 'unauthenticated' && !showingMetrics) {
+    if (value === 'unauthenticated' && !activeOverlay) {
       splash.hidden = false;
       for (const section of sections) section.hidden = true;
       document.getElementById('run-name').textContent = 'Signed out';

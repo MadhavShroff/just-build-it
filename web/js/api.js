@@ -55,6 +55,11 @@ export class Client {
     return this.#request('GET', '/api/v1/metrics');
   }
 
+  /** Read the deterministic DAG preview snapshot (no LLM). */
+  preview() {
+    return this.#request('GET', '/api/v1/preview');
+  }
+
   async #exchangeKey() {
     const match = location.hash.match(/(?:^#|&)k=([^&]+)/);
     if (!match) return;

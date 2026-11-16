@@ -6,17 +6,18 @@ import { icon } from './icons.js';
 const PHASE_LABELS = { intake: 'Plan', stack: 'Stack', bootstrap: 'Bootstrap', configure: 'Configure', execute: 'Build', complete: 'Done' };
 const CONNECTION_LABELS = { live: 'Live', connecting: 'Connecting', offline: 'Offline', unauthenticated: 'Signed out' };
 
-export function mountHeader(ctx, { onAccounts, onMetrics, onTheme, settingsMenu, stopMenu }) {
+export function mountHeader(ctx, { onAccounts, onPreview, onMetrics, onTheme, settingsMenu, stopMenu }) {
   const runName = document.getElementById('run-name');
   const stepper = document.getElementById('stepper');
   const actions = document.getElementById('header-actions');
 
   const conn = h('span', { class: 'conn', 'data-state': 'connecting', role: 'status' },
     h('span', { class: 'conn-dot', 'aria-hidden': 'true' }), h('span', { class: 'conn-label', text: 'Connecting' }));
+  const previewButton = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'aria-label': 'DAG preview', 'data-tip': 'DAG preview', onclick: onPreview }, icon('layers', { size: 14 }), 'Preview');
   const metricsButton = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', 'aria-label': 'Dispatcher metrics', 'data-tip': 'Metrics', onclick: onMetrics }, icon('bolt', { size: 14 }), 'Metrics');
   const themeButton = h('button', { class: 'btn btn-ghost btn-icon', type: 'button', 'aria-label': 'Toggle theme', 'data-tip': 'Theme', onclick: onTheme }, icon('moon'));
   const accountsButton = h('button', { class: 'btn btn-ghost btn-icon', type: 'button', 'aria-label': 'Accounts', 'data-tip': 'Accounts', onclick: onAccounts }, icon('key'));
-  actions.append(conn, metricsButton, settingsMenu.anchor, accountsButton, themeButton, stopMenu.anchor);
+  actions.append(conn, previewButton, metricsButton, settingsMenu.anchor, accountsButton, themeButton, stopMenu.anchor);
 
   ctx.store.subscribe(['run'], (state) => {
     setText(runName, state.run.name || 'Untitled run');

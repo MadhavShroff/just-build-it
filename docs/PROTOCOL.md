@@ -37,6 +37,7 @@ This file is normative. `jbi/protocol.py` implements it. `GET /api/v1/schema` se
 | `POST` | `/api/v1/links` | Bearer token only. Returns `{protocol, links: [{label, url}]}`: one fresh one-time sign-in link per verified listener. |
 | `GET` | `/api/v1/schema` | Command and event catalog. |
 | `GET` | `/api/v1/metrics` | Deterministic metrics snapshot (tokens, task ledger, merged PRs, CI train, board rows, window pool). No LLM call. |
+| `GET` | `/api/v1/preview` | Deterministic DAG preview (waves, parallel task groups, critical path, per-task and per-wave ETAs, live statuses). No LLM call. |
 | `GET` | `/api/v1/health` | Readiness. No authentication. Returns `{protocol, ok, run_id, version}`. `version` is the server's release string. |
 
 ## State read
@@ -134,7 +135,7 @@ POST /api/v1/commands
 | `stack.back` | stack, bootstrap | — From `stack`: back to `intake`. From `bootstrap`: only when `/bootstrap/status` is `failed`; back to `stack`. |
 | `bootstrap.retry` | bootstrap | — Only when `/bootstrap/status` is `failed`. Runs bootstrap again at the same target. |
 | `run.configure` | configure, execute | `rigor`: level, `profile`: profile |
-| `run.start` | configure | — |
+| `run.start` | configure, execute | — |
 | `task.override` | configure, execute | `task`: id, optional `rigor`, optional `profile`, optional `model` |
 | `task.retry` | execute | `task`: id |
 | `task.pause` | execute | `task`: id |

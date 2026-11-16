@@ -895,6 +895,66 @@ class ReviewFindings(unittest.TestCase):
         resumed.engine.submit({"id": "stop-resumed", "type": "run.stop", "payload": {"mode": "quit"}})
         self.assertTrue(resumed.stopped.wait(20))
 
+    def test_15_dry_run_preview_cli_serves_waves_etas_and_updates_live_to_completion(self):
+        import urllib.request
+        from jbi import cli
+        dag_file = self.tmp / "preview_dag.yaml"
+        dag_file.write_text(
+            'project: "preview-demo"\n'
+            'repo: "./preview-demo"\n'
+            'mode: "new"\n'
+            'waves: "auto"\n'
+            'tasks:\n'
+            '  - id: "core"\n'
+            '    title: "Build core"\n'
+            '    goal: "Provide core"\n'
+            '    deps: []\n'
+            '    acceptance: "true"\n'
+            '    owns: ["src/core.py"]\n'
+            '  - id: "docs"\n'
+            '    title: "Write docs"\n'
+            '    goal: "Document core"\n'
+            '    deps: []\n'
+            '    acceptance: "true"\n'
+            '    owns: ["docs/readme.md"]\n'
+            '  - id: "cli"\n'
+            '    title: "Build CLI"\n'
+            '    goal: "Expose core"\n'
+            '    deps: ["core"]\n'
+            '    acceptance: "true"\n'
+            '    owns: ["src/cli.py"]\n'
+        )
+        args = cli.parse_args(["--dag", str(dag_file), "--dry-run", "--preview", "--no-tailscale", "--no-menu"])
+        run = cli.Run(args)
+        self.addCleanup(run.close)
+        self.addCleanup(lambda: (run.runtime.stop("kill"), run.stopped.wait(20)))
+        run.store.commit("cfg", Changes().replace("config", "rigor", "vibe"))
+
+        url = f"http://127.0.0.1:{run.server.port}/api/v1/preview"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            initial = json.loads(resp.read())["preview"]
+        self.assertTrue(initial["dry_run"])
+        self.assertEqual(initial["total_tasks"], 3)
+        self.assertEqual(initial["merged_tasks"], 0)
+        self.assertEqual(initial["waves_total"], 2)
+        self.assertEqual(initial["waves_completed"], 0)
+        self.assertTrue(initial["waves"][0]["parallel"])
+        self.assertEqual(initial["critical_path"], ["core", "cli"])
+        self.assertGreater(initial["remaining_eta_s"], 0)
+
+        run.engine.submit({"id": "start-preview", "type": "run.start", "payload": {}})
+        self.assertTrue(wait_for(lambda: run.store.read("/run/phase") == "complete", 60),
+                        run.store.read("/plan/tasks"))
+
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            final = json.loads(resp.read())["preview"]
+        self.assertEqual(final["merged_tasks"], 3)
+        self.assertEqual(final["waves_completed"], 2)
+        self.assertEqual(final["remaining_eta_s"], 0)
+        self.assertTrue(all(w["status"] == "merged" and w["remaining_eta_s"] == 0 for w in final["waves"]))
+        run.engine.submit({"id": "stop-preview", "type": "run.stop", "payload": {"mode": "quit"}})
+        self.assertTrue(run.stopped.wait(20))
+
 
 if __name__ == "__main__":
     unittest.main()

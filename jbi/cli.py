@@ -62,6 +62,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="rehearse the whole pipeline without touching the repo, the CI service or "
                             "the train: every stage runs against the simulator and the landing path is "
                             "reported, never taken")
+    start.add_argument("--preview", action="store_true",
+                       help="serve the dry-run DAG preview UI showing waves, parallel tasks, "
+                            "critical path and live ETAs")
     start.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
     start.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
 
@@ -190,17 +193,23 @@ class Run:
                                              max_sessions=args.max_sessions, lanes=args.lanes or default_lanes(),
                                              tmux=tmux)
             self.store = Store(self.dir / "run.db", initial)
-            self._seed_accounts(args.offline or getattr(args, "dry_run", False))
-            if getattr(args, "dry_run", False):
-                # A dry run rehearses the whole pipeline and never lands anything.
-                # The simulator answers every model, the CI service is the local
-                # lane, and the merge stage reports what it would do.
+            self._seed_accounts(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False))
+            if getattr(args, "dry_run", False) or getattr(args, "preview", False):
                 from .store import Changes as _Changes
-                self.store.commit("config", _Changes()
-                                  .set("config", "dry_run", True)
-                                  .set("config", "ci_service", "local"), {})
+                cfg_changes = _Changes()
+                if getattr(args, "dry_run", False):
+                    # A dry run rehearses the whole pipeline and never lands anything.
+                    # The simulator answers every model, the CI service is the local
+                    # lane, and the merge stage reports what it would do.
+                    cfg_changes.set("config", "dry_run", True).set("config", "ci_service", "local")
+                if getattr(args, "preview", False):
+                    cfg_changes.set("config", "preview", True)
+                self.store.commit("config", cfg_changes, {})
 
-        completer = make_completer(self.store, offline=bool(getattr(args, "offline", False)))
+        completer = make_completer(
+            self.store,
+            offline=bool(getattr(args, "offline", False) or getattr(args, "dry_run", False)),
+        )
         self.engine = Engine(self.store, completer)
         self.runtime = self._runtime()
         self.engine.runtime = self.runtime
@@ -211,9 +220,19 @@ class Run:
             elif phase == "bootstrap" and self.store.read("/bootstrap/status") == "running":
                 self.runtime.start_bootstrap()
         elif getattr(args, "dag", None):
-            self.engine.submit({"id": "cli-dag", "type": "plan.load",
-                                "payload": {"path": str(args.dag.expanduser().resolve()),
-                                            "start": bool(getattr(args, "start", False))}})
+            load_payload: dict = {
+                "path": str(args.dag.expanduser().resolve()),
+                "start": bool(getattr(args, "start", False)),
+            }
+            if (getattr(args, "dry_run", False) or getattr(args, "preview", False)) and not getattr(args, "repo", None):
+                from . import worktrees as wt
+                rehearsal_repo = self.dir / "preview-repo"
+                wt.init_repo(rehearsal_repo)
+                if wt.head(rehearsal_repo) is None:
+                    (rehearsal_repo / "README.md").write_text("# Dry-run preview repository\n")
+                    wt.commit_all(rehearsal_repo, "Initial preview commit")
+                load_payload["target"] = str(rehearsal_repo)
+            self.engine.submit({"id": "cli-dag", "type": "plan.load", "payload": load_payload})
 
         tailnet = None if args.no_tailscale else netinfo.detect_tailscale()
         self.auth = Auth()

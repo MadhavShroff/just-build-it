@@ -129,6 +129,42 @@ class WavesTest(unittest.TestCase):
         chain = [task("t0")] + [task(f"t{i}", f"t{i - 1}") for i in range(1, 1500)]
         self.assertEqual(len(waves.compile_plan(chain, 1)["waves"]), 1500)
 
+    def test_critical_path_and_describe_preview_etas_and_live_updates(self):
+        t_core = {**task("core", owns=("src/core.py",)), "eta_s": 100}
+        t_docs = {**task("docs", owns=("docs/readme.md",)), "eta_s": 40}
+        t_api = {**task("api", "core", owns=("src/api.py", "src/routes.py")), "eta_s": 200}
+        t_ui = {**task("ui", "core", owns=("web/ui.js",)), "eta_s": 80}
+        t_e2e = {**task("e2e", "api", "ui", owns=("tests/e2e.py",)), "eta_s": 120}
+        plan = waves.compile_plan([t_core, t_docs, t_api, t_ui, t_e2e], 1)
+        for raw in (t_core, t_docs, t_api, t_ui, t_e2e):
+            plan["tasks"][raw["id"]]["eta_s"] = raw["eta_s"]
+
+        preview = waves.describe_preview(plan, {"rigor": "high", "max_sessions": 3, "dry_run": True})
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["total_tasks"], 5)
+        self.assertEqual(preview["waves_total"], 3)
+        self.assertEqual(preview["waves_completed"], 0)
+        self.assertEqual(preview["critical_path"], ["core", "api", "e2e"])
+        self.assertEqual(preview["critical_path_eta_s"], 420)
+        self.assertEqual(preview["remaining_eta_s"], 420)
+        self.assertTrue(preview["waves"][0]["parallel"])
+        self.assertEqual(preview["waves"][0]["eta_s"], 100)
+        self.assertEqual(preview["waves"][1]["eta_s"], 200)
+        self.assertEqual(preview["waves"][0]["tasks"][0]["parallel_with"], ["docs"])
+
+        plan["tasks"]["core"]["status"] = "merged"
+        plan["tasks"]["docs"]["status"] = "merged"
+        plan["tasks"]["api"]["status"] = "running"
+        plan["tasks"]["ui"]["status"] = "ready"
+        updated = waves.describe_preview(plan, {"rigor": "high", "max_sessions": 3, "dry_run": True})
+        self.assertEqual(updated["waves_completed"], 1)
+        self.assertEqual(updated["merged_tasks"], 2)
+        self.assertEqual(updated["running_tasks"], 1)
+        self.assertEqual(updated["waves"][0]["status"], "merged")
+        self.assertEqual(updated["waves"][0]["remaining_eta_s"], 0)
+        self.assertEqual(updated["waves"][1]["status"], "running")
+        self.assertEqual(updated["remaining_eta_s"], 320)
+
 
 class DagLoaderTest(unittest.TestCase):
     YAML_SAMPLE = (
@@ -225,6 +261,9 @@ class DagLoaderTest(unittest.TestCase):
             store.close()
             args = cli.parse_args(["--dag", str(dag_path), "--start"])
             self.assertEqual((args.dag, args.start), (dag_path, True))
+            preview_args = cli.parse_args(["--dag", str(dag_path), "--dry-run", "--preview"])
+            self.assertEqual((preview_args.dag, preview_args.dry_run, preview_args.preview),
+                             (dag_path, True, True))
 
 
 class RigorTest(unittest.TestCase):
@@ -824,6 +863,24 @@ class ServerTest(unittest.TestCase):
         self.assertIsNone(m["board"]["done_rows"])
         self.assertIsNone(m["window_pool"]["busy_count"])
         self.assertIsNone(m["window_pool"]["free_count"])
+
+    def test_preview_endpoint_returns_waves_critical_path_and_etas(self):
+        plan = waves.compile_plan([task("core"), task("api", "core"), task("ui", "core"), task("e2e", "api", "ui")], 1)
+        self.store.commit("plan.updated", Changes()
+                          .replace("plan", plan)
+                          .set("config", "dry_run", True)
+                          .set("config", "preview", True))
+        status, body = self.call("GET", "/api/v1/preview")
+        self.assertEqual(status, 200)
+        p = body["preview"]
+        self.assertTrue(p["dry_run"])
+        self.assertEqual(p["total_tasks"], 4)
+        self.assertEqual(p["waves_total"], 3)
+        self.assertEqual([w["task_ids"] for w in p["waves"]], [["core"], ["api", "ui"], ["e2e"]])
+        self.assertTrue(p["waves"][1]["parallel"])
+        self.assertEqual(len(p["critical_path"]), 3)
+        self.assertGreater(p["critical_path_eta_s"], 0)
+        self.assertEqual(p["remaining_eta_s"], p["critical_path_eta_s"])
 
 
 class InstallAndResumeTest(unittest.TestCase):

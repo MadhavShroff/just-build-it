@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
-from . import PROTOCOL_VERSION, __version__, metrics as metrics_mod, models, protocol, rigor
+from . import PROTOCOL_VERSION, __version__, metrics as metrics_mod, models, protocol, rigor, waves
 from .engine import Engine
 from .protocol import ProtocolError
 from .store import Store, iter_sse
@@ -256,6 +256,20 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             snapshot = metrics_mod.collect_metrics(app.metrics_sources, run_dir=run_dir)
             self._json(200, {"protocol": PROTOCOL_VERSION, "metrics": snapshot})
 
+        def preview(self, query: dict) -> None:
+            seq, doc = app.store.snapshot()
+            summary = waves.describe_preview(
+                doc.get("plan") or {},
+                doc.get("config") or {},
+                doc.get("sessions") or {},
+            )
+            self._json(200, {
+                "protocol": PROTOCOL_VERSION,
+                "seq": seq,
+                "run": doc.get("run") or {},
+                "preview": summary,
+            })
+
     API: dict[tuple[str, str], Callable] = {
         ("GET", "/api/v1/health"): Handler.health,
         ("POST", "/api/v1/session"): Handler.session,
@@ -266,8 +280,14 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         ("POST", "/api/v1/commands"): Handler.commands,
         ("POST", "/api/v1/links"): Handler.links,
         ("GET", "/api/v1/metrics"): Handler.metrics,
+        ("GET", "/api/v1/preview"): Handler.preview,
     }
-    PUBLIC = {("GET", "/api/v1/health"), ("POST", "/api/v1/session"), ("GET", "/api/v1/metrics")}
+    PUBLIC = {
+        ("GET", "/api/v1/health"),
+        ("POST", "/api/v1/session"),
+        ("GET", "/api/v1/metrics"),
+        ("GET", "/api/v1/preview"),
+    }
     return Handler
 
 

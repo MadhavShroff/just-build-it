@@ -167,6 +167,41 @@ class TestWebContract(unittest.TestCase):
         self.assertNotIn("send(", metrics_js, "metrics.js must not invoke any LLM or write command")
 
     @unittest.skipIf(shutil.which("node") is None, "node is not installed")
+    def test_preview_ui_matches_waves_describe_preview(self) -> None:
+        from jbi import waves
+        index_html = (WEB / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="phase-preview"', index_html)
+        preview_js = (JS / "preview.js").read_text(encoding="utf-8")
+        self.assertIn("Critical path", preview_js)
+        self.assertIn("Columns", preview_js)
+        self.assertIn("Rows", preview_js)
+
+        plan = waves.compile_plan([
+            {"id": "core", "title": "Core", "goal": "G", "deps": [], "acceptance": "true", "owns": ["src/core.py"]},
+            {"id": "api", "title": "API", "goal": "G", "deps": ["core"], "acceptance": "true", "owns": ["src/api.py", "src/routes.py"]},
+            {"id": "ui", "title": "UI", "goal": "G", "deps": ["core"], "acceptance": "true", "owns": ["web/ui.js"]},
+            {"id": "e2e", "title": "E2E", "goal": "G", "deps": ["api", "ui"], "acceptance": "true", "owns": ["tests/e2e.py"]},
+        ], 1)
+        config = {"rigor": "high", "profile": "balanced", "max_sessions": 3, "dry_run": True}
+        expected = waves.describe_preview(plan, config)
+        script = (
+            "globalThis.document = { addEventListener() {} };"
+            "import { pathToFileURL } from 'node:url';"
+            "const m = await import(pathToFileURL(process.argv[1]).href);"
+            "console.log(JSON.stringify(m.computePreviewFromState(JSON.parse(process.argv[2]))));"
+        )
+        done = subprocess.run(
+            ["node", "--input-type=module", "-e", script, str(JS / "preview.js"), json.dumps({"plan": plan, "config": config})],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        got = json.loads(done.stdout)
+        self.assertEqual(got["critical_path"], expected["critical_path"])
+        self.assertEqual(got["critical_path_eta_s"], expected["critical_path_eta_s"])
+        self.assertEqual(got["remaining_eta_s"], expected["remaining_eta_s"])
+        self.assertEqual([w["eta_s"] for w in got["waves"]], [w["eta_s"] for w in expected["waves"]])
+
+    @unittest.skipIf(shutil.which("node") is None, "node is not installed")
     def test_patch_js_matches_jsonpatch(self) -> None:
         from jbi import jsonpatch
         vectors = [

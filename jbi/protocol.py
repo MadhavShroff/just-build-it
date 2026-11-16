@@ -103,7 +103,7 @@ COMMANDS: dict[str, Command] = {c.type: c for c in (
     Command("bootstrap.retry", ("bootstrap",), "Run bootstrap again after it failed."),
     Command("run.configure", ("configure", "execute"), "Set the rigor level and model profile.",
             {"rigor": _enum(RIGOR_LEVELS), "profile": _enum(PROFILES)}),
-    Command("run.start", ("configure",), "Start the build."),
+    Command("run.start", ("configure", "execute"), "Start the build."),
     Command("task.override", ("configure", "execute"), "Override rigor, profile or model for one task.",
             {"task": _TASK, "rigor": _enum(RIGOR_LEVELS, False), "profile": _enum(PROFILES, False),
              "model": Field("string", required=False, max_length=120)}),
