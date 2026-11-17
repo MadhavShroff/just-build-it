@@ -54,6 +54,8 @@ PRE_MERGE_AUDIT_STAGES: tuple[Stage, ...] = (
 
 PIPELINES: dict[str, tuple[Stage, ...]] = {
     "vibe": _stages(("implement", "implement", "Implement"), ("merge", "merge", "Merge")),
+    "fast": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
+                    ("review-1", "review", "Review (diff)"), ("merge", "merge", "Train merge")),
     "medium": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
                       *((s.name, s.role, s.label) for s in review_stages()),
                       ("merge", "merge", "Train merge")),
@@ -74,6 +76,8 @@ PIPELINES: dict[str, tuple[Stage, ...]] = {
 LEVELS: dict[str, dict] = {
     "vibe": {"label": "Vibe coder", "summary": "Builds the features. No tests, reviews or scans.",
              "lane_checks": ()},
+    "fast": {"label": "Fast", "summary": "Acceptance command, one read-only diff review, train merge.",
+             "lane_checks": ("build", "test")},
     "medium": {"label": "Medium", "summary": "Acceptance command, one review, train merge.",
                "lane_checks": ("build", "test")},
     "high": {"label": "High", "summary": "Adds an independent verifier and a security scan.",

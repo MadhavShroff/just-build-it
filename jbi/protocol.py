@@ -13,7 +13,7 @@ from typing import Any
 from . import PROTOCOL_VERSION
 
 PHASES = ("intake", "stack", "bootstrap", "configure", "execute", "complete")
-RIGOR_LEVELS = ("vibe", "medium", "high", "xhigh")
+RIGOR_LEVELS = ("vibe", "fast", "medium", "high", "xhigh")
 PROFILES = ("max", "balanced", "economy", "micro")
 DETAIL_LEVELS = ("user", "guided", "delegate")
 STOP_MODES = ("quit", "standdown", "finish", "kill")

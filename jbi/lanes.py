@@ -216,16 +216,21 @@ class Lanes:
         if not checks:
             return CheckResult(True, ["no lane checks for this rigor level"])
         self.check_runs += 1
+        commands_path = tree_dir / ".jbi" / "commands.json"
+        if not commands_path.exists():
+            return CheckResult(True, [f"{name}: skipped, no command in .jbi/commands.json" for name in checks])
         try:
-            commands = json.loads((tree_dir / ".jbi" / "commands.json").read_text())
-        except (OSError, ValueError):
-            commands = {}
+            commands = json.loads(commands_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            return CheckResult(False, [f".jbi/commands.json is invalid: {error}"])
+        if not isinstance(commands, dict):
+            return CheckResult(False, [".jbi/commands.json must contain a JSON object"])
         notes: list[str] = []
         for name in checks:
-            line = commands.get(name)
+            raw_line = commands.get(name)
+            line = raw_line.strip() if isinstance(raw_line, str) else ""
             if not line:
-                notes.append(f"{name}: skipped, no command in .jbi/commands.json")
-                continue
+                return CheckResult(False, [*notes, f"{name} failed (missing command in .jbi/commands.json)"])
             result = run_command(line, cwd=tree_dir, env=child_env(None), timeout=CHECK_TIMEOUT,
                                  parent_pid=self.parent_pid, groups=self.groups)
             code, out = result.returncode, result.output

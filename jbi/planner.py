@@ -185,7 +185,7 @@ def _task(raw: object, components: set[str]) -> object:
 def fallback_plan(prd: dict) -> list[dict]:
     """One shared core task plus one task for each feature. Always valid."""
     component = prd["components"][0]["id"]
-    tasks = [{"id": "core", "title": "Build the shared core", "deps": [], "owns": [], "components": [component],
+    tasks = [{"id": "core", "title": "Build the shared core", "deps": [], "owns": ["**"], "components": [component],
               "goal": f"Build the shared foundation for {prd['name']}: data model, configuration and the "
                       "entry point that every feature uses. Add one smoke test.",
               "acceptance": FALLBACK_ACCEPTANCE}]
@@ -196,7 +196,7 @@ def fallback_plan(prd: dict) -> list[dict]:
             number += 1
             tid = f"{slug(feature, 'feature')[:36]}-{number}"
         taken.add(tid)
-        tasks.append({"id": tid, "title": feature[:80], "deps": ["core"], "owns": [], "components": [component],
+        tasks.append({"id": tid, "title": feature[:80], "deps": ["core"], "owns": ["**"], "components": [component],
                       "goal": f"Implement this feature of {prd['name']}: {feature}. Add tests for it.",
                       "acceptance": FALLBACK_ACCEPTANCE})
     return tasks

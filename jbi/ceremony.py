@@ -37,6 +37,8 @@ TOKENS_RE = re.compile(r"\btokens\s*[:=]\s*(\d+)\b", re.IGNORECASE)
 INPUT_TOKENS_RE = re.compile(r"\binput_tokens\s*[:=]\s*(\d+)\b", re.IGNORECASE)
 OUTPUT_TOKENS_RE = re.compile(r"\boutput_tokens\s*[:=]\s*(\d+)\b", re.IGNORECASE)
 
+MAX_ATTEMPTS = 8
+
 
 class CeremonyError(RuntimeError):
     """A deterministic ceremony step failed or no free window was available."""
@@ -388,7 +390,7 @@ def poll_sb_receipt(window: str, task_id: str, attempt: int, receipt_file: Path,
 def poll_ci_notice(tid: str, pr_number: int, head_sha: str, attempt: int, *,
                    run_dir: Path, repo: Path, runner: ci_mod.Runner = ci_mod.default_runner,
                    illm_state_dir: Path | None = None, timeout: float = 3600.0,
-                   poll_interval: float = 0.2,
+                   poll_interval: float = 1.0, status_interval: float = 15.0,
                    seen_notices: set[str] | None = None) -> dict[str, Any]:
     """Wait for a CI verdict or structured failure notice for `(pr_number, head_sha)`."""
     state_root = illm_state_dir or Path(
@@ -396,6 +398,7 @@ def poll_ci_notice(tid: str, pr_number: int, head_sha: str, attempt: int, *,
     )
     seen = seen_notices if seen_notices is not None else set()
     deadline = time.monotonic() + timeout
+    last_status_at: float | None = None
     while True:
         # 1. Check run_dir notice file or JSONL queue if present.
         attempt_file = run_dir / "notices" / f"{tid}-{attempt}.json"
@@ -425,17 +428,20 @@ def poll_ci_notice(tid: str, pr_number: int, head_sha: str, attempt: int, *,
                     seen.add(key)
                     return matched
 
-        # 3. Query `illm --json ci status <pr_number>` via runner.
-        res = runner(["illm", "--json", "ci", "status", str(pr_number)], repo)
-        if res.returncode == 0 and (res.stdout or "").strip():
-            try:
-                payload = json.loads(res.stdout.strip())
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict):
-                matched = _match_status_payload(payload, pr_number, head_sha)
-                if matched is not None:
-                    return matched
+        # 3. Query `illm --json ci status <pr_number>` at most once per status_interval.
+        now_mono = time.monotonic()
+        if last_status_at is None or (now_mono - last_status_at) >= status_interval:
+            last_status_at = now_mono
+            res = runner(["illm", "--json", "ci", "status", str(pr_number)], repo)
+            if res.returncode == 0 and (res.stdout or "").strip():
+                try:
+                    payload = json.loads(res.stdout.strip())
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    matched = _match_status_payload(payload, pr_number, head_sha)
+                    if matched is not None:
+                        return matched
 
         if time.monotonic() >= deadline:
             raise CeremonyError(
@@ -528,8 +534,14 @@ def run_ceremony(
     wait_ci_notice: Callable[[str, int, str, int], dict[str, Any]] | None = None,
     base: str = wt.MAIN,
     next_tasks: Iterable[dict[str, Any]] = (),
+    max_attempts: int = MAX_ATTEMPTS,
+    reset_window_every: int | None = None,
 ) -> CeremonyOutcome:
     """Run the fixed 9-step ceremony deterministically for one task or a sequence of tasks."""
+    if max_attempts < 1:
+        raise CeremonyError(f"max_attempts must be at least 1, got {max_attempts}.")
+    if reset_window_every is not None and reset_window_every < 1:
+        raise CeremonyError(f"reset_window_every must be at least 1, got {reset_window_every}.")
     tasks = _normalize_tasks(task_or_tasks, next_tasks)
     run_dir = Path(run_dir)
     repo = Path(repo)
@@ -569,6 +581,44 @@ def run_ceremony(
         total_tokens = 0
         saw_tokens = False
 
+        def _abort(failed_attempts: int, findings: list[str], *, reason: str = "") -> None:
+            pool.mark_free(window)
+            if store is not None and store.read(f"/plan/tasks/{tid}") is not None:
+                store.commit("task.status", Changes()
+                             .set("plan", "tasks", tid, "attempts", failed_attempts)
+                             .set("plan", "tasks", tid, "findings", findings)
+                             .set("plan", "tasks", tid, "status", "failed")
+                             .set("plan", "tasks", tid, "window", None), {"task": tid})
+            noun = "attempt" if failed_attempts == 1 else "attempts"
+            parts = [p for p in (reason, "; ".join(findings)) if p]
+            suffix = f": {'; '.join(parts)}" if parts else "."
+            raise CeremonyError(f"Task {tid} failed after {failed_attempts} {noun}{suffix}")
+
+        def _rebrief_or_abort(
+            next_attempt: int, findings: list[str], *, ci_failed: bool = False
+        ) -> tuple[Path, Path]:
+            if next_attempt >= max_attempts:
+                _abort(next_attempt, findings)
+            next_brief, next_receipt = briefs.write(
+                run_dir, task=task, role="implement", stage="implement",
+                attempt=next_attempt, findings=findings,
+            )
+            pool_fields: dict[str, Any] = {"attempts": next_attempt, "brief": str(next_brief)}
+            if ci_failed:
+                pool_fields["ci_status"] = "failed"
+            pool.update(window, **pool_fields)
+            if ci_failed and store is not None and store.read(f"/plan/tasks/{tid}") is not None:
+                store.commit("task.status", Changes()
+                             .set("plan", "tasks", tid, "attempts", next_attempt)
+                             .set("plan", "tasks", tid, "findings", findings)
+                             .set("plan", "tasks", tid, "status", "running"), {"task": tid})
+            if reset_window_every is not None and next_attempt > 0 and next_attempt % reset_window_every == 0:
+                cmd = ["ticket", "start", window, "--file", str(next_brief)]
+            else:
+                cmd = ["sb", "send", window, "--file", str(next_brief)]
+            _exec_cmd(runner, cmd, repo)
+            return next_brief, next_receipt
+
         # 2. Start a coding session there with `ticket start` semantics.
         # 3. Hand the session the task brief.
         brief_file, receipt_file = briefs.write(
@@ -600,23 +650,13 @@ def run_ceremony(
                     wt.discard_changes(worktree)
                     attempt += 1
                     findings = [f"modified unowned path {', '.join(unowned)}"]
-                    brief_file, receipt_file = briefs.write(
-                        run_dir, task=task, role="implement", stage="implement",
-                        attempt=attempt, findings=findings,
-                    )
-                    pool.update(window, attempts=attempt, brief=str(brief_file))
-                    _exec_cmd(runner, ["sb", "send", window, "--file", str(brief_file)], repo)
+                    brief_file, receipt_file = _rebrief_or_abort(attempt, findings)
                     continue
 
             if not receipt.passed:
                 attempt += 1
                 findings = list(receipt.findings) or [f"{tid} reported FAIL on attempt {attempt}"]
-                brief_file, receipt_file = briefs.write(
-                    run_dir, task=task, role="implement", stage="implement",
-                    attempt=attempt, findings=findings,
-                )
-                pool.update(window, attempts=attempt, brief=str(brief_file))
-                _exec_cmd(runner, ["sb", "send", window, "--file", str(brief_file)], repo)
+                brief_file, receipt_file = _rebrief_or_abort(attempt, findings)
                 continue
 
             head_sha = ""
@@ -644,24 +684,17 @@ def run_ceremony(
                              .set("plan", "tasks", tid, "commit", head_sha)
                              .set("plan", "tasks", tid, "status", "merging"), {"task": tid})
 
-            # 8. Wait for the CI verdict; on failure re-brief the SAME window on `sb`.
+            # 8. Wait for the CI verdict; on failure re-brief, reset, or stop.
             raw_notice = ci_waiter(tid, pr_number, head_sha, attempt)
-            notice = {**(raw_notice.get("data") or {}), **{k: v for k, v in raw_notice.items() if k != "data"}}
+            raw_data = raw_notice.get("data") if isinstance(raw_notice.get("data"), dict) else {}
+            notice = {**raw_data, **{k: v for k, v in raw_notice.items() if k != "data" and v is not None}}
             verdict = str(notice.get("verdict") or "red")
             if verdict not in ("green", "merged"):
                 findings = ci_mod.format_failure_findings(notice)
                 attempt += 1
-                brief_file, receipt_file = briefs.write(
-                    run_dir, task=task, role="implement", stage="implement",
-                    attempt=attempt, findings=findings,
-                )
-                pool.update(window, attempts=attempt, ci_status="failed", brief=str(brief_file))
-                if store is not None and store.read(f"/plan/tasks/{tid}") is not None:
-                    store.commit("task.status", Changes()
-                                 .set("plan", "tasks", tid, "attempts", attempt)
-                                 .set("plan", "tasks", tid, "findings", findings)
-                                 .set("plan", "tasks", tid, "status", "running"), {"task": tid})
-                _exec_cmd(runner, ["sb", "send", window, "--file", str(brief_file)], repo)
+                if notice.get("retry_allowed") is False:
+                    _abort(attempt, findings, reason="CI marked notice non-retryable")
+                brief_file, receipt_file = _rebrief_or_abort(attempt, findings, ci_failed=True)
                 continue
 
             # 9. On green: mark the window free, record the task done, take the next task.
@@ -699,6 +732,10 @@ def main(argv: list[str] | None = None, *, runner: ci_mod.Runner = ci_mod.defaul
     parser.add_argument("--run-dir", type=Path, required=True, help="directory for briefs, receipts, pool and ledger")
     parser.add_argument("--windows", required=True, help="comma-separated tmux window names for the pool")
     parser.add_argument("--base", default=wt.MAIN, help="base branch for draft PRs")
+    parser.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS,
+                        help="maximum attempts per task before aborting")
+    parser.add_argument("--reset-window-every", type=int, default=None,
+                        help="reset window via ticket start every N failed attempts")
     args = parser.parse_args(argv)
 
     run_dir = args.run_dir.expanduser().resolve()
@@ -716,6 +753,8 @@ def main(argv: list[str] | None = None, *, runner: ci_mod.Runner = ci_mod.defaul
         run_dir=run_dir,
         base=args.base,
         runner=runner,
+        max_attempts=args.max_attempts,
+        reset_window_every=args.reset_window_every,
         wait_receipt=lambda w, t, a, p: poll_sb_receipt(w, t, a, p, board_db=board_db),
         wait_ci_notice=lambda t, pr, sha, a: poll_ci_notice(
             t, pr, sha, a, run_dir=run_dir, repo=repo, runner=runner,

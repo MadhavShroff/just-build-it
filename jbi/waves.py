@@ -8,6 +8,7 @@ as its own dependencies are merged (`ready_tasks`).
 
 from __future__ import annotations
 
+import fnmatch
 from typing import Any, Iterable
 
 from . import rigor
@@ -169,11 +170,104 @@ def ready_tasks(plan: dict) -> list[str]:
             and all(tasks[d]["status"] == DONE for d in tasks[tid]["deps"])]
 
 
+def _norm_own(path: str) -> str:
+    p = path.strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/") or p
+
+
+def _is_universal_own(path: str) -> bool:
+    return _norm_own(path) in ("*", "**", "**/*")
+
+
+def _has_glob(segment: str) -> bool:
+    return any(ch in segment for ch in ("*", "?", "["))
+
+
+def _segments_overlap(a: str, b: str) -> bool:
+    if a == b or a == "*" or b == "*":
+        return True
+    if not _has_glob(a) and not _has_glob(b):
+        return False
+    if not _has_glob(a):
+        return fnmatch.fnmatchcase(a, b)
+    if not _has_glob(b):
+        return fnmatch.fnmatchcase(b, a)
+    if "[" not in a and "[" not in b and "?" not in a and "?" not in b:
+        pa, sa = a.split("*", 1)[0], a.rsplit("*", 1)[-1]
+        pb, sb = b.split("*", 1)[0], b.rsplit("*", 1)[-1]
+        return (pa.startswith(pb) or pb.startswith(pa)) and (sa.endswith(sb) or sb.endswith(sa))
+    return True
+
+
+def _can_be_directory(segments: list[str], raw: str) -> bool:
+    if raw.endswith("/"):
+        return True
+    last = segments[-1]
+    if last in ("*", "**"):
+        return True
+    if _has_glob(last):
+        suffix = last.rsplit("*", 1)[-1]
+        return "." not in suffix
+    return "." not in last
+
+
+def _paths_overlap(raw_a: str, raw_b: str) -> bool:
+    a = _norm_own(raw_a)
+    b = _norm_own(raw_b)
+    if not a or not b:
+        return False
+    if a == b or _is_universal_own(a) or _is_universal_own(b):
+        return True
+    if not _has_glob(a) and not _has_glob(b):
+        return a.startswith(b + "/") or b.startswith(a + "/")
+
+    segs_a = [s for s in a.split("/") if s]
+    segs_b = [s for s in b.split("/") if s]
+    dir_a = _can_be_directory(segs_a, raw_a.strip())
+    dir_b = _can_be_directory(segs_b, raw_b.strip())
+    memo: dict[tuple[int, int], bool] = {}
+
+    def match(i: int, j: int) -> bool:
+        state = (i, j)
+        if state in memo:
+            return memo[state]
+        if i == len(segs_a) or j == len(segs_b):
+            res = True
+        elif segs_a[i] == "**" and segs_b[j] == "**":
+            res = match(i + 1, j) or match(i, j + 1) or match(i + 1, j + 1)
+        elif segs_a[i] == "**":
+            can_consume_b = (i + 1 == len(segs_a)) or (j + 1 < len(segs_b)) or dir_b
+            res = match(i + 1, j) or (can_consume_b and match(i, j + 1))
+        elif segs_b[j] == "**":
+            can_consume_a = (j + 1 == len(segs_b)) or (i + 1 < len(segs_a)) or dir_a
+            res = match(i, j + 1) or (can_consume_a and match(i + 1, j))
+        elif _segments_overlap(segs_a[i], segs_b[j]):
+            res = match(i + 1, j + 1)
+        else:
+            res = False
+        memo[state] = res
+        return res
+
+    return match(0, 0)
+
+
+def _owns_overlap(mine_raw: Iterable[str], theirs_raw: Iterable[str]) -> bool:
+    mine = [p for p in mine_raw if isinstance(p, str) and p.strip()]
+    theirs = [p for p in theirs_raw if isinstance(p, str) and p.strip()]
+    if any(_is_universal_own(p) for p in mine) or any(_is_universal_own(p) for p in theirs):
+        return True
+    if not mine or not theirs:
+        return False
+    return any(_paths_overlap(a, b) for a in mine for b in theirs)
+
+
 def owns_conflict(plan: dict, tid: str, running: Iterable[str]) -> str | None:
-    """Return a running task that owns a path that `tid` also owns, or None."""
-    mine = set(plan["tasks"][tid]["owns"])
+    """Return a running task that owns a path overlapping `tid`, or None."""
+    mine = plan["tasks"][tid].get("owns") or []
     for other in running:
-        if other != tid and mine & set(plan["tasks"][other]["owns"]):
+        if other != tid and _owns_overlap(mine, plan["tasks"][other].get("owns") or []):
             return other
     return None
 
@@ -374,7 +468,7 @@ def describe_preview(plan: dict[str, Any], config: dict[str, Any] | None = None,
             parallel_peers = [other for other in valid_ids if other != tid]
             conflicts = [
                 other for other in parallel_peers
-                if set(t.get("owns") or ()) & set(tasks[other].get("owns") or ())
+                if _owns_overlap(t.get("owns") or (), tasks[other].get("owns") or ())
             ]
             true_parallel = [other for other in parallel_peers if other not in conflicts]
             wave_tasks.append({

@@ -63,12 +63,24 @@ def parse(text: str) -> dict[str, Any]:
 
 def validate(doc: dict[str, Any]) -> dict[str, Any]:
     """Validate a parsed DAG document and verify it is acyclic via `wave_compiler`."""
+    raw_tasks = doc.get("tasks") if isinstance(doc, dict) else None
+    if isinstance(raw_tasks, list):
+        for raw_task in raw_tasks:
+            if isinstance(raw_task, dict) and "acceptance" in raw_task:
+                acc = raw_task["acceptance"]
+                if not isinstance(acc, str) or not acc.strip():
+                    tid = raw_task.get("id") or "?"
+                    raise Invalid(f"task '{tid}' field 'acceptance' must be a non-empty string")
     try:
         validated = wave_compiler.validate(doc)
         wave_compiler.kahn(validated["tasks"])
     except wave_compiler.Invalid as exc:
         raise _wrap_invalid(exc) from exc
     for task in validated["tasks"]:
+        acc = task.get("acceptance")
+        if not isinstance(acc, str) or not acc.strip():
+            tid = task.get("id") or "?"
+            raise Invalid(f"task '{tid}' field 'acceptance' must be a non-empty string")
         task.setdefault("components", [])
     return validated
 
@@ -100,7 +112,12 @@ def _normalize_json_node(node: Any) -> dict[str, Any]:
             out["goal"] = f"Implement {title} ({plan_path})."
         elif title:
             out["goal"] = title
-    if "acceptance" not in out or not isinstance(out.get("acceptance"), str) or not out["acceptance"].strip():
+    if "acceptance" in out:
+        raw_acc = out["acceptance"]
+        if not isinstance(raw_acc, str) or not raw_acc.strip():
+            tid = out.get("id") or "?"
+            raise Invalid(f"task '{tid}' field 'acceptance' must be a non-empty string")
+    else:
         out["acceptance"] = "true"
     out.setdefault("deps", [])
     out.setdefault("owns", [])
@@ -222,6 +239,14 @@ def expand_node_subtasks(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, An
                 if dep not in combined_deps:
                     combined_deps.append(dep)
 
+            if "acceptance" in sub:
+                sub_acc = sub["acceptance"]
+                if not isinstance(sub_acc, str) or not sub_acc.strip():
+                    raise Invalid(f"subtask '{full_id}' field 'acceptance' must be a non-empty string")
+                child_acceptance = sub_acc
+            else:
+                child_acceptance = norm_parent.get("acceptance") or "true"
+
             child_raw = {
                 **{k: v for k, v in norm_parent.items() if k not in ("subtasks", "batches", "wave")},
                 **sub,
@@ -230,7 +255,7 @@ def expand_node_subtasks(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, An
                 "batch": batch_code,
                 "deps": combined_deps,
                 "owns": list(sub.get("owns") if "owns" in sub else (norm_parent.get("owns") or ())),
-                "acceptance": sub.get("acceptance") or norm_parent.get("acceptance") or "true",
+                "acceptance": child_acceptance,
             }
             if "goal" not in sub or not str(sub.get("goal") or "").strip():
                 child_raw["goal"] = str(sub.get("title") or norm_parent.get("goal") or full_id)
