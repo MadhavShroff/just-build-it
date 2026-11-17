@@ -150,6 +150,10 @@ class FinishTests(unittest.TestCase):
         tasks = planner.fallback_plan(prd)
         waves.validate(tasks)
         self.assertEqual(len({t["id"] for t in tasks}), 4)
+        self.assertTrue(all(t["owns"] == ["**"] for t in tasks[1:]))
+        plan = waves.compile_plan(tasks, 1)
+        f1, f2 = tasks[1]["id"], tasks[2]["id"]
+        self.assertEqual(waves.owns_conflict(plan, f2, [f1]), f1)
 
     def test_dangling_component_links_are_dropped(self):
         plan = good_plan()
@@ -557,6 +561,14 @@ class SkillTests(unittest.TestCase):
     def test_no_unlisted_skill(self):
         found = sorted(p.parent.name for p in (ROOT / "skills").glob("*/SKILL.md"))
         self.assertEqual(found, sorted(self.NAMES))
+
+    def test_review_diff_skill_is_read_only_and_returns_changes_only_on_block(self):
+        text = (ROOT / "skills" / "review-diff" / "SKILL.md").read_text()
+        self.assertIn("read-only", text)
+        self.assertIn("git diff", text)
+        self.assertIn("Do not execute test suites", text)
+        self.assertIn("Return `CHANGES` only when at least one `BLOCK` defect exists.", text)
+        self.assertIn("Return `APPROVE` with notes when only `FIX` or `NOTE` findings exist.", text)
 
 
 if __name__ == "__main__":

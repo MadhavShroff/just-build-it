@@ -316,5 +316,59 @@ class TestExplicitGroups(Harness):
         self.assertEqual(out, "WAVE 1\ncore MERGED\ndocs READY\nWAVE 2\ncli RUNNING\n")
 
 
+class TestDagLoaderAcceptanceValidation(Harness):
+    def test_omitted_acceptance_defaults_to_true_on_json_nodes_and_subtasks(self):
+        import json
+        doc = {
+            "project": "demo",
+            "nodes": [
+                {"id": "A01", "title": "Base", "deps": []},
+                {
+                    "id": "B01",
+                    "title": "Parent",
+                    "deps": ["A01"],
+                    "subtasks": [{"id": "B01-1", "title": "Sub 1", "deps": []}],
+                },
+            ],
+        }
+        plan = dag_loader.load(json.dumps(doc))
+        self.assertEqual(plan["tasks"]["A01"]["acceptance"], "true")
+        self.assertEqual(plan["tasks"]["B01-1"]["acceptance"], "true")
+
+    def test_blank_or_non_string_acceptance_refused_across_nodes_subtasks_and_yaml(self):
+        import json
+        for bad in ("", "   ", None, 123, []):
+            with self.subTest(where="node", value=bad):
+                node_doc = {"project": "d", "nodes": [{"id": "A01", "title": "T", "deps": [], "acceptance": bad}]}
+                with self.assertRaises(dag_loader.Invalid):
+                    dag_loader.load(json.dumps(node_doc))
+            with self.subTest(where="subtask", value=bad):
+                sub_doc = {
+                    "project": "d",
+                    "nodes": [{
+                        "id": "A01",
+                        "title": "T",
+                        "deps": [],
+                        "acceptance": "pytest",
+                        "subtasks": [{"id": "A01-1", "title": "S", "deps": [], "acceptance": bad}],
+                    }],
+                }
+                with self.assertRaises(dag_loader.Invalid):
+                    dag_loader.load(json.dumps(sub_doc))
+        for bad_yaml_acc in ('""', '"   "'):
+            with self.subTest(where="yaml", value=bad_yaml_acc):
+                bad_yaml = file_text(task("a").replace('"python3 -m unittest"', bad_yaml_acc))
+                with self.assertRaises(dag_loader.Invalid):
+                    dag_loader.load(bad_yaml)
+        with self.assertRaises(dag_loader.Invalid):
+            dag_loader.validate({
+                "project": "t",
+                "repo": "./t",
+                "mode": "new",
+                "waves": "auto",
+                "tasks": [{"id": "a", "title": "T", "goal": "G", "deps": [], "acceptance": 99}],
+            })
+
+
 if __name__ == "__main__":
     unittest.main()

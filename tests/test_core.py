@@ -125,6 +125,35 @@ class WavesTest(unittest.TestCase):
         self.assertEqual(waves.owns_conflict(plan, "b", ["a"]), "a")
         self.assertIsNone(waves.owns_conflict(plan, "c", ["a"]))
 
+    def test_owns_conflict_prefixes_and_wildcards(self):
+        plan = waves.compile_plan([
+            task("empty1"),
+            task("empty2"),
+            task("dir_src", owns=("src",)),
+            task("file_src", owns=("src/a.py",)),
+            task("sibling_src", owns=("src/ab.py",)),
+            task("sub_dir", owns=("src/a",)),
+            task("glob_tree", owns=("src/**",)),
+            task("glob_py", owns=("src/*.py",)),
+            task("file_ts", owns=("src/a.ts",)),
+            task("nested_py", owns=("src/deep/mod.py",)),
+            task("wild_all", owns=("**",)),
+            task("wild_star", owns=("*",)),
+        ], 1)
+        self.assertIsNone(waves.owns_conflict(plan, "empty1", ["empty2"]))
+        self.assertIsNone(waves.owns_conflict(plan, "empty1", ["file_src"]))
+        self.assertIsNone(waves.owns_conflict(plan, "file_src", ["empty1"]))
+        self.assertEqual(waves.owns_conflict(plan, "wild_all", ["empty1"]), "empty1")
+        self.assertEqual(waves.owns_conflict(plan, "empty1", ["wild_all"]), "wild_all")
+        self.assertEqual(waves.owns_conflict(plan, "wild_all", ["file_src"]), "file_src")
+        self.assertEqual(waves.owns_conflict(plan, "wild_star", ["file_src"]), "file_src")
+        self.assertEqual(waves.owns_conflict(plan, "dir_src", ["file_src"]), "file_src")
+        self.assertEqual(waves.owns_conflict(plan, "file_src", ["dir_src"]), "dir_src")
+        self.assertIsNone(waves.owns_conflict(plan, "sub_dir", ["sibling_src"]))
+        self.assertEqual(waves.owns_conflict(plan, "glob_tree", ["nested_py"]), "nested_py")
+        self.assertEqual(waves.owns_conflict(plan, "glob_py", ["file_src"]), "file_src")
+        self.assertIsNone(waves.owns_conflict(plan, "glob_py", ["file_ts"]))
+
     def test_deep_plan_has_no_recursion_limit(self):
         chain = [task("t0")] + [task(f"t{i}", f"t{i - 1}") for i in range(1, 1500)]
         self.assertEqual(len(waves.compile_plan(chain, 1)["waves"]), 1500)
@@ -312,6 +341,28 @@ class RigorTest(unittest.TestCase):
         self.assertEqual(stages[0].name, rigor.REVIEW_CASCADE_STAGE)
         self.assertEqual(tuple(s.name for s in stages[1:]), rigor.REVIEW_DEEPSEEK_STAGES)
         self.assertTrue(all(s.role == "review" for s in stages))
+
+    def test_fast_rigor_pipeline_and_protocol_validation(self):
+        stages = rigor.pipeline("fast")
+        self.assertEqual(
+            [(s.name, s.role, s.label) for s in stages],
+            [
+                ("implement", "implement", "Implement"),
+                ("acceptance", "acceptance", "Acceptance"),
+                ("review-1", "review", "Review (diff)"),
+                ("merge", "merge", "Train merge"),
+            ],
+        )
+        self.assertEqual([s.name for s in stages if s.role in rigor.AGENT_ROLES], ["implement", "review-1"])
+        self.assertEqual(rigor.LEVELS["fast"]["lane_checks"], ("build", "test"))
+        _, _, cfg = protocol.validate_command(
+            {"id": "c-fast", "type": "run.configure", "payload": {"rigor": "fast", "profile": "balanced"}}
+        )
+        self.assertEqual(cfg["rigor"], "fast")
+        _, _, ovr = protocol.validate_command(
+            {"id": "c-ovr", "type": "task.override", "payload": {"task": "core", "rigor": "fast"}}
+        )
+        self.assertEqual(ovr["rigor"], "fast")
 
 
 class CeremonyPoolAndLedgerTest(unittest.TestCase):
@@ -1208,6 +1259,47 @@ class DagSubtasksAndToolTest(unittest.TestCase):
             "## Done Criteria",
         ):
             self.assertIn(heading, rendered)
+
+    def test_brief_truncates_middle_and_keeps_header_and_footer_intact(self):
+        from jbi import briefs
+        huge_task = waves.normalize({
+            "id": "D03-B9",
+            "title": "D03 B9: Large specification task",
+            "goal": "Implement D03 Batch B9 with full safety rules.",
+            "deps": [],
+            "owns": ["src/d03/b9.ts", "tests/d03/b9.spec.ts"],
+            "acceptance": "npx vitest run tests/d03/b9.spec.ts",
+            "path": "04/D03-PLAN.md",
+            "spec": "04/D03-SPEC.md",
+            "spec_details": [f"Spec detail line {i}" for i in range(40)],
+            "contracts": [f"ContractPort{i}" for i in range(25)],
+            "invariants": [f"Invariant rule {i}" for i in range(25)],
+            "test_cases": [f"D03-T{i:02d}: test case" for i in range(20)],
+            "done_criteria": [f"Criterion {i}" for i in range(15)],
+        })
+        receipt_file = Path("/tmp/run/receipts/D03-B9-implement-1.txt")
+        rendered = briefs.render(
+            task=huge_task,
+            role="implement",
+            stage="implement",
+            attempt=1,
+            receipt=receipt_file,
+            findings=[f"Prior failure {i}" for i in range(15)],
+        )
+        lines = rendered.splitlines()
+        self.assertEqual(len(lines), briefs.MAX_LINES)
+        self.assertIn("# Brief D03-B9 — implement (attempt 2)", rendered)
+        self.assertIn("Task: D03 B9: Large specification task", rendered)
+        self.assertIn("## Goal", rendered)
+        self.assertIn("Step 8.", rendered)
+        self.assertIn("... (truncated)", rendered)
+        self.assertIn("## Owns\n- src/d03/b9.ts\n- tests/d03/b9.spec.ts", rendered)
+        self.assertIn("## Acceptance\n`npx vitest run tests/d03/b9.spec.ts` must exit 0.", rendered)
+        self.assertIn("## Rules (common, declared once)", rendered)
+        for _num, rule_text in briefs.COMMON:
+            self.assertIn(rule_text, rendered)
+        self.assertIn(f"## Receipt\nWrite {receipt_file}.", rendered)
+        self.assertEqual(lines[-1], "Then one finding per line.")
 
 
 if __name__ == "__main__":

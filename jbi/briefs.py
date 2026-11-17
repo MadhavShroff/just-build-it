@@ -91,6 +91,10 @@ def receipt_path(run_dir: Path, task: str, stage: str, attempt: int) -> Path:
     return run_dir / "receipts" / f"{task}-{stage}-{attempt}.txt"
 
 
+def _flatten(blocks: list[str]) -> list[str]:
+    return [line for block in blocks for line in (str(block).splitlines() or [""])]
+
+
 def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
            findings: list[str] | None = None, goal: str | None = None) -> str:
     """The directive text for one step of one task, clipped to MAX_LINES.
@@ -99,37 +103,72 @@ def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
     two are joined. Nothing is copied into the step block.
     """
     step = step_directive(role, stage)
-    lines = [f"# Brief {task['id']} — {stage} (attempt {attempt + 1})", "",
-             "## Goal", goal or task.get("goal", ""), ""]
-    if step:
-        lines += [f"Step {step[0]}. {step[1]}", ""]
+    header_blocks = [f"# Brief {task['id']} — {stage} (attempt {attempt + 1})", ""]
     if task.get("title"):
-        lines[2:2] = [f"Task: {task['title']}", ""]
+        header_blocks += [f"Task: {task['title']}", ""]
+    header_blocks += ["## Goal", goal or task.get("goal", ""), ""]
+    if step:
+        header_blocks += [f"Step {step[0]}. {step[1]}", ""]
+
+    middle_blocks: list[str] = []
     if task.get("path") or task.get("spec"):
         refs = [p for p in (task.get("path"), task.get("spec")) if p]
-        lines += ["## Source Docs", *(f"- {r}" for r in refs), ""]
+        middle_blocks += ["## Source Docs", *(f"- {r}" for r in refs), ""]
     if task.get("spec_details"):
         details = task["spec_details"]
         detail_lines = details if isinstance(details, list) else [str(details)]
-        lines += ["## Specification Details", *(f"- {d}" for d in detail_lines), ""]
+        middle_blocks += ["## Specification Details", *(f"- {d}" for d in detail_lines), ""]
     if task.get("contracts"):
-        lines += ["## Contracts & Interfaces", *(f"- {c}" for c in task["contracts"]), ""]
+        middle_blocks += ["## Contracts & Interfaces", *(f"- {c}" for c in task["contracts"]), ""]
     if task.get("invariants"):
-        lines += ["## Invariants", *(f"- {inv}" for inv in task["invariants"]), ""]
+        middle_blocks += ["## Invariants", *(f"- {inv}" for inv in task["invariants"]), ""]
     if task.get("test_cases"):
-        lines += ["## Required Test Cases", *(f"- {tc}" for tc in task["test_cases"]), ""]
+        middle_blocks += ["## Required Test Cases", *(f"- {tc}" for tc in task["test_cases"]), ""]
     if task.get("done_criteria"):
-        lines += ["## Done Criteria", *(f"- {dc}" for dc in task["done_criteria"]), ""]
-    lines += ["## Owns", *(f"- {p}" for p in task.get("owns") or ["(no declared paths)"]), ""]
-    lines += ["## Acceptance", f"`{task.get('acceptance') or 'none'}` must exit 0.", ""]
+        middle_blocks += ["## Done Criteria", *(f"- {dc}" for dc in task["done_criteria"]), ""]
     if findings:
-        lines += ["## Findings from the last attempt", *(f"- {f}" for f in findings[:20]), ""]
-    lines += ["## Rules (common, declared once)", *common_lines(), ""]
-    lines += ["## Receipt", f"Write {receipt}.",
-              f"First line: `BRIEF {task['id']} | <commit sha or uncommitted> | PASS` or `... | FAIL`.",
-              "Then one finding per line."]
-    text_lines = [line for block in lines for line in str(block).splitlines() or [""]]
-    return "\n".join(text_lines[:MAX_LINES]) + "\n"
+        middle_blocks += ["## Findings from the last attempt", *(f"- {f}" for f in findings[:20]), ""]
+
+    owns_items = list(task.get("owns") or ["(no declared paths)"])
+    tail_blocks = [
+        "## Acceptance", f"`{task.get('acceptance') or 'none'}` must exit 0.", "",
+        "## Rules (common, declared once)", *common_lines(), "",
+        "## Receipt", f"Write {receipt}.",
+        f"First line: `BRIEF {task['id']} | <commit sha or uncommitted> | PASS` or `... | FAIL`.",
+        "Then one finding per line.",
+    ]
+    header = _flatten(header_blocks)
+    middle = _flatten(middle_blocks)
+    tail = _flatten(tail_blocks)
+    owns = _flatten(["## Owns", *(f"- {p}" for p in owns_items), ""])
+    footer = [*owns, *tail]
+
+    if len(header) + len(middle) + len(footer) <= MAX_LINES:
+        return "\n".join([*header, *middle, *footer]) + "\n"
+
+    if len(header) + len(footer) > MAX_LINES and len(owns_items) > 1:
+        max_owns_lines = max(3, MAX_LINES - len(header) - len(tail))
+        keep_count = max(1, max_owns_lines - 3)
+        if keep_count < len(owns_items):
+            rem = len(owns_items) - keep_count
+            owns = _flatten(["## Owns", *(f"- {p}" for p in owns_items[:keep_count]), f"- ... ({rem} more)", ""])
+            footer = [*owns, *tail]
+    if len(header) + len(footer) > MAX_LINES:
+        step_tail = _flatten([f"Step {step[0]}. {step[1]}", ""]) if step else []
+        h_budget = max(0, MAX_LINES - len(footer))
+        if step_tail and h_budget > len(step_tail):
+            header = [*header[:h_budget - len(step_tail)], *step_tail]
+        else:
+            header = header[:h_budget]
+
+    budget = max(0, MAX_LINES - len(header) - len(footer))
+    if budget >= 2:
+        kept_middle = [*middle[:budget - 2], "... (truncated)", ""]
+    elif budget == 1:
+        kept_middle = ["... (truncated)"]
+    else:
+        kept_middle = []
+    return "\n".join([*header, *kept_middle, *footer]) + "\n"
 
 
 def write(run_dir: Path, *, task: dict, role: str, stage: str, attempt: int,
