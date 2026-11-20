@@ -370,9 +370,33 @@ def load_tasks(source: str | Path) -> list[dict[str, Any]]:
     return load_document(source)["tasks"]
 
 
-def load(source: str | Path, *, revision: int = 1) -> dict[str, Any]:
+def validate_strict_spec(tasks: list[dict[str, Any]]) -> None:
+    """Enforce self-contained execution spec fields (ported from rswarm PR #26 and dev-pipeline)."""
+    context_keys = ("contracts", "invariants", "test_cases", "done_criteria", "spec_details")
+    for task in tasks:
+        tid = str(task.get("id") or "?")
+        goal = str(task.get("goal") or "").strip()
+        if len(goal) < 20:
+            raise Invalid(f"task '{tid}' strict spec requires a detailed 'goal' (>= 20 chars)", task=tid)
+        owns = [p for p in (task.get("owns") or ()) if isinstance(p, str) and p.strip()]
+        if not owns:
+            raise Invalid(f"task '{tid}' strict spec requires at least one declared 'owns' path", task=tid)
+        acc = str(task.get("acceptance") or "").strip()
+        if not acc or acc == "true":
+            raise Invalid(f"task '{tid}' strict spec requires a real executable 'acceptance' command", task=tid)
+        if not any(task.get(k) for k in context_keys):
+            raise Invalid(
+                f"task '{tid}' strict spec requires at least one of {', '.join(context_keys)}",
+                task=tid,
+            )
+
+
+def load(source: str | Path, *, revision: int = 1, strict_spec: bool = False,
+         forbid_wave_owns_conflicts: bool = False) -> dict[str, Any]:
     """Load a DAG from `source` and return the compiled `plan` dict for the state document."""
     doc = load_document(source)
+    if strict_spec:
+        validate_strict_spec(doc["tasks"])
     plan = waves.compile_plan(doc["tasks"], revision)
     if doc.get("waves") == "explicit" and doc.get("wave_groups"):
         groups = [list(group) for group in doc["wave_groups"]]
@@ -380,6 +404,14 @@ def load(source: str | Path, *, revision: int = 1) -> dict[str, Any]:
         for number, group in enumerate(groups, start=1):
             for tid in group:
                 plan["tasks"][tid]["wave"] = number
+    if forbid_wave_owns_conflicts:
+        conflicts = waves.detect_wave_owns_conflicts(plan)
+        if conflicts:
+            first = conflicts[0]
+            raise Invalid(
+                f"wave {first['wave']} has overlapping owns between {first['task_a']} and {first['task_b']}",
+                conflicts=conflicts,
+            )
     return plan
 
 

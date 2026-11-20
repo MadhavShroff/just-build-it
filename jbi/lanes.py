@@ -33,6 +33,7 @@ class MergeJob:
     branch: str
     level: str
     worktree: Path
+    target_branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,7 +163,7 @@ class Lanes:
         head = wt.head(self.repo, job.branch)
         if head is None:
             raise LaneFailure(f"branch {job.branch} does not exist")
-        branch = self.branch
+        branch = job.target_branch or self.branch
         for _ in range(MAX_REBUILDS):
             base = wt.head(self.repo, branch)
             if base is None:
@@ -170,7 +171,8 @@ class Lanes:
             self._status(n, status="testing", task=job.task, base=base, head=head)
             self._log(n, f"{job.task}: base {base[:10]} head {head[:10]} checks {list(checks) or 'none'}")
             tree = wt.squash_merge_tree(self.repo, base, job.branch, tmp)
-            result = self.checked(base, head, checks, tmp, lane=n)
+            wt.purge_tsbuildinfo(tmp)
+            result = self.checked(base, head, checks, tmp, lane=n, tree=tree)
             if not result.ok:
                 raise LaneFailure("; ".join(result.notes))
             with self._merge_lock:
@@ -197,18 +199,21 @@ class Lanes:
             return {}
 
     def checked(self, base: str, head: str, checks: tuple[str, ...], tree_dir: Path,
-                lane: int = 1) -> CheckResult:
+                lane: int = 1, tree: str | None = None) -> CheckResult:
         """The check result for (base, head, checks): from the cache, or by running the checks."""
         key = f"{base}:{head}:{','.join(checks)}"
         with self._cache_lock:
             hit = self._cache().get(key)
-        if hit is not None:
+        if hit is not None and (tree is None or not hit.get("tree") or hit.get("tree") == tree):
             self._log(lane, f"cache hit {key}")
             return CheckResult(hit["ok"], hit["notes"])
         result = self.run_checks(checks, tree_dir, lane)
         with self._cache_lock:
             cache = self._cache()
-            cache[key] = {"ok": result.ok, "notes": result.notes}
+            entry: dict[str, object] = {"ok": result.ok, "notes": result.notes}
+            if tree:
+                entry["tree"] = tree
+            cache[key] = entry
             self.cache_path.write_text(json.dumps(cache, indent=1))
         return result
 

@@ -236,6 +236,10 @@ class Shim:
         self.spec = spec
         self.status_path = Path(spec["status"])
         self.grace = float(spec.get("grace", DEFAULT_GRACE))
+        self.timeout_sec = float(spec["timeout_sec"]) if spec.get("timeout_sec") else 0.0
+        self.idle_timeout_sec = float(spec["idle_timeout_sec"]) if spec.get("idle_timeout_sec") else 0.0
+        self._started_mono = 0.0
+        self._last_output_mono = 0.0
         self.usage = Usage()
         self.proc: subprocess.Popen | None = None
         self.status: dict = {"shim_pid": os.getpid(), "shim_start": process_start(os.getpid()),
@@ -278,16 +282,25 @@ class Shim:
     def _watch_parent(self) -> None:
         parent = int(self.spec["parent_pid"])
         start = self.spec.get("parent_start")
+        poll = min(POLL_SECONDS, 0.2) if (self.timeout_sec > 0 or self.idle_timeout_sec > 0) else POLL_SECONDS
         while self.proc is not None and self.proc.returncode is None:
             if not alive(parent, start):
                 self.terminate("parent-gone")
                 return
-            time.sleep(POLL_SECONDS)
+            now_m = time.monotonic()
+            if self.timeout_sec > 0 and self._started_mono > 0 and (now_m - self._started_mono) >= self.timeout_sec:
+                self.terminate("timeout")
+                return
+            if self.idle_timeout_sec > 0 and self._last_output_mono > 0 and (now_m - self._last_output_mono) >= self.idle_timeout_sec:
+                self.terminate("idle-timeout")
+                return
+            time.sleep(poll)
 
     def _tee(self, log) -> None:
         assert self.proc and self.proc.stdout
         window_ok = True
         for raw in iter(self.proc.stdout.readline, b""):
+            self._last_output_mono = time.monotonic()
             line = raw.decode("utf-8", "replace")
             log.write(line)
             log.flush()
@@ -331,6 +344,8 @@ class Shim:
                 self.status.update(started=now(), ended=now(), exit_code=127, reason="spawn-failed")
                 write_json(self.status_path, self.status)
                 return 127
+            self._started_mono = time.monotonic()
+            self._last_output_mono = self._started_mono
             self.status.update(pid=self.proc.pid, pgid=self.proc.pid, start=process_start(self.proc.pid),
                                started=now())
             write_json(self.status_path, self.status)

@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -315,33 +316,58 @@ def _http_call(model: str, prompt: Prompt, timeout: int) -> tuple[str, dict]:
     return data["choices"][0]["message"]["content"], {"tokens_in": tokens_in, "tokens_out": tokens_out}
 
 
-def completer(state_reader: Callable[[], dict], *, timeout: int = CALL_TIMEOUT,
-              debug_log: Path | None = None) -> Completer:
-    """A Completer over the enabled accounts.
+def _is_rate_limit(error: Exception) -> bool:
+    """True when `error` looks like an HTTP 429 or provider RPM/rate-limit throttling response."""
+    if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+        return True
+    if isinstance(error, CallFailed):
+        text = f"{error.stderr}\n{error.stdout}".lower()
+        return any(tok in text for tok in ("429", "rate limit", "rate_limit", "too many requests", "quota"))
+    return False
 
-    It asks `models.select` for the provider and model, and falls back to the next
-    usable provider with the same tier when a call fails. A CompletionError names each
-    provider with its exit code and a fixed sentence only; the provider's own output goes
-    to `debug_log`, redacted.
+
+def completer(state_reader: Callable[[], dict], *, timeout: int = CALL_TIMEOUT,
+              debug_log: Path | None = None,
+              cooldowns: models.ProviderCooldowns | None = None,
+              max_429_retries: int = 2,
+              retry_backoff_s: float = 2.0,
+              cooldown_s: float = 60.0) -> Completer:
+    """A Completer over the enabled accounts with in-turn 429 backoff and cooldown failover.
+
+    It asks `models.select` for the provider and model, retries transient 429 rate-limit
+    responses with exponential backoff before marking a cooldown, and falls back to the
+    next usable provider with the same tier when a call fails.
     """
     def complete(prompt: Prompt) -> Completion:
         state = state_reader()
-        first = models.select(state, prompt.role)
+        first = models.select(state, prompt.role, cooldowns=cooldowns)
         failures = []
-        for provider in models.usable(state):
-            if provider == "simulator":
-                continue
+        ordered = [p for p in models.usable(state) if p != "simulator"]
+        if cooldowns is not None:
+            ordered = sorted(ordered, key=lambda p: (1 if cooldowns.cooling(p) else 0))
+        for provider in ordered:
             model = first.model if provider == first.provider else catalog()["providers"][provider]["models"][first.tier]
-            try:
-                if provider == "openai-compatible":
-                    text, usage = _http_call(model, prompt, timeout)
-                else:
-                    text, usage = _cli_call(provider, model, prompt, timeout)
-            except (ValueError, OSError, subprocess.SubprocessError, urllib.error.URLError, KeyError, IndexError,
-                    TypeError) as error:
-                failures.append(_failure(provider, error))
-                write_debug(debug_log, f"{prompt.purpose or 'completion'} failed", _details(provider, model, error))
-                continue
-            return Completion(text=text, model=model, provider=provider, **usage)
+            attempt = 0
+            while True:
+                try:
+                    if provider == "openai-compatible":
+                        text, usage = _http_call(model, prompt, timeout)
+                    else:
+                        text, usage = _cli_call(provider, model, prompt, timeout)
+                    return Completion(text=text, model=model, provider=provider, **usage)
+                except (ValueError, OSError, subprocess.SubprocessError, urllib.error.URLError, KeyError, IndexError,
+                        TypeError) as error:
+                    if _is_rate_limit(error) and attempt < max_429_retries:
+                        delay = retry_backoff_s * (2 ** attempt)
+                        attempt += 1
+                        write_debug(debug_log, f"{provider} 429 retry {attempt}", _details(provider, model, error))
+                        if delay > 0:
+                            time.sleep(delay)
+                        continue
+                    if _is_rate_limit(error) and cooldowns is not None:
+                        cooldowns.mark(provider, cooldown_s)
+                    failures.append(_failure(provider, error))
+                    write_debug(debug_log, f"{prompt.purpose or 'completion'} failed", _details(provider, model, error))
+                    break
         raise CompletionError("No enabled provider answered. " + ("; ".join(failures) or "Enable one on the Accounts panel."))
     return complete

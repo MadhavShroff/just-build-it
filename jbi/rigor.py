@@ -54,6 +54,8 @@ PRE_MERGE_AUDIT_STAGES: tuple[Stage, ...] = (
 
 PIPELINES: dict[str, tuple[Stage, ...]] = {
     "vibe": _stages(("implement", "implement", "Implement"), ("merge", "merge", "Merge")),
+    "wave-epic": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
+                         ("merge", "merge", "Epic land")),
     "fast": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
                     ("review-1", "review", "Review (diff)"), ("merge", "merge", "Train merge")),
     "medium": _stages(("implement", "implement", "Implement"), ("acceptance", "acceptance", "Acceptance"),
@@ -76,6 +78,9 @@ PIPELINES: dict[str, tuple[Stage, ...]] = {
 LEVELS: dict[str, dict] = {
     "vibe": {"label": "Vibe coder", "summary": "Builds the features. No tests, reviews or scans.",
              "lane_checks": ()},
+    "wave-epic": {"label": "Wave epic",
+                  "summary": "Acceptance + clean squash + no-cache tsc onto epic/wave-N; combined review and CI at wave end.",
+                  "lane_checks": ("build",)},
     "fast": {"label": "Fast", "summary": "Acceptance command, one read-only diff review, train merge.",
              "lane_checks": ("build", "test")},
     "medium": {"label": "Medium", "summary": "Acceptance command, one review, train merge.",
@@ -84,6 +89,25 @@ LEVELS: dict[str, dict] = {
              "lane_checks": ("build", "lint", "test")},
     "xhigh": {"label": "Extra high", "summary": "Two reviews, a security audit and the full lane check set.",
               "lane_checks": ("build", "lint", "test", "format_check")},
+}
+
+# Role-based reasoning effort defaults (ported from rswarm PRs #2, #6, #35).
+EFFORT_BY_ROLE: dict[str, str] = {
+    "implement": "medium",
+    "verify": "high",
+    "review": "high",
+    "security": "high",
+    "plan": "xhigh",
+    "bootstrap": "medium",
+}
+
+# Task-effort-scaled timeout and turn ceilings (ported from rswarm 492bb0b, 70393e5).
+TASK_TIMEOUT_BY_EFFORT: dict[str, dict[str, float | int]] = {
+    "XS": {"agent_timeout_s": 600.0, "idle_timeout_s": 240.0, "acceptance_timeout_s": 300.0, "max_turns": 36},
+    "S":  {"agent_timeout_s": 900.0, "idle_timeout_s": 300.0, "acceptance_timeout_s": 600.0, "max_turns": 60},
+    "M":  {"agent_timeout_s": 1800.0, "idle_timeout_s": 420.0, "acceptance_timeout_s": 900.0, "max_turns": 100},
+    "L":  {"agent_timeout_s": 2700.0, "idle_timeout_s": 600.0, "acceptance_timeout_s": 1500.0, "max_turns": 150},
+    "XL": {"agent_timeout_s": 3600.0, "idle_timeout_s": 600.0, "acceptance_timeout_s": 1800.0, "max_turns": 200},
 }
 
 PROFILES: dict[str, dict] = {
@@ -133,6 +157,23 @@ def effective(task: dict, config: dict) -> tuple[str, str]:
     """The (rigor, profile) pair that applies to one task after its overrides."""
     override = task.get("override") or {}
     return override.get("rigor") or config["rigor"], override.get("profile") or config["profile"]
+
+
+def effort_for(role: str, task: dict | None = None, attempts: int = 0) -> str:
+    """Return the reasoning effort for `role`, escalating `implement` after repeated failures."""
+    override = (task or {}).get("override") or {}
+    if isinstance(override.get("effort"), str) and override["effort"].strip():
+        return override["effort"].strip()
+    base = EFFORT_BY_ROLE.get(role, "medium")
+    if role == "implement" and attempts >= ESCALATE_AFTER and base in ("low", "medium"):
+        return "high"
+    return base
+
+
+def task_timeouts(task: dict | None = None) -> dict[str, float | int]:
+    """Return wall-clock, idle-output, acceptance timeout, and turn ceiling scaled by task effort."""
+    effort = str((task or {}).get("effort") or "M").upper()
+    return dict(TASK_TIMEOUT_BY_EFFORT.get(effort, TASK_TIMEOUT_BY_EFFORT["M"]))
 
 
 def describe() -> dict:

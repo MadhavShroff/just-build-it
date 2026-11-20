@@ -95,8 +95,34 @@ def _flatten(blocks: list[str]) -> list[str]:
     return [line for block in blocks for line in (str(block).splitlines() or [""])]
 
 
+def discover_shared_helpers(repo: Path | None,
+                            search_dirs: tuple[str, ...] = ("shared", "src/shared", "lib/shared"),
+                            max_items: int = 12) -> list[str]:
+    """Scan common shared-helper directories so smaller models reuse existing utilities (rswarm #35)."""
+    if repo is None or not Path(repo).is_dir():
+        return []
+    root = Path(repo)
+    found: list[str] = []
+    for rel_dir in search_dirs:
+        base = root / rel_dir
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            if any(part.startswith(".") or part == "node_modules" or part == "__pycache__" for part in path.parts):
+                continue
+            if path.suffix.lower() in (".ts", ".tsx", ".js", ".mjs", ".py", ".h", ".hpp"):
+                found.append(str(path.relative_to(root)))
+                if len(found) >= max_items:
+                    return found
+    return found
+
+
 def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
-           findings: list[str] | None = None, goal: str | None = None) -> str:
+           findings: list[str] | None = None, goal: str | None = None,
+           shared_helpers: list[str] | None = None,
+           checkpoint_note: str | None = None) -> str:
     """The directive text for one step of one task, clipped to MAX_LINES.
 
     REQUIREMENT 4.3: the common block is read once and the step block once, and the
@@ -126,6 +152,10 @@ def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
         middle_blocks += ["## Required Test Cases", *(f"- {tc}" for tc in task["test_cases"]), ""]
     if task.get("done_criteria"):
         middle_blocks += ["## Done Criteria", *(f"- {dc}" for dc in task["done_criteria"]), ""]
+    if shared_helpers:
+        middle_blocks += ["## Shared Helpers (reuse, do not duplicate)", *(f"- {h}" for h in shared_helpers[:12]), ""]
+    if checkpoint_note:
+        middle_blocks += ["## Checkpoint Resume", checkpoint_note, ""]
     if findings:
         middle_blocks += ["## Findings from the last attempt", *(f"- {f}" for f in findings[:20]), ""]
 
@@ -172,7 +202,9 @@ def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
 
 
 def write(run_dir: Path, *, task: dict, role: str, stage: str, attempt: int,
-          findings: list[str] | None = None, goal: str | None = None) -> tuple[Path, Path]:
+          findings: list[str] | None = None, goal: str | None = None,
+          shared_helpers: list[str] | None = None,
+          checkpoint_note: str | None = None) -> tuple[Path, Path]:
     """Write the brief for one stage. Returns (brief path, receipt path)."""
     path = brief_path(run_dir, task["id"], stage, attempt)
     receipt = receipt_path(run_dir, task["id"], stage, attempt)
@@ -180,7 +212,8 @@ def write(run_dir: Path, *, task: dict, role: str, stage: str, attempt: int,
     receipt.parent.mkdir(parents=True, exist_ok=True)
     receipt.unlink(missing_ok=True)
     path.write_text(render(task=task, role=role, stage=stage, attempt=attempt, receipt=receipt,
-                           findings=findings, goal=goal))
+                           findings=findings, goal=goal, shared_helpers=shared_helpers,
+                           checkpoint_note=checkpoint_note))
     return path, receipt
 
 

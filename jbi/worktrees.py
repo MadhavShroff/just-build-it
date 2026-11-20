@@ -8,6 +8,7 @@ temporary detached worktree, then fast-forwards `main` to the squash commit.
 from __future__ import annotations
 
 import fnmatch
+import os
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -160,3 +161,79 @@ def remove_worktree(repo: Path, path: Path) -> None:
     if path.exists():
         git(repo, "worktree", "remove", "--force", str(path), check=False)
     git(repo, "worktree", "prune", check=False)
+
+
+def purge_tsbuildinfo(worktree: Path) -> list[str]:
+    """Delete stale `*.tsbuildinfo` files under `worktree` so `tsc` never gives a false green."""
+    removed: list[str] = []
+    if not worktree.is_dir():
+        return removed
+    for root, dirs, files in os.walk(worktree):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+        for name in files:
+            if name.endswith(".tsbuildinfo"):
+                target = Path(root) / name
+                try:
+                    target.unlink()
+                    removed.append(str(target.relative_to(worktree)))
+                except OSError:
+                    pass
+    return sorted(removed)
+
+
+def prepare_worktree(worktree: Path, *, setup_commands: Iterable[str] = (),
+                     cache_key: str | None = None, timeout: int = 300) -> list[str]:
+    """Purge stale `.tsbuildinfo` caches and run workspace `setup_commands` when `cache_key` changed."""
+    notes: list[str] = []
+    purged = purge_tsbuildinfo(worktree)
+    if purged:
+        notes.append(f"purged {len(purged)} tsbuildinfo file(s)")
+    commands = [cmd.strip() for cmd in setup_commands if isinstance(cmd, str) and cmd.strip()]
+    if not commands:
+        return notes
+    marker = worktree / ".jbi" / ".prepared-key"
+    if cache_key and marker.is_file():
+        try:
+            if marker.read_text(encoding="utf-8").strip() == cache_key:
+                notes.append(f"setup cache hit ({cache_key[:12]})")
+                return notes
+        except OSError:
+            pass
+    for cmd in commands:
+        proc = subprocess.run(cmd, shell=True, cwd=str(worktree), capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=timeout)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[-400:]
+            raise GitError(f"worktree setup command failed (rc={proc.returncode}): {cmd}: {detail}")
+        notes.append(f"ran setup: {cmd}")
+    if cache_key:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(cache_key + "\n", encoding="utf-8")
+        except OSError:
+            pass
+    return notes
+
+
+def host_admission_check(*, max_load_per_cpu: float = 0.0, min_free_mem_mb: int = 0) -> str | None:
+    """Return None when host CPU load and available memory allow a new job, else a refusal reason."""
+    if max_load_per_cpu > 0:
+        try:
+            load1 = os.getloadavg()[0]
+            cpus = max(1, os.cpu_count() or 1)
+            ratio = load1 / cpus
+            if ratio > max_load_per_cpu:
+                return f"host load {load1:.2f} across {cpus} CPUs ({ratio:.2f}/cpu > {max_load_per_cpu:.2f})"
+        except OSError:
+            pass
+    if min_free_mem_mb > 0:
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemAvailable:"):
+                    avail_mb = int(line.split()[1]) // 1024
+                    if avail_mb < min_free_mem_mb:
+                        return f"host MemAvailable {avail_mb} MiB < {min_free_mem_mb} MiB"
+                    break
+        except (OSError, ValueError, IndexError):
+            pass
+    return None

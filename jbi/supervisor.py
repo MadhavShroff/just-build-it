@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, briefs, ci_adapter as ci_mod, models, rigor, taskkey, waves, worktrees as wt
+from . import agents, briefs, ci_adapter as ci_mod, guards, models, rigor, taskkey, waves, worktrees as wt
 from .contracts import Hooks
 from .lanes import Lanes, MergeJob
 from .shim import Groups, alive, process_start, run_command
@@ -190,6 +190,12 @@ class Supervisor:
         self.identities: dict[str, dict[int, str]] = {}   # sid -> {pid: start time} at spawn
         self.branch: str = wt.MAIN
         self._lock = threading.RLock()
+        self.cooldowns = models.ProviderCooldowns()
+        raw_pool = store.read("/config/provider_pool") or []
+        self.provider_pool = models.ProviderPool(
+            (item.get("provider"), item.get("model"))
+            for item in raw_pool if isinstance(item, dict) and item.get("provider")
+        ) if raw_pool else None
         self._task_cache = taskkey.WorkCache(self.run_dir, str(run_id or "run"))
         self._wake = threading.Event()
         self._stopping: str | None = None
@@ -243,7 +249,8 @@ class Supervisor:
         return f"{self.dag_name()}-wave{wave}-task{ordinal}-{self._slug(provider, 'none')}"
 
     def run_session(self, task: str, role: str, cmd: list[str], cwd: Path, provider: str,
-                    model: str, attempt: int) -> Session:
+                    model: str, attempt: int, *, timeout_sec: float = 0.0,
+                    idle_timeout_sec: float = 0.0) -> Session:
         """Start one agent under the shim, wait until it ends, then reclaim its window.
 
         REQUIREMENT 1.1 to 1.6: the step owns a window of its own, named by
@@ -257,6 +264,10 @@ class Supervisor:
         spec = {"cmd": cmd, "cwd": str(cwd), "provider": provider, "env": agents.extra_env(provider),
                 "parent_pid": self.parent_pid, "parent_start": process_start(self.parent_pid),
                 "status": f"{base}.status.json", "log": f"{base}.log"}
+        if timeout_sec > 0:
+            spec["timeout_sec"] = float(timeout_sec)
+        if idle_timeout_sec > 0:
+            spec["idle_timeout_sec"] = float(idle_timeout_sec)
         Path(f"{base}.spec.json").write_text(json.dumps(spec))
         argv = [sys.executable, "-m", "jbi.shim", f"{base}.spec.json"]
         opened = self.tmux.open(self.window_name(task, provider), argv)
@@ -414,8 +425,14 @@ class Supervisor:
         with self._lock:
             plan, config = self.store.read("/plan"), self.store.read("/config")
             state = self.store.snapshot()[1]
+            admit_err = wt.host_admission_check(
+                max_load_per_cpu=float(config.get("max_load_per_cpu") or 0.0),
+                min_free_mem_mb=int(config.get("min_free_mem_mb") or 0),
+            )
+            if admit_err:
+                return
             running = [t for t, th in self._running.items() if th.is_alive()]
-            for tid in waves.ready_tasks(plan):
+            for tid in waves.prioritize_ready(plan, config=config):
                 if len(running) >= config["max_sessions"]:
                     break
                 if tid in running or waves.owns_conflict(plan, tid, running):
@@ -480,6 +497,8 @@ class Supervisor:
         if base is None:
             raise wt.GitError(f"base branch {self.branch} has no commit")
         worktree = wt.create_worktree(self.repo, tid, base, self.run_dir / "worktrees")
+        setup_cmds = self.store.read("/config/worktree_setup_commands") or ()
+        wt.prepare_worktree(worktree, setup_commands=setup_cmds, cache_key=base)
         findings: list[str] = task.get("findings") or []
         stage_name: str | None = task.get("resume_after")
         while not self._stopping or self._stopping == "finish":
@@ -574,8 +593,10 @@ class Supervisor:
         else:
             self._task_update(tid, "task.stage", stage=stage.name)
         if stage.role == "acceptance":
+            wt.purge_tsbuildinfo(worktree)
+            acc_timeout = float(rigor.task_timeouts(task).get("acceptance_timeout_s") or ACCEPTANCE_TIMEOUT)
             result = run_command(task["acceptance"], cwd=worktree, env=agents.child_env(None),
-                                 timeout=ACCEPTANCE_TIMEOUT, parent_pid=self.parent_pid, groups=self.groups)
+                                 timeout=acc_timeout, parent_pid=self.parent_pid, groups=self.groups)
             code, out = result.returncode, result.output
             return code == 0, f"exit {'timeout' if code is None else code}\n{out[-2000:]}", None
         if stage.role == "merge":
@@ -639,29 +660,64 @@ class Supervisor:
                      findings: list[str], *, discard: bool = True) -> tuple[bool, str, str | None]:
         tid, attempt = task["id"], task.get("attempts", 0)
         state = self.store.snapshot()[1]
-        choice = models.select(state, stage.role, task=task, attempts=attempt)
+        choice = models.select(state, stage.role, task=task, attempts=attempt,
+                               pool=self.provider_pool, cooldowns=self.cooldowns)
+        shared = briefs.discover_shared_helpers(worktree) if stage.role == "implement" else None
+        ckpt_path = worktree / ".jbi_checkpoint.json"
+        ckpt_note: str | None = None
+        if stage.role == "implement" and ckpt_path.is_file():
+            try:
+                ckpt = json.loads(ckpt_path.read_text(encoding="utf-8"))
+                if isinstance(ckpt, dict):
+                    ckpt_note = f"Resuming after {ckpt.get('reason', 'previous attempt')} (attempt {ckpt.get('attempt', attempt)})."
+            except (OSError, ValueError):
+                pass
         brief, receipt = briefs.write(self.run_dir, task=task, role=stage.role, stage=stage.name,
-                                      attempt=attempt, findings=findings if stage.role == "implement" else None)
+                                      attempt=attempt, findings=findings if stage.role == "implement" else None,
+                                      shared_helpers=shared, checkpoint_note=ckpt_note)
         job = agents.AgentJob(choice.provider, choice.model, tid, stage.role, worktree, brief, receipt,
                               attempt, tuple(task.get("owns") or ()))
-        session = self.run_session(tid, stage.name, agents.command(job), worktree, choice.provider,
-                                   choice.model, attempt)
+        limits = rigor.task_timeouts(task)
+        use_watchdog = choice.provider != "simulator" or bool(state.get("config", {}).get("enforce_timeouts"))
+        if use_watchdog:
+            session = self.run_session(
+                tid, stage.name, agents.command(job), worktree, choice.provider, choice.model, attempt,
+                timeout_sec=float(limits["agent_timeout_s"]),
+                idle_timeout_sec=float(limits["idle_timeout_s"]),
+            )
+        else:
+            session = self.run_session(tid, stage.name, agents.command(job), worktree, choice.provider,
+                                       choice.model, attempt)
         if self._stopping in ("quit", "kill", "standdown"):
             return False, f"stopped by {self._stopping}", choice.model
+        reason = session.status.get("reason")
+        if reason in ("timeout", "idle-timeout") and stage.role == "implement":
+            try:
+                ckpt_path.write_text(json.dumps({"task": tid, "attempt": attempt + 1, "reason": reason,
+                                                 "provider": choice.provider, "model": choice.model}), encoding="utf-8")
+            except OSError:
+                pass
         result = briefs.parse_receipt(receipt)
         if stage.role == "implement":
             owns = task.get("owns") or []
-            if owns:
+            check_syntax = choice.provider != "simulator" or bool(state.get("config", {}).get("enforce_syntax_guards"))
+            if check_syntax:
+                guard_errors = guards.validate_worktree_edits(worktree, owns)
+            elif owns:
                 unowned = [p for p in wt.dirty_paths(worktree) if not wt.path_owned(p, owns)]
-                if unowned:
-                    wt.discard_changes(worktree)
-                    return False, f"modified unowned path {', '.join(unowned)}", choice.model
+                guard_errors = [f"modified unowned path {', '.join(unowned)}"] if unowned else []
+            else:
+                guard_errors = []
+            if guard_errors:
+                wt.discard_changes(worktree)
+                return False, "; ".join(guard_errors), choice.model
             sha = wt.commit_all(worktree, f"{tid}: implement attempt {attempt + 1}")
             self._task_update(tid, commit=sha or wt.head(worktree, "HEAD"), receipt=str(receipt))
+            ckpt_path.unlink(missing_ok=True)
         elif discard:
             wt.discard_changes(worktree)        # verifiers and reviewers never edit code
         if result is None:
-            return False, f"no valid receipt (exit {session.status.get('exit_code')})", choice.model
+            return False, f"no valid receipt (exit {session.status.get('exit_code')}, reason {reason or 'none'})", choice.model
         return result.passed, "\n".join(result.findings), choice.model
 
     # ---- merging ---------------------------------------------------------------------
@@ -681,12 +737,14 @@ class Supervisor:
         done = threading.Event()
         self._merge_done[tid] = done
         service = self.store.read("/config/ci_service") or self.ci_service
+        epic_branch = self.store.read("/config/epic_branch") if level == "wave-epic" else None
+        target_branch = str(epic_branch) if epic_branch else None
         if service == "illm":
             task = self.store.read(f"/plan/tasks/{tid}")
             try:
-                handover = self.ci_adapter.handover(self.repo, task, base=self.branch)
+                handover = self.ci_adapter.handover(self.repo, task, base=target_branch or self.branch)
             except ci_mod.CIAdapterError as error:
-                self._merge_failed(MergeJob(tid, f"jbi/{tid}", level, worktree), [str(error)])
+                self._merge_failed(MergeJob(tid, f"jbi/{tid}", level, worktree, target_branch=target_branch), [str(error)])
                 return self._merge_ok.pop(tid, False)
             self._task_update(tid, pr_number=handover.pr_number, commit=handover.head_sha)
             if not done.is_set():
@@ -694,7 +752,7 @@ class Supervisor:
             self.store.log("lane", f"{tid} handed over to illm ci ready #{handover.pr_number} @ {handover.head_sha[:10]}",
                            task=tid)
         else:
-            self.lanes.submit(MergeJob(tid, f"jbi/{tid}", level, worktree))
+            self.lanes.submit(MergeJob(tid, f"jbi/{tid}", level, worktree, target_branch=target_branch))
         while not done.wait(0.2):
             if self._stopping in ("quit", "kill", "standdown"):
                 return False
