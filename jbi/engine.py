@@ -42,6 +42,7 @@ class Engine:
             "decision.answer": self._decision_answer,
             "account.set": self._account_set, "account.probe": self._account_probe,
             "architecture.refresh": self._architecture_refresh, "run.stop": self._run_stop,
+            "message.send": self._message_send,
         }
         missing = set(protocol.COMMANDS) - set(self._handlers)
         assert not missing, f"commands without a handler: {missing}"
@@ -298,6 +299,10 @@ class Engine:
                        etype="decision.answered", decision=payload["decision"])
         if decision.get("owner") == "runtime" and self.runtime:
             self.runtime.answer(payload["decision"], payload["answer"])
+
+    def _message_send(self, ctype: str, payload: dict) -> None:
+        self._require_runtime().send_message(payload["target"], payload["text"],
+                                             bool(payload.get("all_sessions", False)))
 
     # ---- accounts ----------------------------------------------------------------------
 

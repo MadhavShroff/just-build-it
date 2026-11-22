@@ -60,6 +60,9 @@ class Runtime(Protocol):
     def answer(self, decision: str, answer: str) -> None:
         """A decision that the runtime opened has an answer."""
 
+    def send_message(self, target: str, text: str, all_sessions: bool = False) -> None:
+        """Queue one message for a session, or for every session when `all_sessions` is true."""
+
     def retry_bootstrap(self) -> None:
         """Run bootstrap again in the same target after a failure."""
 

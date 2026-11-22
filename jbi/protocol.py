@@ -135,6 +135,9 @@ COMMANDS: dict[str, Command] = {c.type: c for c in (
             {"provider": Field("string", max_length=40)}),
     Command("architecture.refresh", ("configure", "execute", "complete"),
             "Run the architecture.sync hook now."),
+    Command("message.send", ANY_PHASE, "Send one message to a session, or to every session.",
+            {"target": Field("string", max_length=64), "text": Field("string", max_length=20000),
+             "all_sessions": Field("bool", required=False)}),
     Command("run.stop", ANY_PHASE, "Stop the run with one of four modes.", {"mode": _enum(STOP_MODES)}),
 )}
 

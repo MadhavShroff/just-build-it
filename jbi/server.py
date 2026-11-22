@@ -21,6 +21,7 @@ from . import PROTOCOL_VERSION, __version__, metrics as metrics_mod, models, pro
 from .engine import Engine
 from .protocol import ProtocolError
 from .store import Store, iter_sse
+from .tracking import Tracking
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 MAX_BODY = 256 * 1024
@@ -64,13 +65,14 @@ class App:
 
     def __init__(self, store: Store, engine: Engine, auth: Auth, *, extra_info: Callable[[], dict] | None = None,
                  link_bases: Callable[[], list[dict]] | None = None,
-                 metrics_sources: metrics_mod.MetricsSources | None = None,
+                 fleet_reader: Callable[[], dict] | None = None,
                  base_path: str = "", public_paths: frozenset[str] = frozenset()):
         self.store, self.engine, self.auth = store, engine, auth
         self.extra_info = extra_info or (lambda: {})
         # The verified base URLs ({label, url}) that sign-in links may point at.
         self.link_bases = link_bases or (lambda: [])
-        self.metrics_sources = metrics_sources
+        # An optional callback that returns the fleet; the default reads the run's fleet store.
+        self.fleet_reader = fleet_reader
         # A reverse proxy may mount the dashboard under a prefix, such as
         # /jbi/preview. The prefix is stripped before routing, so every relative
         # link and every fetch() in the page keeps working unchanged.
@@ -273,8 +275,11 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
 
         def metrics(self, query: dict) -> None:
             run_dir = Path(app.store.path).parent if getattr(app.store, "path", None) else None
-            snapshot = metrics_mod.collect_metrics(app.metrics_sources, run_dir=run_dir)
+            snapshot = metrics_mod.collect_metrics(run_dir)
             self._json(200, {"protocol": PROTOCOL_VERSION, "metrics": snapshot})
+
+        def fleet(self, query: dict) -> None:
+            self._json(200, {"protocol": PROTOCOL_VERSION, "fleet": fleet_snapshot(app)})
 
         def preview(self, query: dict) -> None:
             seq, doc = app.store.snapshot()
@@ -301,6 +306,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         ("POST", "/api/v1/links"): Handler.links,
         ("GET", "/api/v1/metrics"): Handler.metrics,
         ("GET", "/api/v1/preview"): Handler.preview,
+        ("GET", "/api/v1/fleet"): Handler.fleet,
     }
     PUBLIC = {
         ("GET", "/api/v1/health"),
@@ -309,6 +315,21 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         ("GET", "/api/v1/preview"),
     }
     return Handler
+
+
+def fleet_snapshot(app: App) -> dict:
+    """The one fleet read: the app callback, else the run's fleet store, else the whole run state."""
+    if app.fleet_reader is not None:
+        return app.fleet_reader()
+    run_dir = Path(app.store.path).parent if getattr(app.store, "path", None) else None
+    path = run_dir / metrics_mod.FLEET_DB if run_dir else None
+    if path is not None and path.is_file():
+        tracking = Tracking(path)
+        try:
+            return tracking.fleet()
+        finally:
+            tracking.close()
+    return app.store.snapshot()[1]
 
 
 def _content_length(values: list[str]) -> int:

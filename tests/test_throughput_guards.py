@@ -12,7 +12,8 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from jbi import briefs, dag_loader, guards, lanes, models, providers, rigor, shim, store, waves, worktrees as wt
+from jbi import briefs, dag_loader, guards, models, providers, rigor, shim, store, waves, worktrees as wt
+from jbi.ci_adapter import CIAdapter
 from jbi.llm import Prompt
 
 
@@ -233,7 +234,7 @@ class TestShimWatchdogAndEpicLane(unittest.TestCase):
             st = json.loads((root / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(st["reason"], "idle-timeout")
 
-    def test_lane_lands_onto_epic_branch_and_purges_tsbuildinfo(self) -> None:
+    def test_ready_handover_targets_the_epic_branch_through_the_fake_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo = root / "repo"
@@ -242,26 +243,32 @@ class TestShimWatchdogAndEpicLane(unittest.TestCase):
             base_sha = wt.commit_all(repo, "init")
             assert base_sha
             wt.git(repo, "branch", "epic/wave-4", base_sha)
-
             task_wt = wt.create_worktree(repo, "t1", "epic/wave-4", root / "wts")
             (task_wt / "feature.ts").write_text("export const v = 1;\n", encoding="utf-8")
-            wt.commit_all(task_wt, "add feature")
+            head = wt.commit_all(task_wt, "add feature")
+            calls: list[list[str]] = []
 
-            run_dir = root / "run"
-            (run_dir / "lanes").mkdir(parents=True, exist_ok=True)
-            st = store.Store(run_dir / "state.db", initial={"lanes": {"lane-1": {}}})
-            merged: list[tuple[str, str]] = []
-            failed: list[list[str]] = []
-            lane_mgr = lanes.Lanes(
-                1, store=st, repo=repo, run_dir=run_dir, groups=shim.Groups(),
-                on_merged=lambda job, sha: merged.append((job.task, sha)),
-                on_failed=lambda job, notes: failed.append(notes),
-            )
-            sha = lane_mgr.merge(1, lanes.MergeJob("t1", "jbi/t1", "vibe", task_wt, target_branch="epic/wave-4"))
-            self.assertIsNotNone(sha, f"merge failed: {failed}")
-            self.assertEqual(failed, [])
-            self.assertEqual(wt.head(repo, "main"), base_sha)
-            self.assertEqual(wt.head(repo, "epic/wave-4"), sha)
+            def runner(argv, cwd):
+                calls.append(list(argv))
+                out = ""
+                if argv[0] == "ci-conductor":
+                    out = json.dumps({"type": "queued", "job": "pr-9", "expect": "notice-on-completion",
+                                      "text": f"#9 at {head[:9]} is queued."})
+                elif argv[:3] == ["gh", "pr", "list"]:
+                    out = "[]"
+                elif argv[:3] == ["gh", "pr", "create"]:
+                    out = "https://example.test/pull/9"
+                return subprocess.CompletedProcess(argv, 0, out, "")
+
+            result = CIAdapter(runner=runner).handover(
+                repo, {"id": "t1", "title": "T", "goal": "G"}, base="epic/wave-4", verb="ready")
+            self.assertEqual(result.pr_number, 9)
+            self.assertIn(["ci-conductor", "ready", "9", "--head", head], calls)
+            create = next(c for c in calls if c[:3] == ["gh", "pr", "create"])
+            self.assertEqual(create[create.index("--base") + 1], "epic/wave-4")
+            self.assertEqual(result.base_commit, base_sha)
+            self.assertEqual(wt.head(repo, "main"), base_sha, "the adapter never moves a branch")
+            self.assertEqual(wt.head(repo, "epic/wave-4"), base_sha)
 
 
 if __name__ == "__main__":
