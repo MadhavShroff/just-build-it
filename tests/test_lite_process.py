@@ -130,6 +130,12 @@ class ProcessBase(unittest.TestCase):
         return subprocess.run([sys.executable, "-m", "claude_mux_lite", str(spec_path)], env=env,
                               cwd=str(self.tmp), capture_output=True, text=True, timeout=120)
 
+    def add_session(self, session_id: str) -> None:
+        """Create an idle session row for a history key, as the parent does before dispatch."""
+        with sqlite3.connect(self.db) as db:
+            db.execute("INSERT INTO sessions (id,node,status,created_at,updated_at) "
+                       "SELECT ?,node,'idle',created_at,updated_at FROM sessions WHERE id='s1'", (session_id,))
+
     def usage(self) -> dict:
         return json.loads(Path(self.tmp / "state" / "usage.json").read_text())
 
@@ -167,13 +173,51 @@ class FreshProcess(ProcessBase):
         self.assertTrue(receipt.startswith("BRIEF t1 | uncommitted | PASS"))
         self.assertEqual(Path(self.tmp / "state" / "ck.json").exists(), True)
 
-    def test_fresh_stores_cost_but_no_history_or_secret(self):
+    def test_fresh_persists_history_for_later_correction_without_cross_task_load(self):
+        first_id = self.dispatch()
+        with FakeEndpoint([final(RECEIPT_TEXT)]) as ep:
+            first = self.run_process(self.spec(first_id, continuation=False), ep.url)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(ep.requests[0]["body"]["messages"]), 1)
+        stored = self.tracking.session_history("s1")
+        self.assertEqual([m["role"] for m in stored], ["user", "assistant"])
+        self.assertIn("Write src/new.txt.", json.dumps(stored[0]))
+        self.assertIn("BRIEF t1 | uncommitted | PASS", json.dumps(stored[1]))
+        self.assertNotIn("cache_control", json.dumps(stored))
+        second_id = self.dispatch(renew=True)
+        with FakeEndpoint([final("BRIEF t1 | uncommitted | PASS")]) as ep:
+            second = self.run_process(self.spec(second_id, continuation=True, brief="Correct."), ep.url)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        sent = ep.requests[0]["body"]["messages"]
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[0]["content"][-1]["text"], "Brief:\nWrite src/new.txt.")
+        self.assertIn("BRIEF t1 | uncommitted | PASS", json.dumps(sent[1]))
+        self.assertEqual(sent[2]["content"][0]["text"], "Brief:\nCorrect.")
+        self.add_session("s-other")
+        with FakeEndpoint([final("BRIEF t2 | uncommitted | PASS")]) as ep:
+            other = self.run_process(self.spec(second_id, continuation=True, session_id="s-other",
+                                               brief="Other."), ep.url)
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertEqual(len(ep.requests[0]["body"]["messages"]), 1)
+        self.assertEqual(len(self.tracking.session_history("s1")), 4)
+        self.assertEqual(len(self.tracking.session_history("s-other")), 2)
+
+    def test_history_session_id_key_is_used_for_history(self):
+        did = self.dispatch()
+        self.add_session("h1")
+        with FakeEndpoint([final(RECEIPT_TEXT)]) as ep:
+            proc = self.run_process(self.spec(did, history_session_id="h1"), ep.url)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.tracking.session_history("h1")), 2)
+        self.assertEqual(self.tracking.session_history("s1"), [])
+
+    def test_fresh_stores_cost_but_no_secret(self):
         dispatch_id = self.dispatch()
         with FakeEndpoint([final(RECEIPT_TEXT, {"input_tokens": 1})]) as ep:
             spec = self.spec(dispatch_id)
             proc = self.run_process(spec, ep.url)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.tracking.session_history("s1"), [])
+        self.assertEqual([m["role"] for m in self.tracking.session_history("s1")], ["user", "assistant"])
         self.assertEqual(len(self.tracking.fleet()["costs"]), 1)
         self.assertEqual(self.tracking.fleet()["costs"][0]["input_tokens"], 1)
         self.assertNotIn(SECRET, json.dumps(spec))
@@ -182,6 +226,97 @@ class FreshProcess(ProcessBase):
             self.assertNotIn(SECRET, blob)
         for path in self.db.parent.iterdir():
             self.assertNotIn(SECRET.encode(), path.read_bytes())
+
+
+class BrokerBootstrap(ProcessBase):
+    """H2: one credential reaches the fake endpoint, and no spec, argv or child variable holds it."""
+
+    def run_bootstrap(self, spec: dict, url: str, extra: dict | None = None):
+        spec_path = self.tmp / "sessions" / "spec.json"
+        spec_path.parent.mkdir(exist_ok=True)
+        spec_path.write_text(json.dumps(spec))
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.tmp), "PYTHONPATH": str(ROOT),
+               "CLAUDE_MUX_BASE_URL": url, "CLAUDE_MUX_API_KEY": SECRET,
+               "CLAUDE_MUX_HEADERS": json.dumps({"X-Org": "org-secret-5521"}), **(extra or {})}
+        proc = subprocess.run([sys.executable, "-m", "claude_mux_lite", "--bootstrap", str(spec_path)],
+                              env=env, cwd=str(self.tmp), capture_output=True, text=True, timeout=120)
+        return proc, spec_path
+
+    def test_real_key_reaches_the_endpoint_and_no_file_holds_it(self):
+        dispatch_id = self.dispatch()
+        with FakeEndpoint([write_call(), final(RECEIPT_TEXT)]) as ep:
+            spec = self.spec(dispatch_id)
+            proc, spec_path = self.run_bootstrap(spec, ep.url)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual({h["Authorization"] for h in ep.headers}, {f"Bearer {SECRET}"})
+        self.assertEqual({h.get("X-Org") for h in ep.headers}, {"org-secret-5521"})
+        self.assertEqual(len(ep.requests), 2)
+        self.assertEqual((self.repo / "src" / "new.txt").read_text(), "hello\n")
+        for blob in (spec_path.read_text(), self.store_text(), proc.stdout, proc.stderr,
+                     (self.tmp / "state" / "usage.json").read_text(), (self.tmp / "state" / "ck.json").read_text()):
+            self.assertNotIn(SECRET, blob)
+            self.assertNotIn("org-secret-5521", blob)
+        for path in self.db.parent.iterdir():
+            self.assertNotIn(SECRET.encode(), path.read_bytes())
+        self.assertEqual(list((self.tmp / "sessions").glob("b-*")), [])        # the socket is gone
+
+    def test_a_shell_in_the_child_cannot_read_the_key_through_spec_or_environment(self):
+        dispatch_id = self.dispatch()
+        script = {"content": [{"type": "tool_use", "id": "b1", "name": "bash", "input": {
+            "command": f"cat {self.tmp}/sessions/spec.json; env; cat /proc/$PPID/environ | tr '\\0' '\\n'"}}],
+            "stop_reason": "tool_use"}
+        with FakeEndpoint([script, final(RECEIPT_TEXT)]) as ep:
+            proc, _ = self.run_bootstrap(self.spec(dispatch_id), ep.url)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.dumps(ep.requests[1]["body"]["messages"][-1]["content"])
+        self.assertNotIn(SECRET, result)
+        self.assertNotIn("org-secret-5521", result)
+        self.assertNotIn("sk-test-bearer", json.dumps(ep.requests))
+
+    def test_bootstrap_does_not_touch_tracking_and_child_env_holds_only_a_random_token(self):
+        probe = self.tmp / "probe.py"
+        probe.write_text("import os, json, sys\nprint(json.dumps({k: v for k, v in os.environ.items() "
+                         "if k.startswith(('CLAUDE_MUX', 'ANTHROPIC', 'OPENAI'))}))\n")
+        from claude_mux_lite import credentials
+        env = {"PATH": os.environ.get("PATH", ""), "CLAUDE_MUX_API_KEY": SECRET, "CLAUDE_MUX_HEADERS": "{}",
+               "OPENAI_API_KEY": SECRET}
+        extra = credentials.start_broker(self.tmp / "sessions", env)
+        self.assertNotEqual(extra["CLAUDE_MUX_API_KEY"], SECRET)
+        self.assertGreaterEqual(len(extra["CLAUDE_MUX_API_KEY"]), 43)
+        self.assertEqual(sorted(extra), ["CLAUDE_MUX_API_KEY", "CLAUDE_MUX_BROKER"])
+        self.assertTrue(os.path.exists(extra["CLAUDE_MUX_BROKER"]))
+        self.assertEqual(oct(os.stat(extra["CLAUDE_MUX_BROKER"]).st_mode & 0o777), "0o600")
+        self.assertEqual(tracking_rows(self.db), 0)
+
+    def test_the_socket_refuses_a_wrong_token(self):
+        from claude_mux_lite import credentials
+        with FakeEndpoint([final("x")]) as ep:
+            extra = credentials.start_broker(self.tmp / "sessions", {"CLAUDE_MUX_API_KEY": SECRET,
+                                                                       "CLAUDE_MUX_BASE_URL": ep.url})
+            status, _, _ = credentials.post(extra["CLAUDE_MUX_BROKER"], "wrong-token", {}, {}, 5)
+            self.assertEqual(status, 401)
+            self.assertEqual(ep.requests, [])
+            status, _, body = credentials.post(extra["CLAUDE_MUX_BROKER"], extra["CLAUDE_MUX_API_KEY"], {}, {}, 5)
+            self.assertEqual(status, 200)
+            self.assertEqual(ep.headers[0]["Authorization"], f"Bearer {SECRET}")
+
+
+class ShimLaunch(unittest.TestCase):
+    def test_shim_takes_the_inherited_key_and_ignores_a_spec_key(self):
+        from jbi import shim
+        spec = {"cmd": [sys.executable, "-m", "claude_mux_lite", "/x/spec.json"], "provider": "claude-mux-lite",
+                "env": {"CLAUDE_MUX_API_KEY": "spec-key-0000", "PYTHONPATH": "/p"}}
+        argv, env = shim.neutral_launch(spec, {"PATH": "/bin", "CLAUDE_MUX_API_KEY": SECRET, "ZZ": "dropped"})
+        self.assertEqual(argv[1:], ["-m", "claude_mux_lite", "--bootstrap", "/x/spec.json"])
+        self.assertEqual(env["CLAUDE_MUX_API_KEY"], SECRET)
+        self.assertEqual(env["PYTHONPATH"], "/p")
+        self.assertNotIn("ZZ", env)
+        self.assertNotIn(SECRET, " ".join(argv))
+
+
+def tracking_rows(db: Path) -> int:
+    with sqlite3.connect(db) as conn:
+        return conn.execute("select count(*) from sqlite_master where name='never-written'").fetchone()[0]
 
 
 class MessageProcess(ProcessBase):

@@ -67,6 +67,12 @@ def brief(state: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_brief(state: dict, receipt: Path) -> str:
+    """Use the full repository setup brief, with the exact launch receipt path."""
+    return brief(state).replace("Write the receipt file named in the launch message.",
+                               f"Write {receipt}.")
+
+
 def check(repo: Path, *, parent_pid: int | None = None, groups: Groups | None = None) -> tuple[bool, str]:
     """Run the recorded `build` and `lint` commands. A missing command is a FAIL."""
     path = Path(repo) / COMMANDS_FILE

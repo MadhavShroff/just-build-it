@@ -330,6 +330,70 @@ class Merge(Base):
             self.tr.record_ci("t1", pr_number=1, head_sha="xyz", base_commit=self.base, service_reply={})
 
 
+class CISettle(Base):
+    def submit(self, head, job, pr=7):
+        reply = {"type": "queued", "job": job,
+                 "bound": {"task": "t1", "pr_number": pr, "head_sha": head}}
+        return self.tr.record_ci("t1", pr_number=pr, head_sha=head, base_commit=self.base,
+                                 service_reply=reply, state="submitted")
+
+    def test_red_green_restore_leaves_nothing_pending(self):
+        path = self.make_task()
+        self.dispatch()
+        head = self.commit_in(path)
+        self.submit(head, "job-1")
+        self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base, state="failed",
+                          service_reply={"type": "data", "text": "red", "job": "job-1"})
+        self.assertEqual(self.tr.pending_ci("t1"), [])
+        self.submit(head, "job-2")
+        self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base, state="green",
+                          green_run="job-2", service_reply={"type": "data", "job": "job-2"})
+        self.assertEqual(self.tr.pending_ci("t1"), [])
+        states = [r["state"] for r in self.tr.fleet()["ci_submissions"]]
+        self.assertEqual(sorted(states), ["failed", "failed", "green", "green"])
+
+    def test_unchanged_head_red_leaves_no_candidate(self):
+        path = self.make_task()
+        self.dispatch()
+        head = self.commit_in(path)
+        self.submit(head, "job-9")
+        reply = {"type": "data", "text": "verdict RED", "job": "job-9"}
+        for _ in range(2):
+            self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base,
+                              state="failed", service_reply=reply)
+        self.assertEqual(self.tr.pending_ci("t1"), [])
+        self.assertEqual(len(self.tr.fleet()["ci_submissions"]), 2)
+
+    def test_independent_jobs_stay_open(self):
+        path = self.make_task()
+        self.dispatch()
+        head = self.commit_in(path)
+        self.submit(head, "job-a")
+        self.submit(head, "job-b", pr=8)
+        self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base, state="failed",
+                          service_reply={"type": "data", "job": "job-a"})
+        open_jobs = [r["service_reply"]["job"] for r in self.tr.pending_ci("t1")]
+        self.assertEqual(open_jobs, ["job-b"])
+
+    def test_repeated_merge_is_idempotent_and_conflict_refused(self):
+        path = self.make_task()
+        self.dispatch()
+        head = self.commit_in(path)
+        self.submit(head, "job-1")
+        self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base, state="green",
+                          green_run="job-1", service_reply={"type": "data", "job": "job-1"})
+        first = self.tr.record_merge("t1", 7, head, head, "job-1")
+        self.assertEqual(self.tr.pending_ci("t1"), [])
+        again = self.tr.record_merge("t1", 7, head, head, "job-1")
+        self.assertEqual(first["merge"], again["merge"])
+        self.assertEqual(len(self.tr.fleet()["merges"]), 1)
+        with self.assertRaises(LeaseError):
+            self.tr.record_merge("t1", 7, head, "c" * 40, "job-1")
+        with self.assertRaises(LeaseError):
+            self.tr.record_merge("t1", 7, head, head, "job-2")
+        self.assertEqual(len(self.tr.fleet()["merges"]), 1)
+
+
 class Stages(Base):
     def ensure(self, **kw):
         args = dict(task_id="t1", title="t1", owns=["src/a"], branch="jbi/t1",
@@ -470,6 +534,25 @@ class Stages(Base):
         self.tr.record_merge("t1", 7, head, "c" * 40, "run-1")
         self.tr.release("t1", reason="merged")
         self.assertEqual(self.tr.fleet()["tasks"][0]["state"], "merged")
+
+
+class HistorySessions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tr = Tracking(Path(self.tmp.name) / "fleet.db")
+        self.addCleanup(self.tr.close)
+
+    def test_history_session_is_fresh_idempotent_and_node_bound(self):
+        first = self.tr.start_history_session("s-task-a-h-stage", node="one")
+        self.assertEqual(self.tr.session_history(first["id"]), [])
+        self.tr.record_session_history(first["id"], [{"role": "user", "content": "one"}])
+        self.tr.start_history_session(first["id"], node="one")
+        self.assertEqual(self.tr.session_history(first["id"])[0]["content"], "one")
+        with self.assertRaises(LeaseError):
+            self.tr.start_history_session(first["id"], node="two")
+        other = self.tr.start_history_session("s-task-b-h-stage", node="other")
+        self.assertEqual(self.tr.session_history(other["id"]), [])
 
 
 if __name__ == "__main__":

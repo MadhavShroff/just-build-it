@@ -9,6 +9,9 @@
 `Tracking.authorize_write(task_id, path, tool_write=False) -> None or LeaseError`.
 `Tracking.release(task_id, reason, abandon=False) -> release record`.
 `Tracking.fleet() -> one JSON-compatible dict`.
+`Tracking.get_task(task_id) -> task or None`.
+`Tracking.start_history_session(session_id, node) -> one isolated task-stage history record`.
+`Tracking.pending_ci(task_id) -> only unanswered exact-head job submissions`.
 `Tracking.send(target, text, sender="founder") -> list of message records`.
 
 Tasks hold id, title, goal, owns JSON, branch, worktree, base commit, state, node, timestamps, and release reason. Dispatches hold id, task, session, attempt, model, continuation flag, brief digest, timestamps, receipt, and verdict. Sessions hold id, node, history, status, and reset timestamps. Messages hold delivery state in their own table.
@@ -27,13 +30,15 @@ Release first checks merged or abandoned state. A clean leased worktree resets t
 
 The new package contains tools, a request builder, a raw HTTP transport, a session loop, checkpointing, parsing, and tests. Its code derives selectively from the MIT-licensed rswarm harness. It imports no rswarm modules. It requires only the Python standard library. Provider credentials come only from `CLAUDE_MUX_BASE_URL` and `CLAUDE_MUX_API_KEY`, or the configured endpoint injection in tests. Files and logs never contain credentials.
 
-The tool schemas cover bash, file reads, file writes, exact edits, directory lists, and regex searches. Path resolution rejects workspace escapes, symlink escapes, and unleased writes. Linux runs bash under `bwrap`, with a read-only root and writable worktree, Git storage, and scratch directory. A real write outside those leaves refuses. A process cannot reach the temporary space of another task. No live shell runs without `bwrap`. `git status` detects repository mutations after each tool call. The fence restores the path from the base commit, records the refusal, and fails the tool call. Each response appends complete content blocks to session history. An identical system prompt and ordered tool list precede messages. Explicit ephemeral cache breakpoints mark stable content and growing history.
+The tool schemas cover bash, file reads, file writes, exact edits, directory lists, and regex searches. Path resolution rejects workspace escapes, symlink escapes, and unleased writes. Linux runs bash under `bwrap`, with a read-only root and selected writable leaves. Those leaves are the worktree, Git objects, the leased task branch, its index state, and the task scratch directory. Configuration, hooks, and other branches stay read-only. Host Git discovery ignores agent steering files and disables monitors, external diff, and hooks. Index-changing guard operations stay inside `bwrap`. `/tmp` is a private mount, not the host directory. A real write outside those leaves refuses. A process cannot reach the temporary space of another task. No live shell runs without `bwrap`. `git status` detects repository mutations after each tool call. The fence restores the path from the base commit, records the refusal, and fails the tool call. Each response appends complete content blocks to session history. An identical system prompt and ordered tool list precede messages. Explicit ephemeral cache breakpoints mark stable content and growing history.
+
+The shim passes inherited provider credentials directly to `claude_mux_lite --bootstrap`. The one-time bootstrap starts a private local credential broker. The neutral child receives a random token and a local Unix socket. The broker checks peer identity and forwards to the provider with the real credential. Spec files and tracking records hold neither that credential nor custom credential headers.
 
 The provider endpoint uses `POST {base}/v1/messages`. The request specifies model, maximum output, effort, tools, system messages, and message history. Every `tool_use` gets one result. A missing usage field stays null. Parser failures return a recorded transport failure. A deterministic fake endpoint verifies every request and usage mapping without network access.
 
 ## Cache method
 
-A brief puts the repository map and frozen contracts first. Its task goal, attempt, owns paths, acceptance, findings, and receipt instructions come last. The header has no timestamp or random identifier. Each task starts a fresh session. A same-task correction continues that task's history. Every dispatch records `continuation` as a boolean. The provider cache serves the identical node prefix inside its TTL. The dispatcher runs same-node tasks consecutively. A released lease has no continuation write authority. Cost records distinguish one dispatch from a whole session. The fleet read reports dispatches with reads, writes, uncached input, and hit rate.
+A brief puts the repository map and frozen contracts first. Its task goal, attempt, owns paths, acceptance, findings, and receipt instructions come last. The header has no timestamp or random identifier. Each task starts a fresh session. A same-stage correction continues that stage's history. The first model interaction persists stripped history for that key. Another stage and another task get different keys. The stable lease session remains the message endpoint. Every dispatch records `continuation` as a boolean. The provider cache serves the identical node prefix inside its TTL. The dispatcher runs same-node tasks consecutively. A released lease has no continuation write authority. Cost records distinguish one dispatch from a whole session. The fleet read reports dispatches with reads, writes, uncached input, and hit rate.
 
 This request shape follows the raw HTTP protocol accepted by claude-mux-lite. The implementation does not change the prescribed neutral provider boundary to an Anthropic SDK.
 
@@ -41,7 +46,11 @@ This request shape follows the raw HTTP protocol accepted by claude-mux-lite. Th
 
 `message.send` validates a session id or `--all`. The runtime persists one message per target. claude-mux-lite injects pending text before a model call and marks delivery. An idle session receives the next task's message without restoring task history. The fleet read shows delivery state. It never claims agent action. `just-build-it send --agent ID --text TEXT` addresses one agent. `--all --text TEXT` addresses all sessions.
 
-`CIAdapter` invokes `ci-conductor ready PR --head SHA` directly. No interface-llm wrapper exists in jbi. The adapter validates textual or structured replies and requires active-mode acceptance. A direct `job` read records pending until a terminal run. That run supplies a green verdict and squash SHA for the same head. A missing squash SHA never counts as merged. The fleet read combines internal CI records with exact service receipts.
+`CIAdapter` invokes `ci-conductor ready PR --head SHA` directly. No interface-llm wrapper exists in jbi. The adapter validates direct replies. A `job` read records pending while the job is active. A terminal job can fail closed or supply a green verdict and squash SHA for the same head. Green evidence closes the original submitted row. A duplicate identical confirmation is idempotent. A missing squash SHA never counts as merged.
+
+The runtime serializes notices and evidence polling. A verified merge releases the clean task branch first. The runtime then fast-forwards the local base to the exact CI squash. It never performs the merge locally. Dirty release leaves the current base, live lease, and untracked files unchanged. A dependent task starts against the verified new base. A live task keeps its original base.
+
+Stand-down preserves committed work under the parked branch. Resume restores the exact recorded parked branch before dispatch. A different task never uses that ref. Bootstrap owns the initial tree only while feature tasks cannot run. Its full repository brief includes the accepted stack and `.jbi/commands.json`. A clean bootstrap release parks the branch and resets the main worktree.
 
 ## Slice verification
 

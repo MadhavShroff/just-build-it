@@ -208,6 +208,19 @@ class ConfirmMergeTest(Fixture):
         self.reply = self.job_text()
         self.assertFalse(self.adapter().pending(self.repo, result))
 
+    def test_job_state_vocabulary(self):
+        result = self.result()
+        cases = {"started 1  running": True, "state: queued": True, "status=pending": True,
+                 "state: in_progress": True, "state: started": True,
+                 "state: finished": False, "state: failed": False, "state: success": False,
+                 "state: completed": False, "state: complete": False,
+                 "started 1  finished running\nverdict RED  failed gates: unit": False}
+        for text, want in cases.items():
+            self.reply = {"type": "data", "job": "pr-812", "text": text}
+            self.assertIs(self.adapter().pending(self.repo, result), want, text)
+        self.reply = self.job_text()
+        self.assertFalse(self.adapter().pending(self.repo, result))
+
     def test_submit_reply_alone_proves_no_merge(self) -> None:
         result = self.result()
         self.reply = self.job_text(merge=False)

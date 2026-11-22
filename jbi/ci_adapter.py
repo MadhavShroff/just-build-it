@@ -53,6 +53,31 @@ def _full_sha(value: Any) -> bool:
     return isinstance(value, str) and bool(SHA40_RE.match(value))
 
 
+ACTIVE_WORDS = frozenset({"running", "queued", "pending", "started", "in_progress"})
+_STATE_RE = re.compile(r"\b(?:state|status)\s*[:=]\s*([A-Za-z_]+)", re.I)
+_VERDICT_RE = re.compile(r"\bverdict\s+(?:GREEN|RED|VOID)\b")
+MAX_JOB_TEXT = 20000
+
+
+def job_is_active(text: str) -> bool:
+    """Return True when plain job text shows a job that still runs. No provider is called.
+
+    The ci-conductor `job` verb prints `started <t>  finished <t|running>` and adds a
+    `verdict ...` line only after the job ends."""
+    text = text[:MAX_JOB_TEXT]
+    if _VERDICT_RE.search(text):
+        return False
+    if re.search(r"\bfinished\s+running\b", text, re.I):
+        return True
+    state = _STATE_RE.search(text)
+    if state:
+        return state.group(1).lower() in ACTIVE_WORDS
+    if re.search(r"\bfinished\s+\S", text, re.I) or re.search(
+            r"\b(?:failed|success|complete|completed)\b", text, re.I):
+        return False
+    return bool(re.search(r"\b(?:running|queued|pending|started|in_progress)\b", text, re.I))
+
+
 class CIAdapter:
     """Pushes task branches, creates draft PRs with `gh`, and calls the CI service directly."""
 
@@ -182,7 +207,7 @@ class CIAdapter:
         if not job:
             raise CIAdapterError("the handover has no direct job identifier")
         reply = self._service(repo, "job", [str(job)])
-        return bool(re.search(r"\bfinished running\b", str(reply.get("text") or "")))
+        return job_is_active(str(reply.get("text") or ""))
 
     def confirm_merge(self, repo: Path, result: HandoverResult, *, job: str | None = None,
                       tracking: Any | None = None) -> dict[str, Any]:
@@ -213,7 +238,8 @@ class CIAdapter:
                     "green_run": str(job), "reply": reply}
         if tracking is not None:
             tracking.record_ci(result.task, pr_number=number, head_sha=head, base_commit=result.base_commit,
-                               service_reply=reply, green_run=str(job), squash_sha=squash, state="green")
+                               service_reply={**reply, "job": str(job), "bound": result.reply.get("bound")},
+                               green_run=str(job), squash_sha=squash, state="green")
             tracking.record_merge(result.task, number, head, squash, str(job))
         return evidence
 

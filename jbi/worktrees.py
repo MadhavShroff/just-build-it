@@ -1,8 +1,9 @@
 """Thin git helpers. Every call uses an argument list, never a shell.
 
 The target repository keeps its base branch checked out (`main` for a new repository). Each task works in its own worktree on
-branch `jbi/<task>`. A lane squash-merges a task branch onto a pinned base in a
-temporary detached worktree, then fast-forwards `main` to the squash commit.
+branch `jbi/<task>`.
+Host Git calls disable agent-controlled hooks, monitors, and external diff.
+The configured CI service performs every merge. Host functions synchronize only its verified squash.
 """
 
 from __future__ import annotations
@@ -15,6 +16,13 @@ from typing import Iterable
 
 MAIN = "main"
 IDENTITY = ("-c", "user.name=just-build-it", "-c", "user.email=jbi@localhost")
+HOST_CONFIG = ("--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+               "-c", "diff.external=", "-c", "protocol.file.allow=never")
+
+
+def _host_env() -> dict[str, str]:
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM") if k in os.environ}
+    return {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 
 
 class GitError(RuntimeError):
@@ -22,8 +30,8 @@ class GitError(RuntimeError):
 
 
 def git(repo: Path | str, *args: str, check: bool = True) -> str:
-    result = subprocess.run(["git", *IDENTITY, "-C", str(repo), *args],
-                            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    result = subprocess.run(["git", *IDENTITY, *HOST_CONFIG, "-C", str(repo), *args],
+                            capture_output=True, text=True, stdin=subprocess.DEVNULL, env=_host_env())
     if check and result.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {(result.stderr or result.stdout).strip()}")
     return result.stdout.strip()
@@ -51,6 +59,18 @@ def head(repo: Path, ref: str = MAIN) -> str | None:
     """The commit that `ref` names, or None when the ref does not exist yet."""
     out = git(repo, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}", check=False)
     return out or None
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """Check ancestry without changing the repository."""
+    result = subprocess.run(["git", *IDENTITY, *HOST_CONFIG, "-C", str(repo), "merge-base",
+                             "--is-ancestor", ancestor, descendant], capture_output=True,
+                            stdin=subprocess.DEVNULL, env=_host_env())
+    if result.returncode == 1:
+        return False
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode(errors="replace").strip())
+    return True
 
 
 def tree_of(repo: Path, sha: str) -> str:
@@ -110,10 +130,49 @@ def create_worktree(repo: Path, task: str, base: str, root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     branch = f"jbi/{task}"
     if head(repo, branch):
-        git(repo, "worktree", "add", "-q", str(path), branch)
+        if (path / ".git").exists():
+            git(path, "checkout", "-q", branch)
+        else:
+            git(repo, "worktree", "add", "-q", str(path), branch)
+    elif (path / ".git").exists():
+        git(path, "checkout", "-q", "-b", branch, base)
     else:
         git(repo, "worktree", "add", "-q", "-b", branch, str(path), base)
     return path
+
+
+def restore_worktree(repo: Path, task: str, base: str, root: Path, expected_head: str | None = None) -> Path:
+    """Attach a released task to its exact parked branch. Never overwrite existing work."""
+    path = root / task
+    branch = f"jbi/{task}"
+    if not (path / ".git").exists():
+        existing = git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/jbi-parked/").splitlines()
+        refs = [ref for ref in existing if ref.removeprefix("refs/heads/jbi-parked/").startswith(f"{task}-")]
+        if not refs:
+            return create_worktree(repo, task, base, root)
+    if current_branch_or_none(path) == branch:
+        return path
+    if (expected_head is None and (path / ".git").exists() and current_branch_or_none(path) is None
+            and head(path, "HEAD") == base and not dirty_paths(path)):
+        return create_worktree(repo, task, base, root)
+    refs = git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/jbi-parked/").splitlines()
+    refs = [ref for ref in refs if ref.removeprefix("refs/heads/jbi-parked/").startswith(f"{task}-")]
+    matches = [ref for ref in refs if expected_head is None or head(repo, ref) == expected_head]
+    if len(matches) != 1:
+        raise GitError(f"task {task} has {len(matches)} parked refs matching its recorded head")
+    if dirty_paths(path):
+        raise GitError(f"task {task} has dirty or untracked work; parked-checkout refused")
+    existing = head(repo, branch)
+    if existing and existing != head(repo, matches[0]):
+        raise GitError(f"task {task} already has a different branch {branch}")
+    if matches[0] != branch:
+        git(repo, "branch", "-m", matches[0].removeprefix("refs/heads/"), branch)
+    git(path, "checkout", branch)
+    return path
+
+
+def current_branch_or_none(repo: Path) -> str | None:
+    return git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False) or None
 
 
 def discard_changes(path: Path) -> None:

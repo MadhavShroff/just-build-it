@@ -130,7 +130,7 @@ class FakeCI:
                 f"verdict GREEN  failed gates: none\nmerge: #{number}->{job['squash']}; stopped=None")
 
     def _land(self, pr: dict) -> str:
-        """The external service squash-merges the branch onto the PR base."""
+        """The external service squash-merges the branch onto its recorded base."""
         base_sha = wt.head(self.repo, pr["base"])
         tmp = self.scratch / f"squash-{pr['branch'].replace('/', '-')}"
         try:
@@ -138,8 +138,6 @@ class FakeCI:
             sha = wt.commit_tree(self.repo, tree, base_sha, f"squash {pr['branch']}")
         finally:
             wt.remove_worktree(self.repo, tmp)
-        if not wt.fast_forward_main(self.repo, sha, base_sha, branch=pr["base"]):
-            raise AssertionError("the fake CI could not advance its base branch")
         return sha
 
 
@@ -391,6 +389,10 @@ class Runs(RunFixture):
         self.assertTrue(self.hooks.merged_event.wait(60), self.store.read("/timeline"))
         self.assertEqual({self.status("a"), self.status("b")}, {"merged"})
         self.assertIn("a attempt 1", wt.git(self.repo, "show", "main:src/a.txt"))
+        self.assertEqual((self.run_dir / "worktrees/b/src/a.txt").read_text(), "a attempt 1\n")
+        self.assertEqual(self.sup.tracking.get_task("b")["base_commit"],
+                         self.store.read("/plan/tasks/a/commit"))
+        self.assertIsNotNone(self.sup.tracking.get_task("a")["base_commit"])
         stages = self.store.read("/plan/tasks/a/stages")
         self.assertEqual(list(stages), ["implement", "merge"])
         self.assertIn(("wave", 2), self.hooks.calls)
@@ -639,7 +641,11 @@ class TargetFollowsTheUser(unittest.TestCase):
             time.sleep(0.2)
         self.assertEqual(store.read("/bootstrap/status"), "passed", store.read("/bootstrap/detail"))
         self.assertTrue((chosen / ".git").exists())
-        self.assertTrue((chosen / ".jbi" / "commands.json").exists())
+        parked = wt.git(chosen, "for-each-ref", "--format=%(refname:short)", "refs/heads/jbi-parked").splitlines()
+        self.assertTrue(len(parked) == 1 and parked[0].startswith("jbi-parked/bootstrap-"), parked)
+        wt.git(chosen, "show", parked[0] + ":.jbi/commands.json")
+        self.assertFalse((chosen / ".jbi" / "commands.json").exists(),
+                         "clean bootstrap parks the branch and resets its worktree")
         self.assertFalse(default.exists())
 
 
@@ -921,6 +927,7 @@ class ReviewFindings(unittest.TestCase):
         head_sha = wt.commit_all(worktree, f"{tid}: implement attempt 1")
         sup._task_lease(tid, worktree)
         sup._task_update(tid, commit=head_sha)
+        sup.tracking.record_commit(tid, head_sha)
         sup.ci_poll_interval = 0.05
         return sup, store, repo, worktree, head_sha
 
@@ -934,10 +941,10 @@ class ReviewFindings(unittest.TestCase):
         self.assertIn(["ci-conductor", "ready", "901", "--head", head_sha], self.ci.calls)
         squash = store.read("/plan/tasks/a/commit")
         self.assertRegex(squash, r"^[0-9a-f]{40}$")
-        self.assertEqual(wt.head(repo, "main"), squash, "the fake service, not the supervisor, advanced main")
+        self.assertEqual(wt.head(repo, "main"), squash, "the runtime synchronized exact CI squash evidence")
         self.assertEqual(wt.git(repo, "rev-parse", f"{squash}^"), base_before)
         fleet = sup.tracking.fleet()
-        self.assertEqual([r["state"] for r in fleet["ci_submissions"]], ["submitted", "green"])
+        self.assertEqual([r["state"] for r in fleet["ci_submissions"]], ["green", "green"])
         self.assertEqual(len(fleet["merges"]), 1)
         merge = fleet["merges"][0]
         self.assertEqual((merge["pr_number"], merge["head_sha"], merge["squash_sha"], merge["green_run"]),
@@ -958,7 +965,8 @@ class ReviewFindings(unittest.TestCase):
         self.assertEqual(sup.tracking.fleet()["merges"], [])
         self.assertNotEqual(store.read("/plan/tasks/a/status"), "merged")
         findings = "\n".join(sup._merge_notes.get("a") or [])
-        self.assertIn("CI merged", findings)
+        self.assertIn("No bound CI handover", findings)
+        self.assertIn("failed", [r["state"] for r in sup.tracking.fleet()["ci_submissions"]])
 
     def test_11b_unknown_notice_without_a_handover_records_no_merge(self):
         sup, store, repo, worktree, head_sha = self.lander("unknown_repo", "a", {"src/a.txt": "x = 1\n"})

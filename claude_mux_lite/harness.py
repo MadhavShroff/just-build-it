@@ -104,6 +104,7 @@ class HttpTransport:
         self.base = (env.get("CLAUDE_MUX_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
         self._secrets = _secrets(env)
+        self.broker = env.get("CLAUDE_MUX_BROKER") or None
         self.headers = {"Content-Type": "application/json", "anthropic-version": API_VERSION}
         raw = env.get("CLAUDE_MUX_HEADERS")
         if raw:
@@ -118,7 +119,41 @@ class HttpTransport:
         if env.get("CLAUDE_MUX_API_KEY"):
             self.headers["Authorization"] = f"Bearer {env['CLAUDE_MUX_API_KEY']}"
 
+    def _via_broker(self, payload: dict) -> str:
+        """Send through the private credential broker. The child holds only a random token."""
+        from . import credentials
+        try:
+            status, headers, raw = credentials.post(self.broker, self.headers["Authorization"].split(" ", 1)[1],
+                                                    payload, {"Content-Type": "application/json",
+                                                              "anthropic-version": API_VERSION}, self.timeout)
+        except (TimeoutError, OSError, ValueError) as exc:
+            if isinstance(exc, TimeoutError):
+                raise TimeoutError("request timed out") from None
+            raise ProtocolError(redact(f"transport failure: {exc}", self._secrets)) from None
+        text = raw.decode("utf-8", errors="replace")
+        if headers.get(credentials.TIMEOUT_HEADER):
+            raise TimeoutError("request timed out")
+        if headers.get(credentials.TRANSPORT_HEADER):
+            raise ProtocolError(redact(headers[credentials.TRANSPORT_HEADER], self._secrets))
+        if status >= 400:
+            retry = None
+            try:
+                retry = float(headers.get("Retry-After")) if headers.get("Retry-After") else None
+            except (TypeError, ValueError):
+                pass
+            raise HttpError(status, redact(text[:500], self._secrets), retry)
+        return text
+
     def __call__(self, payload: dict) -> dict:
+        if self.broker:
+            body = self._via_broker(payload)
+            try:
+                doc = json.loads(body)
+            except ValueError:
+                raise ProtocolError("endpoint returned invalid JSON") from None
+            if not isinstance(doc, dict):
+                raise ProtocolError("endpoint returned a non-object answer")
+            return doc
         req = urllib.request.Request(f"{self.base}/v1/messages", data=json.dumps(payload).encode("utf-8"),
                                      headers=self.headers, method="POST")
         try:
@@ -311,6 +346,40 @@ DOTDOT_IN_CODE = re.compile(r"(?:^|[\s'\"=(,\[])\.\.(?:/|$|[\s'\")\],])")
 STASH = re.compile(r"\bgit\b[^\n;&|]*\bstash\b")
 
 
+SAFE_GIT = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=")
+DISCOVERY_GIT = ("--no-optional-locks", "-c", "protocol.file.allow=never")
+
+
+def host_git_argv(*args: str, work_tree: Path | str | None = None, git_dir: Path | str | None = None,
+                  discovery: bool = True) -> list[str]:
+    """A Git argument list for the host. It never reads an agent hook, monitor or external diff.
+
+    A pinned `git_dir` ignores the `.git` file of the worktree, which the agent can rewrite."""
+    argv = ["git", *SAFE_GIT]
+    if discovery:
+        argv += list(DISCOVERY_GIT)
+    if git_dir is not None:
+        argv += [f"--git-dir={git_dir}"]
+        if work_tree is not None:
+            argv += [f"--work-tree={work_tree}"]
+    elif work_tree is not None:
+        argv += ["-C", str(work_tree)]
+    return argv + list(args)
+
+
+def fence_env() -> dict[str, str]:
+    """The environment of a fenced shell. It holds no credential."""
+    env = {k: os.environ[k] for k in CHILD_ENV if k in os.environ}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def host_git_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k in CHILD_ENV or k.startswith("LC_")}
+    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
+    return env
+
+
 class GuardError(Exception):
     """The fence cannot parse or cannot safely repair a state."""
 
@@ -381,15 +450,29 @@ class BashGuard:
         self.owns = tuple(owns)
         self.authorize = authorize
         self.allow_commits = allow_commits
+        from .sandbox import discover_git
+        self.git_dir, self.common_dir = discover_git(self.root)
         self.head = self._rev()
         self.branch = self._git("symbolic-ref", "-q", "HEAD")[1].decode().strip()
         self.baseline = self.snapshot()
 
     # -- git helpers --
     def _git(self, *args: str) -> tuple[int, bytes]:
-        proc = subprocess.run(["git", "-C", str(self.root), *args], capture_output=True,
-                              stdin=subprocess.DEVNULL, timeout=120)
+        """A read-only Git call on the host. It uses safe config and the pinned Git folder."""
+        proc = subprocess.run(host_git_argv(*args, work_tree=self.root, git_dir=self.git_dir),
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=120, env=host_git_env())
         return proc.returncode, proc.stdout
+
+    def _git_fenced(self, *args: str) -> int:
+        """A Git call that changes the index or files. It runs inside the bwrap fence."""
+        from .sandbox import LinuxSandbox
+        try:
+            with LinuxSandbox(self.root, git_dir=self.git_dir, common_dir=self.common_dir) as fence:
+                return subprocess.run(fence.argv("git " + " ".join(shlex.quote(a) for a in args)),
+                                      capture_output=True, stdin=subprocess.DEVNULL, timeout=120,
+                                      env=fence_env()).returncode
+        except Exception:
+            return 1
 
     def _rev(self) -> str:
         rc, out = self._git("rev-parse", "--verify", "-q", "HEAD")
@@ -471,6 +554,20 @@ class BashGuard:
                 if bad:
                     return f"tee target refused: {bad}"
         if cmd == "git":
+            gargs = [a for a in args if not a.startswith("-")]
+            verb = next((i for i, a in enumerate(args) if not a.startswith("-")
+                         and (i == 0 or args[i - 1] not in ("-C", "--git-dir", "--work-tree", "--exec-path", "-c"))), None)
+            if any(a in ("--exec-path", "--work-tree", "--git-dir", "-C") for a in args):
+                return "Git directory and execution options are reserved for the runtime"
+            subcommand = args[verb] if verb is not None else ""
+            if subcommand in ("update-ref", "symbolic-ref", "worktree", "remote", "tag", "stash"):
+                return f"git {subcommand} is confined to the leased branch and is refused"
+            if subcommand == "branch" and (not gargs or len(gargs) > 1 or any(a.startswith("-") for a in args)):
+                return "git branch mutations are confined to the runtime"
+            if subcommand in ("checkout", "switch") and any(a in ("-b", "-B", "-c", "-C", "--orphan", "--detach") for a in args):
+                return "a shell cannot create or detach a leased branch"
+            if any(a in ("--global", "--system", "--file", "-f") for a in args if subcommand == "config"):
+                return "only local leased config is permitted"
             for j, arg in enumerate(args):
                 value = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else None
                 if arg in ("-C", "--git-dir", "--work-tree") and j + 1 < len(args):
@@ -567,15 +664,14 @@ class BashGuard:
                 pass
             return False
         if not is_orig and (xy[0] in "AC" or (xy[0] == "R")):
-            self._git("rm", "-f", "--cached", "-q", "--", rel)
+            self._git_fenced("rm", "-f", "--cached", "-q", "--", rel)
             try:
                 if os.path.lexists(full):
                     full.unlink()
             except OSError:
                 return False
             return True
-        rc, _ = self._git("checkout", "HEAD", "--", rel)
-        return rc == 0
+        return self._git_fenced("checkout", "HEAD", "--", rel) == 0
 
     def reconcile(self) -> tuple[list[str], list[str]]:
         """Compare with the baseline. Revert new unowned changes. Return (reverted, errors)."""
@@ -592,7 +688,7 @@ class BashGuard:
                 self.head = now
             else:
                 branch = self._git("symbolic-ref", "-q", "HEAD")[1].decode().strip()
-                rc = self._git("reset", "--soft", self.head)[0] if branch == self.branch else 1
+                rc = self._git_fenced("reset", "--soft", self.head) if branch == self.branch else 1
                 if rc == 0:
                     reverted.append("HEAD")
                 else:
@@ -883,10 +979,9 @@ class LiteHarness:
         wanted = inp.get("timeout_sec")
         wanted = wanted if isinstance(wanted, int) and not isinstance(wanted, bool) and wanted > 0 else 180
         limit = max(1.0, min(float(wanted), float(self.bash_max_sec), deadline - self.clock()))
-        env = {k: os.environ[k] for k in CHILD_ENV if k in os.environ}
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env = fence_env()
         from .sandbox import LinuxSandbox
-        with LinuxSandbox(self.root) as fence:
+        with LinuxSandbox(self.root, git_dir=self.guard.git_dir, common_dir=self.guard.common_dir) as fence:
             proc = subprocess.Popen(fence.argv(cmd), cwd=str(self.root), env=env, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
             try:

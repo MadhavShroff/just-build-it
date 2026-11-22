@@ -187,7 +187,7 @@ class OperatingSystemFence(Base):
     def test_outside_worktree_write_is_absent_and_lease_write_survives(self):
         from claude_mux_lite.sandbox import LinuxSandbox
         outside = self.tmp / "external.txt"
-        sibling = self.tmp / "sibling.txt"
+        sibling = Path("/var/tmp") / f"jbi-sibling-{os.getpid()}.txt"
         with LinuxSandbox(self.repo) as fence:
             good = subprocess.run(fence.argv("printf good > src/owned.txt && mkdir -p .git/testdir"),
                                   capture_output=True, text=True)
@@ -196,13 +196,112 @@ class OperatingSystemFence(Base):
             temp = subprocess.run(fence.argv("mkdir -p \"$TMPDIR/scratch-task\" && printf local > \"$TMPDIR/scratch-task/x\""),
                                   capture_output=True, text=True)
         self.assertEqual(good.returncode, 0, good.stderr)
-        self.assertNotEqual(bad.returncode, 0)
+        self.assertFalse(outside.exists())      # /tmp is a private tmpfs: the write never reaches the host
         self.assertNotEqual(parent.returncode, 0)
-        self.assertFalse(outside.exists())
         self.assertFalse(sibling.exists())
         self.assertTrue((self.repo / "src/owned.txt").exists())
         self.assertTrue((self.repo / ".git/testdir").is_dir())
         self.assertEqual(temp.returncode, 0)
+
+
+def linked_worktree(root: Path, repo: Path, name: str = "t1") -> Path:
+    path = root / "wts" / name
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", f"jbi/{name}", str(path)],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "branch", "jbi/other"], check=True, capture_output=True)
+    return path
+
+
+class GitFence(Base):
+    """H1 and M6: the shared Git config, hooks and scratch stay out of the agent's reach."""
+
+    def setUp(self):
+        super().setUp()
+        self.work = linked_worktree(self.tmp, self.repo)
+        self.marker = Path("/var/tmp") / f"jbi-marker-{os.getpid()}-{self.id().split('.')[-1]}"
+        self.addCleanup(lambda: self.marker.exists() and self.marker.unlink())
+
+    def shell(self, command, work=None):
+        from claude_mux_lite.sandbox import LinuxSandbox
+        with LinuxSandbox(work or self.work) as fence:
+            return subprocess.run(fence.argv(command), capture_output=True, text=True, timeout=60)
+
+    def test_fsmonitor_config_write_refuses_and_host_status_makes_no_marker(self):
+        attack = self.shell(f"git config --local core.fsmonitor 'touch {self.marker}; false'")
+        self.assertNotEqual(attack.returncode, 0)
+        config = (self.repo / ".git" / "config").read_text()
+        self.assertNotIn("fsmonitor", config)
+        out = subprocess.run(H.host_git_argv("status", "--porcelain", work_tree=self.work),
+                             capture_output=True, text=True, env=H.host_git_env())
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_host_helper_ignores_a_planted_fsmonitor_and_hook(self):
+        # Plant the attack with host privileges. The helper must still not run it.
+        subprocess.run(["git", "-C", str(self.work), "config", "core.fsmonitor",
+                        f"touch {self.marker}; false"], check=True)
+        out = subprocess.run(H.host_git_argv("status", "--porcelain", work_tree=self.work),
+                             capture_output=True, text=True, env=H.host_git_env())
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_owned_git_writes_succeed_in_a_linked_worktree(self):
+        done = self.shell("printf one > src.txt && git add src.txt && "
+                          "git -c user.name=a -c user.email=b commit -qm one && git status --short")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        log = subprocess.run(["git", "-C", str(self.repo), "log", "--format=%s", "jbi/t1"],
+                             capture_output=True, text=True).stdout.split()
+        self.assertEqual(log[0], "one")
+
+    def test_second_task_branch_and_hooks_and_config_are_read_only(self):
+        self.assertEqual(self.shell("git -c user.name=a -c user.email=b commit -q --allow-empty -m next").returncode, 0)
+        before = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/other"],
+                                capture_output=True, text=True).stdout
+        for command in ("git update-ref refs/heads/jbi/other HEAD",
+                        "printf x > \"$(git rev-parse --git-common-dir)/hooks/pre-commit\"",
+                        "git branch -f jbi/other HEAD",
+                        "git config core.hooksPath /tmp"):
+            done = self.shell(command)
+            self.assertNotEqual(done.returncode, 0, command)
+        self.assertNotIn("hooksPath", (self.repo / ".git" / "config").read_text())
+        after = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/other"],
+                               capture_output=True, text=True).stdout
+        self.assertEqual(before, after)
+
+    def test_plain_repository_still_commits(self):
+        done = self.shell("printf one > src/z.txt && git add src/z.txt && "
+                          "git -c user.name=a -c user.email=b commit -qm z", work=self.repo)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(subprocess.run(["git", "-C", str(self.repo), "log", "-1", "--format=%s"],
+                                        capture_output=True, text=True).stdout.strip(), "z")
+
+    def test_host_worktree_helper_ignores_planted_fsmonitor_and_hooks(self):
+        from jbi import worktrees as wt
+        subprocess.run(["git", "-C", str(self.work), "config", "core.fsmonitor",
+                        f"touch {self.marker}; false"], check=True)
+        hooks = self.repo / ".git" / "hooks"
+        (hooks / "status").write_text(f"#!/bin/sh\ntouch {self.marker}\n")
+        (hooks / "status").chmod(0o755)
+        self.assertEqual(wt.dirty_paths(self.work), [])
+        self.assertFalse(self.marker.exists())
+
+    def test_unrelated_new_branch_is_refused(self):
+        guard = H.BashGuard(self.work, ["src"])
+        for command in ("git update-ref refs/heads/evil HEAD", "git checkout -b evil", "git branch evil"):
+            self.assertIsNotNone(guard.check(command), command)
+        self.assertFalse(subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "-q",
+                                        "refs/heads/evil"], capture_output=True).stdout)
+
+    def test_host_tmp_of_another_task_is_absent_and_own_scratch_works(self):
+        other = Path(tempfile.mkdtemp(prefix="other-task-", dir="/tmp"))
+        self.addCleanup(lambda: shutil.rmtree(other, ignore_errors=True))
+        (other / "secret").write_text("host-secret")
+        done = self.shell(f"cat {other}/secret; ls {other}; "
+                          "printf mine > \"$TMPDIR/own\" && cat \"$TMPDIR/own\"")
+        self.assertNotIn("host-secret", done.stdout)
+        self.assertIn("mine", done.stdout)
+        listing = self.shell("ls /tmp")
+        self.assertNotIn(other.name, listing.stdout)
 
 
 class Tools(Base):

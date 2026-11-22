@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -11,9 +12,25 @@ from jbi.store import now
 from jbi.tracking import Tracking
 
 
+def bootstrap(spec_path: str) -> int:
+    """Read the real credentials once, start the private broker, then exec the neutral child.
+
+    This mode never opens the spec contents and never touches tracking."""
+    from . import credentials
+    try:
+        extra = credentials.start_broker(Path(spec_path).resolve().parent, os.environ)
+    except credentials.BrokerError as error:
+        print(f"credential broker failed: {error}", file=sys.stderr)
+        return 3
+    credentials.exec_child(spec_path, os.environ, extra)
+    return 3                                    # not reached: exec replaced this process
+
+
 def main(arguments: list[str]) -> int:
+    if len(arguments) == 2 and arguments[0] == "--bootstrap":
+        return bootstrap(arguments[1])
     if len(arguments) != 1:
-        print("usage: python -m claude_mux_lite SPEC.json", file=sys.stderr)
+        print("usage: python -m claude_mux_lite [--bootstrap] SPEC.json", file=sys.stderr)
         return 2
     spec = json.loads(Path(arguments[0]).read_text(encoding="utf-8"))
     tracking_path = Path(spec["tracking"])
@@ -27,8 +44,9 @@ def main(arguments: list[str]) -> int:
     history: list[dict] = []
     usage_path = Path(spec["usage_path"])
     try:
+        history_key = spec.get("history_session_id") or spec["session_id"]
         if spec.get("continuation"):
-            history = tracking.session_history(spec["session_id"])
+            history = tracking.session_history(history_key)
         def inbox() -> str:
             text = []
             for message in tracking.pending_messages(spec["session_id"]):
@@ -50,8 +68,8 @@ def main(arguments: list[str]) -> int:
         tracking.record_cost(dispatch, input_tokens=result.usage.input_tokens,
                              output_tokens=result.usage.output_tokens, cache_read=result.usage.cache_read,
                              cache_write=result.usage.cache_write)
-        if spec.get("continuation") and history:
-            tracking.record_session_history(spec["session_id"], strip_marks(history), status="idle")
+        if history:
+            tracking.record_session_history(history_key, strip_marks(history), status="idle")
         usage = {"dispatch_id": dispatch, "input_tokens": result.usage.input_tokens,
                  "output_tokens": result.usage.output_tokens, "cache_read": result.usage.cache_read,
                  "cache_write": result.usage.cache_write, "exit_code": result.exit_code,

@@ -235,6 +235,26 @@ class Tracking:
         out["owns"] = json.loads(out["owns"])
         return out
 
+    def get_task(self, task_id: str) -> dict | None:
+        """Read one task without loading the fleet. Unknown tasks return None."""
+        _check_id(task_id, "task")
+        row = self._one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        return self._task_dict(row) if row is not None else None
+
+    def start_history_session(self, session_id: str, node: str | None = None) -> dict:
+        """Create one task-stage history endpoint. Existing history never moves."""
+        _check_id(session_id, "session")
+        stamp = _now()
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row is None:
+                db.execute("INSERT INTO sessions (id,node,history,status,created_at,updated_at) "
+                           "VALUES (?,?,'[]','idle',?,?)", (session_id, node, stamp, stamp))
+                row = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+            elif node is not None and row["node"] is not None and row["node"] != node:
+                raise LeaseError(f"history session {session_id} belongs to node {row['node']}, not {node}")
+            return dict(row)
+
     def table_names(self) -> list[str]:
         """Return the sorted table names of the store."""
         rows = self._all("SELECT name FROM sqlite_master WHERE type='table' "
@@ -479,15 +499,62 @@ class Tracking:
         stamp = _now()
         with self._tx() as db:
             self._task(task_id, db)
+            if state != "submitted":
+                dup = None
+                for old in db.execute("SELECT * FROM ci_submissions WHERE task_id=? AND pr_number=? "
+                                      "AND head_sha=? AND state=? ORDER BY id", (task_id, pr_number, head_sha, state)):
+                    if (old["green_run"] == green_run and old["service_reply"] == json.dumps(service_reply, sort_keys=True)
+                            and squash_sha in (None, old["squash_sha"])):
+                        dup = old["id"]
+                        break
+                if dup is not None:
+                    self._settle(db, task_id, service_reply, state, stamp, keep=dup)
+                    row = dict(db.execute("SELECT * FROM ci_submissions WHERE id=?", (dup,)).fetchone())
+                    row["service_reply"] = json.loads(row["service_reply"])
+                    return row
             cur = db.execute("INSERT INTO ci_submissions (task_id,pr_number,head_sha,base_commit,"
                              "service_reply,green_run,squash_sha,state,created_at,updated_at) "
                              "VALUES (?,?,?,?,?,?,?,?,?,?)",
                              (task_id, pr_number, head_sha, base_commit,
                               json.dumps(service_reply, sort_keys=True), green_run, squash_sha, state,
                               stamp, stamp))
+            if state != "submitted":
+                self._settle(db, task_id, service_reply, state, stamp, keep=cur.lastrowid)
             row = dict(db.execute("SELECT * FROM ci_submissions WHERE id=?", (cur.lastrowid,)).fetchone())
             row["service_reply"] = json.loads(row["service_reply"])
             return row
+
+    @staticmethod
+    def _job_keys(task_id: str, reply: Any) -> set:
+        """Return the job identities of one service reply: its job text and its bound PR and head."""
+        keys: set = set()
+        if not isinstance(reply, dict):
+            return keys
+        job = reply.get("job")
+        if isinstance(job, str) and job.strip():
+            keys.add(("job", job.strip()))
+        bound = reply.get("bound")
+        if isinstance(bound, dict) and bound.get("task") == task_id:
+            head, pr = bound.get("head_sha"), bound.get("pr_number")
+            if isinstance(head, str) and head.strip() and isinstance(pr, int) and not isinstance(pr, bool):
+                keys.add(("bound", pr, head))
+        return keys
+
+    def _settle(self, db: sqlite3.Connection, task_id: str, reply: Any, state: str, stamp: str,
+                keep: int) -> None:
+        """Finish the earlier submitted rows of the same job. Other jobs and terminal rows stay."""
+        wanted = self._job_keys(task_id, reply)
+        if not wanted:
+            return
+        for row in db.execute("SELECT id, service_reply FROM ci_submissions WHERE task_id=? "
+                              "AND state='submitted' AND id<>?", (task_id, keep)).fetchall():
+            try:
+                have = self._job_keys(task_id, json.loads(row["service_reply"]))
+            except (TypeError, ValueError):
+                continue
+            if have & wanted:
+                db.execute("UPDATE ci_submissions SET state=?, updated_at=? WHERE id=?",
+                           (state, stamp, row["id"]))
 
     def pending_ci(self, task_id: str) -> list[dict]:
         """Return submitted CI records whose direct job evidence has not arrived."""
@@ -514,7 +581,11 @@ class Tracking:
         with self._tx() as db:
             task = self._task(task_id, db)
             if task["state"] == "merged":
-                raise LeaseError(f"task {task_id} is already merged")
+                prior = db.execute("SELECT * FROM merges WHERE task_id=?", (task_id,)).fetchone()
+                if (prior is not None and prior["pr_number"] == pr_number and prior["head_sha"] == head_sha
+                        and prior["squash_sha"] == squash_sha and prior["green_run"] == green_run):
+                    return {"task": task, "merge": dict(prior)}
+                raise LeaseError(f"task {task_id} is already merged with different evidence")
             rows = db.execute("SELECT * FROM ci_submissions WHERE task_id=? AND pr_number=? AND head_sha=? "
                               "AND state='green' ORDER BY id DESC", (task_id, pr_number, head_sha)).fetchall()
             good = [r for r in rows if (r["green_run"] or "").strip() == green_run
@@ -523,6 +594,7 @@ class Tracking:
                 raise LeaseError(f"task {task_id} has no green CI record with evidence for PR {pr_number} "
                                  f"head {head_sha[:12]}")
             for row in good:
+                self._settle(db, task_id, json.loads(row["service_reply"]), "green", stamp, keep=row["id"])
                 if row["squash_sha"] is None:
                     db.execute("UPDATE ci_submissions SET squash_sha=?, updated_at=? WHERE id=?",
                                (squash_sha, stamp, row["id"]))
