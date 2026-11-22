@@ -182,6 +182,11 @@ class Tracking:
         self._db.execute("PRAGMA busy_timeout=10000")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(dispatches)")}
+        if "continuation" not in columns:
+            if "warm" not in columns:
+                raise LeaseError("dispatches table has no mode column")
+            self._db.execute("ALTER TABLE dispatches RENAME COLUMN warm TO continuation")
         for suffix in ("-wal", "-shm"):
             side = Path(str(self.path) + suffix)
             if side.exists():
@@ -565,7 +570,7 @@ class Tracking:
             attempt = db.execute("SELECT COUNT(*) FROM dispatches WHERE task_id=?",
                                  (task_id,)).fetchone()[0] + 1
             cur = db.execute("INSERT INTO dispatches (task_id,session_id,attempt,model,continuation,brief_digest,"
-                             "started_at,receipt,verdict) VALUES (?,?,?,?,?,?,?,?)",
+                             "started_at,receipt,verdict) VALUES (?,?,?,?,?,?,?,?,?)",
                              (task_id, lease["session_id"], attempt, model, 1 if continuation else 0,
                               brief_digest, stamp, receipt, verdict))
             return {"dispatch_id": cur.lastrowid, "task": self._task(task_id, db),
