@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 
 from .harness import LiteHarness, redact, strip_marks
-from ..jbi.store import now
-from ..jbi.tracking import Tracking
+from jbi.store import now
+from jbi.tracking import Tracking
 
 
 def main(arguments: list[str]) -> int:
@@ -16,7 +16,14 @@ def main(arguments: list[str]) -> int:
         print("usage: python -m claude_mux_lite SPEC.json", file=sys.stderr)
         return 2
     spec = json.loads(Path(arguments[0]).read_text(encoding="utf-8"))
-    tracking = Tracking(Path(spec["tracking"]))
+    tracking_path = Path(spec["tracking"])
+    usage_path = Path(spec["usage_path"])
+    if not tracking_path.is_file():
+        usage_path.parent.mkdir(parents=True, exist_ok=True)
+        usage_path.write_text(json.dumps({"exit_code": 3,
+                                         "final_text": "internal store is missing", "ended_at": now()}))
+        return 3
+    tracking = Tracking(tracking_path)
     history: list[dict] = []
     usage_path = Path(spec["usage_path"])
     try:
