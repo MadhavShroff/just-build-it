@@ -24,8 +24,14 @@ from .worktrees import GitError, git
 
 ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 GLOB_CHARS = "*?["
 CI_STATES = ("submitted", "green", "failed")
+TASK_STATES = ("created", "dispatched", "running", "verifying", "queued", "merging", "merged",
+               "failed", "paused", "blocked", "abandoned")
+SESSION_STATUSES = ("idle", "busy", "reset", "failed", "ended")
+DELIVERY_STATES = ("queued", "sent", "delivered", "failed", "read")
+HISTORY_ROLES = ("user", "assistant", "system")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -88,6 +94,12 @@ def _check_id(value: Any, what: str) -> str:
 def _check_sha(value: Any, what: str) -> str:
     if not isinstance(value, str) or not SHA_RE.match(value):
         raise InvalidInput(f"bad {what} commit id: {value!r}")
+    return value
+
+
+def _check_sha40(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not SHA40_RE.match(value):
+        raise InvalidInput(f"bad {what} commit id: {value!r}. A full 40 character id is required")
     return value
 
 
@@ -447,13 +459,16 @@ class Tracking:
         _check_sha(head_sha, "head")
         _check_sha(base_commit, "base")
         if squash_sha is not None:
-            _check_sha(squash_sha, "squash")
+            _check_sha40(squash_sha, "squash")
         if not isinstance(service_reply, dict):
             raise InvalidInput("service_reply must be a dict")
         if state not in CI_STATES:
             raise InvalidInput(f"state must be one of {CI_STATES}")
         if green_run is not None and not isinstance(green_run, str):
             raise InvalidInput("green_run must be text or None")
+        if state == "green" and (not green_run or not green_run.strip()
+                                 or green_run.strip().lower() == "green"):
+            raise InvalidInput("a green CI record needs run evidence text, not the word green")
         stamp = _now()
         with self._tx() as db:
             self._task(task_id, db)
@@ -473,7 +488,7 @@ class Tracking:
         _check_sha(head_sha, "head")
         if not isinstance(squash_sha, str) or not squash_sha.strip():
             raise LeaseError(f"merge of task {task_id} needs a squash sha")
-        _check_sha(squash_sha, "squash")
+        _check_sha40(squash_sha, "squash")
         if not isinstance(green_run, str) or not green_run.strip():
             raise LeaseError(f"merge of task {task_id} needs a green run")
         stamp = _now()
@@ -488,11 +503,169 @@ class Tracking:
             if not good:
                 raise LeaseError(f"task {task_id} has no green CI record with evidence for PR {pr_number} "
                                  f"head {head_sha[:12]}")
+            for row in good:
+                if row["squash_sha"] is None:
+                    db.execute("UPDATE ci_submissions SET squash_sha=?, updated_at=? WHERE id=?",
+                               (squash_sha, stamp, row["id"]))
             db.execute("INSERT INTO merges (task_id,pr_number,head_sha,squash_sha,green_run,merged_at) "
                        "VALUES (?,?,?,?,?,?)", (task_id, pr_number, head_sha, squash_sha, green_run, stamp))
             db.execute("UPDATE tasks SET state='merged', updated_at=? WHERE id=?", (stamp, task_id))
             return {"task": self._task(task_id, db),
                     "merge": dict(db.execute("SELECT * FROM merges WHERE task_id=?", (task_id,)).fetchone())}
+
+    # ---- stage persistence --------------------------------------------------------------
+
+    def ensure_task(self, *, task_id: str, title: str, goal: str = "", owns: Iterable[str],
+                    branch: str, worktree: Path, base_commit: str, node: str | None = None) -> dict:
+        """Register one task before any agent runs. Repeat calls with equal fields return the record."""
+        _check_id(task_id, "task")
+        with self._lock:
+            row = self._one("SELECT 1 FROM tasks WHERE id=?", (task_id,))
+        if row is None:
+            try:
+                return self.create_task(title=title, goal=goal, owns=owns, branch=branch,
+                                        worktree=worktree, base_commit=base_commit,
+                                        task_id=task_id, node=node)
+            except LeaseError:
+                if not self._one("SELECT 1 FROM tasks WHERE id=?", (task_id,)):
+                    raise
+        _check_sha(base_commit, "base")
+        owned = normalize_owns(owns)
+        task = self._task(task_id)
+        for name, want, have in (("title", title, task["title"]), ("owns", owned, task["owns"]),
+                                 ("branch", branch, task["branch"]),
+                                 ("worktree", str(worktree), task["worktree"]),
+                                 ("base_commit", base_commit, task["base_commit"])):
+            if want != have:
+                raise LeaseError(f"task {task_id} exists with a different {name}: "
+                                 f"{have!r}, not {want!r}")
+        return task
+
+    def renew_dispatch(self, task_id: str, *, model: str | None = None,
+                       brief_digest: str | None = None, verdict: str | None = None,
+                       receipt: str | None = None) -> dict:
+        """Append one dispatch under the live lease. The lease, owns, and task state stay as they are."""
+        _check_id(task_id, "task")
+        for name, value in (("model", model), ("brief_digest", brief_digest),
+                            ("verdict", verdict), ("receipt", receipt)):
+            if value is not None and not isinstance(value, str):
+                raise InvalidInput(f"{name} must be text or None")
+        stamp = _now()
+        with self._tx() as db:
+            self._task(task_id, db)
+            lease = self._live_lease(task_id, db)
+            if lease is None:
+                raise LeaseError(f"task {task_id} has no live lease to renew")
+            db.execute("UPDATE dispatches SET finished_at=?, verdict='ended' "
+                       "WHERE task_id=? AND finished_at IS NULL", (stamp, task_id))
+            attempt = db.execute("SELECT COUNT(*) FROM dispatches WHERE task_id=?",
+                                 (task_id,)).fetchone()[0] + 1
+            cur = db.execute("INSERT INTO dispatches (task_id,session_id,attempt,model,warm,brief_digest,"
+                             "started_at,receipt,verdict) VALUES (?,?,?,?,1,?,?,?,?)",
+                             (task_id, lease["session_id"], attempt, model, brief_digest, stamp,
+                              receipt, verdict))
+            return {"dispatch_id": cur.lastrowid, "task": self._task(task_id, db),
+                    "dispatch": dict(db.execute("SELECT * FROM dispatches WHERE id=?",
+                                                (cur.lastrowid,)).fetchone()),
+                    "lease": lease}
+
+    def finish_dispatch(self, dispatch_id: int, *, verdict: str, receipt: str | None = None) -> None:
+        """Close one dispatch with a verdict and an optional receipt."""
+        if isinstance(dispatch_id, bool) or not isinstance(dispatch_id, int):
+            raise InvalidInput("dispatch_id must be an integer")
+        if not isinstance(verdict, str) or not verdict.strip():
+            raise InvalidInput("verdict is empty")
+        if receipt is not None and not isinstance(receipt, str):
+            raise InvalidInput("receipt must be text or None")
+        with self._tx() as db:
+            if db.execute("SELECT 1 FROM dispatches WHERE id=?", (dispatch_id,)).fetchone() is None:
+                raise LeaseError(f"dispatch {dispatch_id} is unknown")
+            db.execute("UPDATE dispatches SET finished_at=?, verdict=?, receipt=COALESCE(?,receipt) "
+                       "WHERE id=?", (_now(), verdict, receipt, dispatch_id))
+
+    def record_session_history(self, session_id: str, history: list[dict], *,
+                               status: str | None = None) -> None:
+        """Store message history as compact sorted JSON. The caller keeps credentials out."""
+        _check_id(session_id, "session")
+        if not isinstance(history, list):
+            raise InvalidInput("history must be a list")
+        for i, entry in enumerate(history):
+            if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                raise InvalidInput(f"history entry {i} needs role and content")
+            if entry["role"] not in HISTORY_ROLES:
+                raise InvalidInput(f"history entry {i} has bad role {entry['role']!r}")
+            if not isinstance(entry["content"], (str, list, dict)):
+                raise InvalidInput(f"history entry {i} content must be text, list, or dict")
+        if status is not None and status not in SESSION_STATUSES:
+            raise InvalidInput(f"status must be one of {SESSION_STATUSES}")
+        try:
+            blob = json.dumps(history, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise InvalidInput(f"history is not JSON: {exc}") from exc
+        with self._tx() as db:
+            if db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
+                raise LeaseError(f"session {session_id} is unknown")
+            db.execute("UPDATE sessions SET history=?, status=COALESCE(?,status), updated_at=? WHERE id=?",
+                       (blob, status, _now(), session_id))
+
+    def session_history(self, session_id: str) -> list[dict]:
+        """Return a fresh copy of the stored history. An unknown session gives an empty list."""
+        _check_id(session_id, "session")
+        row = self._one("SELECT history FROM sessions WHERE id=?", (session_id,))
+        if row is None or not row["history"]:
+            return []
+        return json.loads(row["history"])
+
+    def message_receipt(self, message_id: int, status: str, receipt: str = "") -> None:
+        """Record a delivery state. A queued or failed row never moves to read directly."""
+        if isinstance(message_id, bool) or not isinstance(message_id, int):
+            raise InvalidInput("message_id must be an integer")
+        if status not in DELIVERY_STATES:
+            raise InvalidInput(f"status must be one of {DELIVERY_STATES}")
+        if not isinstance(receipt, str):
+            raise InvalidInput("receipt must be text")
+        with self._tx() as db:
+            row = db.execute("SELECT delivery_state FROM messages WHERE id=?", (message_id,)).fetchone()
+            if row is None:
+                raise LeaseError(f"message {message_id} is unknown")
+            if status == "read" and row["delivery_state"] not in ("delivered", "read"):
+                raise LeaseError(f"message {message_id} is {row['delivery_state']}. "
+                                 "It must be delivered before read")
+            db.execute("UPDATE messages SET delivery_state=?, receipt=? WHERE id=?",
+                       (status, receipt, message_id))
+
+    def pending_messages(self, session_id: str) -> list[dict]:
+        """Return queued rows for one session in id order. The rows stay queued."""
+        _check_id(session_id, "session")
+        return self._all("SELECT * FROM messages WHERE target=? AND delivery_state='queued' ORDER BY id",
+                         (session_id,))
+
+    def mark_task_state(self, task_id: str, state: str) -> dict:
+        """Set a task state. Only record_merge sets merged."""
+        _check_id(task_id, "task")
+        if state not in TASK_STATES:
+            raise InvalidInput(f"state must be one of {TASK_STATES}")
+        if state == "merged":
+            raise LeaseError(f"task {task_id} cannot be set to merged here. record_merge is the only setter")
+        with self._tx() as db:
+            task = self._task(task_id, db)
+            if task["state"] == "merged":
+                raise LeaseError(f"task {task_id} is merged and keeps that state")
+            if state == "dispatched" and self._live_lease(task_id, db) is None:
+                raise LeaseError(f"task {task_id} has no live lease and cannot be dispatched")
+            db.execute("UPDATE tasks SET state=?, updated_at=? WHERE id=?", (state, _now(), task_id))
+            return self._task(task_id, db)
+
+    def mark_session_status(self, session_id: str, status: str) -> None:
+        """Set a session status. An unknown session raises."""
+        _check_id(session_id, "session")
+        if status not in SESSION_STATUSES:
+            raise InvalidInput(f"status must be one of {SESSION_STATUSES}")
+        with self._tx() as db:
+            if db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
+                raise LeaseError(f"session {session_id} is unknown")
+            db.execute("UPDATE sessions SET status=?, updated_at=? WHERE id=?",
+                       (status, _now(), session_id))
 
     # ---- reads -------------------------------------------------------------------------
 

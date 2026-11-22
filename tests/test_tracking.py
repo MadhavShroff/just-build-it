@@ -321,5 +321,144 @@ class Merge(Base):
             self.tr.record_ci("t1", pr_number=1, head_sha="xyz", base_commit=self.base, service_reply={})
 
 
+class Stages(Base):
+    def ensure(self, **kw):
+        args = dict(task_id="t1", title="t1", owns=["src/a"], branch="jbi/t1",
+                    worktree=self.tmp / "wts" / "t1", base_commit=self.base)
+        args.update(kw)
+        return self.tr.ensure_task(**args)
+
+    def test_ensure_task_idempotent_and_mismatch(self):
+        wt.create_worktree(self.repo, "t1", "main", self.tmp / "wts")
+        first = self.ensure()
+        self.assertEqual(self.ensure(), first)
+        for kw in ({"owns": ["src/b"]}, {"branch": "x"}, {"worktree": self.tmp},
+                   {"title": "other"}, {"base_commit": "a" * 40}):
+            with self.assertRaises(LeaseError, msg=str(kw)):
+                self.ensure(**kw)
+        self.assertEqual(len(self.tr.fleet()["tasks"]), 1)
+
+    def test_renew_dispatch_keeps_one_lease(self):
+        self.make_task()
+        with self.assertRaises(LeaseError):
+            self.tr.renew_dispatch("t1")
+        first = self.dispatch()
+        out = self.tr.renew_dispatch("t1", model="m", brief_digest="d")
+        self.assertEqual(out["dispatch"]["attempt"], 2)
+        self.assertEqual(out["dispatch"]["session_id"], "s1")
+        self.assertEqual(out["lease"]["id"], first["lease"]["id"])
+        fleet = self.tr.fleet()
+        self.assertEqual(len(fleet["leases"]), 1)
+        self.assertEqual(fleet["tasks"][0]["state"], "dispatched")
+        old = [d for d in fleet["dispatches"] if d["id"] == first["dispatch_id"]][0]
+        self.assertEqual(old["verdict"], "ended")
+        self.tr.finish_dispatch(out["dispatch_id"], verdict="pass", receipt="r")
+        done = self.tr.fleet()["dispatches"][-1]
+        self.assertEqual((done["verdict"], done["receipt"]), ("pass", "r"))
+        with self.assertRaises(LeaseError):
+            self.tr.finish_dispatch(999, verdict="x")
+
+    def test_redispatch_after_release_granted(self):
+        path = self.make_task()
+        self.dispatch()
+        self.commit_in(path)
+        self.tr.release("t1", reason="abandon", abandon=True)
+        with self.assertRaises(LeaseError):
+            self.tr.renew_dispatch("t1")
+        wt.git(path, "checkout", "-q", "-b", "jbi/t1")
+        self.assertEqual(self.dispatch()["dispatch"]["attempt"], 2)
+
+    def test_session_history_roundtrip(self):
+        self.make_task()
+        self.dispatch()
+        self.assertEqual(self.tr.session_history("ghost"), [])
+        hist = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "text"}]}]
+        self.tr.record_session_history("s1", hist, status="reset")
+        got = self.tr.session_history("s1")
+        self.assertEqual(got, hist)
+        got[0]["content"] = "changed"
+        self.assertEqual(self.tr.session_history("s1"), hist)
+        raw = self.tr._db.execute("SELECT history FROM sessions WHERE id='s1'").fetchone()[0]
+        self.assertEqual(raw, json.dumps(hist, sort_keys=True, separators=(",", ":")))
+        self.assertEqual(self.tr.fleet()["sessions"][0]["status"], "reset")
+        for bad in ([{"role": "tool", "content": "x"}], [{"role": "user"}], ["x"],
+                    [{"role": "user", "content": 5}], "no"):
+            with self.assertRaises(LeaseError, msg=str(bad)):
+                self.tr.record_session_history("s1", bad)
+        with self.assertRaises(LeaseError):
+            self.tr.record_session_history("s1", hist, status="bogus")
+        with self.assertRaises(LeaseError):
+            self.tr.record_session_history("ghost", hist)
+        with self.assertRaises(LeaseError):
+            self.tr.mark_session_status("ghost", "idle")
+        self.tr.mark_session_status("s1", "ended")
+        self.assertEqual(self.tr.fleet()["sessions"][0]["status"], "ended")
+        with self.assertRaises(LeaseError):
+            self.tr.mark_session_status("s1", "bogus")
+
+    def test_pending_and_receipts(self):
+        self.make_task()
+        self.dispatch()
+        a = self.tr.send("s1", "one")[0]
+        b = self.tr.send("s1", "two")[0]
+        self.assertEqual([m["id"] for m in self.tr.pending_messages("s1")], [a["id"], b["id"]])
+        self.assertEqual([m["id"] for m in self.tr.pending_messages("s1")], [a["id"], b["id"]])
+        with self.assertRaises(LeaseError):
+            self.tr.message_receipt(a["id"], "read")
+        with self.assertRaises(LeaseError):
+            self.tr.message_receipt(a["id"], "seen")
+        with self.assertRaises(LeaseError):
+            self.tr.message_receipt(999, "sent")
+        self.tr.message_receipt(a["id"], "sent", "r1")
+        self.assertEqual([m["id"] for m in self.tr.pending_messages("s1")], [b["id"]])
+        self.tr.message_receipt(a["id"], "delivered")
+        self.tr.message_receipt(a["id"], "read")
+
+    def test_mark_task_state_rules(self):
+        self.make_task()
+        with self.assertRaises(LeaseError):
+            self.tr.mark_task_state("t1", "dispatched")
+        with self.assertRaises(LeaseError):
+            self.tr.mark_task_state("t1", "merged")
+        with self.assertRaises(LeaseError):
+            self.tr.mark_task_state("t1", "bogus")
+        self.dispatch()
+        self.assertEqual(self.tr.mark_task_state("t1", "running")["state"], "running")
+        self.assertEqual(self.tr.mark_task_state("t1", "dispatched")["state"], "dispatched")
+        self.assertEqual(self.tr.fleet()["merges"], [])
+
+    def test_strict_squash_and_green_evidence(self):
+        path = self.make_task()
+        self.dispatch()
+        head = self.commit_in(path)
+        for bad in ("a" * 64, "abc"):
+            with self.assertRaises(LeaseError):
+                self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base,
+                                  service_reply={"ok": 1}, green_run="run-1", squash_sha=bad, state="green")
+            with self.assertRaises(LeaseError):
+                self.tr.record_merge("t1", 7, head, bad, "run-1")
+        with self.assertRaises(LeaseError):
+            self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base,
+                              service_reply={"ok": 1}, green_run="green", state="green")
+        self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base,
+                          service_reply={"ok": 1}, green_run="run-1", state="green")
+        squash = "b" * 40
+        self.tr.record_merge("t1", 7, head, squash, "run-1")
+        self.assertEqual(self.tr.fleet()["ci_submissions"][0]["squash_sha"], squash)
+        self.assertEqual(self.tr.fleet()["tasks"][0]["state"], "merged")
+        with self.assertRaises(LeaseError):
+            self.tr.mark_task_state("t1", "running")
+
+    def test_merged_release_after_merge(self):
+        path = self.make_task()
+        self.dispatch()
+        head = self.commit_in(path)
+        self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base,
+                          service_reply={"ok": 1}, green_run="run-1", state="green")
+        self.tr.record_merge("t1", 7, head, "c" * 40, "run-1")
+        self.tr.release("t1", reason="merged")
+        self.assertEqual(self.tr.fleet()["tasks"][0]["state"], "merged")
+
+
 if __name__ == "__main__":
     unittest.main()
