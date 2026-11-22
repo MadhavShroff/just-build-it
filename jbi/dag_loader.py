@@ -129,16 +129,16 @@ def _normalize_json_node(node: Any) -> dict[str, Any]:
 # A node may pin the model and provider its stages run on (founder order
 # 2026-11-17: "a way to attach a particular dag node to a particular model and
 # provider"). It is a routing choice, never a speed choice: the scheduler still
-# defaults to the cascade, and an override names one provider for one node.
+# defaults to the account preference, and an override names one provider for one node.
 _OVERRIDE_KEYS = ("prefer", "pin", "profile")
 _PROVIDERS = ("agy", "claude", "codex", "openai-compatible", "simulator")
 
 
 def _validate_override(node: dict[str, Any]) -> None:
-    """Refuse a malformed override, so a typo cannot silently fall back to the cascade.
+    """Refuse a malformed override, so a typo cannot silently fall back to the account preference.
 
     A silent fallback is the dangerous case: a node meant for agy would run on
-    whatever the cascade names, and nothing would say so.
+    whatever the account preference names, and nothing would say so.
     """
     override = node.get("override")
     if override is None:
@@ -371,7 +371,7 @@ def load_tasks(source: str | Path) -> list[dict[str, Any]]:
 
 
 def validate_strict_spec(tasks: list[dict[str, Any]]) -> None:
-    """Enforce self-contained execution spec fields (ported from rswarm PR #26 and dev-pipeline)."""
+    """Enforce self-contained execution spec fields (self-contained spec check)."""
     context_keys = ("contracts", "invariants", "test_cases", "done_criteria", "spec_details")
     for task in tasks:
         tid = str(task.get("id") or "?")

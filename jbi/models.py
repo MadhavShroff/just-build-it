@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
-from . import cascade, rigor
+from . import rigor
 
 CATALOG_PATH = Path(__file__).parent / "data" / "models.json"
 # The providers a stage can actually dispatch on: agents.command builds an argument
@@ -37,7 +37,7 @@ class Choice:
 
 
 class ProviderCooldowns:
-    """Thread-safe per-provider rate-limit cooldown tracker (ported from rswarm PRs #17, #23)."""
+    """Thread-safe per-provider rate-limit cooldown tracker (provider retry helper)."""
 
     def __init__(self, clock=time.monotonic) -> None:
         self._clock = clock
@@ -64,7 +64,7 @@ class ProviderCooldowns:
 
 
 class ProviderPool:
-    """Weighted multi-provider round-robin pool (ported from rswarm PRs #31, #35).
+    """Weighted multi-provider round-robin pool (provider retry helper).
 
     Entries are `(provider, model_or_none)` tuples. Repeating an entry creates a weighted
     ratio (for example, 2:1 agy:claude). Rate-limited providers are skipped while cooling.
@@ -129,27 +129,24 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
            pool: ProviderPool | None = None, cooldowns: ProviderCooldowns | None = None) -> Choice:
     """The provider and model for one stage.
 
-    FOUNDER ORDERS, 2026-11-16 and 2026-11-17. The scheduler sets no model of its
-    own: the cascade decides. A task may then choose between three modes, in
-    order of strength:
+    The scheduler picks a model in this order: the task pin, the task preference
+    list, the provider pool, then the enabled account preference.
 
-    prefer   the task names providers in order. The first one the cascade can
-             serve is used; the cascade's own rung is used when none of them can.
-             This is the "top 2 first, else whatever the cascade says" rule.
     pin      the task names ONE provider and model and runs on nothing else. The
              stage does not start until that model is available. `blocked()`
              answers that question for the supervisor.
-    default  no task key: the cascade's rung, exactly as before.
+    prefer   the task names providers in order. The first usable one wins.
+    pool     the weighted provider pool, when one is supplied.
+    default  the first enabled provider in PREFERENCE order.
 
-    A `pin` is a hard rule. It is the founder's, never the scheduler's: a task
-    that pins a model waits rather than runs somewhere else.
+    A `pin` is a hard rule. A task that pins a model waits rather than runs
+    somewhere else.
     """
     profile = state["config"]["profile"]
     override = (task or {}).get("override") or {}
     profile = override.get("profile") or profile
     tier = rigor.tier_for(profile, role, attempts)
 
-    rung = cascade.read()
     up = usable(state)
 
     # A provider the scheduler cannot dispatch on is not "usable" for this purpose,
@@ -164,7 +161,7 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     if isinstance(pinned, dict) and pinned.get("provider") and pinned.get("model"):
         return _choice(str(pinned["provider"]), str(pinned["model"]), tier)
 
-    # A PREFERENCE list is tried in order, then the pool, then the cascade.
+    # A PREFERENCE list is tried in order, then the pool, then the account preference.
     prefer = override.get("prefer")
     if isinstance(prefer, list) and prefer:
         for want in prefer:
@@ -181,17 +178,12 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
             if provider and provider in up:
                 model = want.get("model") or catalog()["providers"][provider]["models"][tier]
                 return _choice(str(provider), str(model), tier)
-        # None of the preferred providers is usable. Fall through to the pool or cascade.
+        # None of the preferred providers is usable. Fall through to the pool or the account preference.
 
     if pool:
         pooled = pool.next(up, tier, cooldowns=cooldowns)
         if pooled is not None:
             return pooled
-
-    if rung is not None and rung.provider in AGENT_PROVIDERS:
-        if cooldowns is None or not cooldowns.cooling(rung.provider):
-            model = rung.model or catalog()["providers"][rung.provider]["models"][tier]
-            return _choice(rung.provider, model, tier)
 
     healthy = [p for p in up if cooldowns is None or not cooldowns.cooling(p)]
     provider = (healthy or up or ["simulator"])[0]

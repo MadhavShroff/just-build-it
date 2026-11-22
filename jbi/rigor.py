@@ -25,7 +25,7 @@ def _stages(*spec: tuple[str, str, str]) -> tuple[Stage, ...]:
 
 
 # FOUNDER RULE 2026-11-16: every review step runs FOUR reviews in parallel.
-# One on the model the cascade service names as active, and three independent
+# One on the model the account preference names first, and three independent
 # DeepSeek agents. The three are not coordinated with each other or with the
 # first. DeepSeek credits are near-unlimited, so the extra reads cost nothing
 # that matters. This is not a per-task choice and not a rigor-level option.
@@ -91,7 +91,7 @@ LEVELS: dict[str, dict] = {
               "lane_checks": ("build", "lint", "test", "format_check")},
 }
 
-# Role-based reasoning effort defaults (ported from rswarm PRs #2, #6, #35).
+# Role-based reasoning effort defaults (role effort table).
 EFFORT_BY_ROLE: dict[str, str] = {
     "implement": "medium",
     "verify": "high",
@@ -101,7 +101,7 @@ EFFORT_BY_ROLE: dict[str, str] = {
     "bootstrap": "medium",
 }
 
-# Task-effort-scaled timeout and turn ceilings (ported from rswarm 492bb0b, 70393e5).
+# Task-effort-scaled timeout and turn ceilings (effort timeout table).
 TASK_TIMEOUT_BY_EFFORT: dict[str, dict[str, float | int]] = {
     "XS": {"agent_timeout_s": 600.0, "idle_timeout_s": 240.0, "acceptance_timeout_s": 300.0, "max_turns": 36},
     "S":  {"agent_timeout_s": 900.0, "idle_timeout_s": 300.0, "acceptance_timeout_s": 600.0, "max_turns": 60},

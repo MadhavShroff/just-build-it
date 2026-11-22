@@ -1,4 +1,4 @@
-"""Structural error-prevention guards for smaller models (ported from rswarm PR #27).
+"""Structural error-prevention guards for smaller models (structural checks).
 
 Catch syntax errors, destructive file truncations, invalid JSON, and edit-string
 mismatches in milliseconds instead of waiting for a 10-minute test suite to fail.

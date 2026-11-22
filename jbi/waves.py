@@ -51,7 +51,7 @@ def normalize(task: dict) -> dict:
         "wave": 0, "status": "blocked", "stage": None, "attempts": 0,
         # A DAG node's routing override must survive compilation. The supervisor
         # reads the compiled plan, so an override dropped here is an override the
-        # runtime never sees: a pinned node would run on the cascade instead.
+        # runtime never sees: a pinned node would run on the account preference instead.
         "override": dict(task.get("override") or {}),
         "branch": f"jbi/{task['id']}", "commit": None, "receipt": None,
     }
@@ -197,9 +197,9 @@ def _segments_overlap(a: str, b: str) -> bool:
     if not _has_glob(b):
         return fnmatch.fnmatchcase(b, a)
     if "[" not in a and "[" not in b and "?" not in a and "?" not in b:
-        pa, sa = a.split("*", 1)[0], a.rsplit("*", 1)[-1]
-        pb, sb = b.split("*", 1)[0], b.rsplit("*", 1)[-1]
-        return (pa.startswith(pb) or pb.startswith(pa)) and (sa.endswith(sb) or sb.endswith(sa))
+        pa, tail_a = a.split("*", 1)[0], a.rsplit("*", 1)[-1]
+        pb, tail_b = b.split("*", 1)[0], b.rsplit("*", 1)[-1]
+        return (pa.startswith(pb) or pb.startswith(pa)) and (tail_a.endswith(tail_b) or tail_b.endswith(tail_a))
     return True
 
 
@@ -317,10 +317,14 @@ def prioritize_ready(plan: dict[str, Any], ready_ids: Iterable[str] | None = Non
 
 
 def wave_preflight(plan: dict[str, Any], wave_number: int, *,
-                   open_decisions: Iterable[dict[str, Any]] = (),
+                   open_requests: Iterable[dict[str, Any]] = (),
                    repo: Path | None = None, base_branch: str | None = None,
                    required_tools: Iterable[str] = ()) -> dict[str, Any]:
-    """Deterministic Wave Preflight Gate before starting Wave `wave_number`."""
+    """Deterministic Wave Preflight Gate before starting Wave `wave_number`.
+
+    `open_requests` is the one open-request parameter: a list of dicts with
+    `id`, `status`, `task` or `node`, `blocking`, `urgency` and `title`.
+    """
     tasks = plan.get("tasks") or {}
     raw_waves = plan.get("waves") or []
     blockers: list[str] = []
@@ -338,18 +342,18 @@ def wave_preflight(plan: dict[str, Any], wave_number: int, *,
             if dep not in wave_set and dep in tasks and tasks[dep].get("status") != DONE:
                 blockers.append(f"task {tid} depends on unmerged upstream task {dep} ({tasks[dep].get('status')})")
 
-    for decision in open_decisions:
-        if not isinstance(decision, dict):
+    for request in open_requests:
+        if not isinstance(request, dict):
             continue
-        status = str(decision.get("status") or "open").lower()
+        status = str(request.get("status") or "open").lower()
         if status in ("resolved", "closed", "dismissed", "answered"):
             continue
-        target = str(decision.get("task") or decision.get("node") or "")
-        blocking = bool(decision.get("blocking")) or str(decision.get("urgency") or "").lower() == "blocker"
+        target = str(request.get("task") or request.get("node") or "")
+        blocking = bool(request.get("blocking")) or str(request.get("urgency") or "").lower() == "blocker"
         if blocking or (target and (target in wave_set or target in wave_nodes)):
-            did = decision.get("id") or "unknown"
-            title = str(decision.get("title") or "")[:80]
-            blockers.append(f"open decision {did} blocks wave {wave_number}: {title}")
+            did = request.get("id") or "unknown"
+            title = str(request.get("title") or "")[:80]
+            blockers.append(f"open request {did} blocks wave {wave_number}: {title}")
 
     for conflict in detect_wave_owns_conflicts(plan):
         if conflict["wave"] == wave_number:
