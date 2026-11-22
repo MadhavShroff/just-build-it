@@ -260,12 +260,14 @@ class Tracking:
             return self._task(task_id, db)
 
     def dispatch(self, task_id: str, *, session_id: str, owns: Iterable[str], branch: str,
-                 worktree: Path, model: str | None = None, warm: bool = False,
+                 worktree: Path, model: str | None = None, continuation: bool = False,
                  brief_digest: str | None = None) -> dict:
         """Insert the session, the dispatch, and the lease in one transaction."""
         _check_id(task_id, "task")
         _check_id(session_id, "session")
         owned = normalize_owns(owns)
+        if not isinstance(continuation, bool):
+            raise InvalidInput("continuation must be true or false")
         stamp = _now()
         with self._tx() as db:
             task = self._task(task_id, db)
@@ -291,9 +293,9 @@ class Tracking:
                        "ON CONFLICT(id) DO UPDATE SET status='busy', updated_at=excluded.updated_at",
                        (session_id, task["node"], stamp, stamp))
             attempt = db.execute("SELECT COUNT(*) FROM dispatches WHERE task_id=?", (task_id,)).fetchone()[0] + 1
-            cur = db.execute("INSERT INTO dispatches (task_id,session_id,attempt,model,warm,brief_digest,"
+            cur = db.execute("INSERT INTO dispatches (task_id,session_id,attempt,model,continuation,brief_digest,"
                              "started_at) VALUES (?,?,?,?,?,?,?)",
-                             (task_id, session_id, attempt, model, 1 if warm else 0, brief_digest, stamp))
+                             (task_id, session_id, attempt, model, 1 if continuation else 0, brief_digest, stamp))
             dispatch_id = cur.lastrowid
             db.execute("INSERT INTO leases (task_id,session_id,owns,branch,worktree,base_commit,granted_at) "
                        "VALUES (?,?,?,?,?,?,?)",
@@ -543,13 +545,15 @@ class Tracking:
 
     def renew_dispatch(self, task_id: str, *, model: str | None = None,
                        brief_digest: str | None = None, verdict: str | None = None,
-                       receipt: str | None = None) -> dict:
+                       receipt: str | None = None, continuation: bool = True) -> dict:
         """Append one dispatch under the live lease. The lease, owns, and task state stay as they are."""
         _check_id(task_id, "task")
         for name, value in (("model", model), ("brief_digest", brief_digest),
                             ("verdict", verdict), ("receipt", receipt)):
             if value is not None and not isinstance(value, str):
                 raise InvalidInput(f"{name} must be text or None")
+        if not isinstance(continuation, bool):
+            raise InvalidInput("continuation must be true or false")
         stamp = _now()
         with self._tx() as db:
             self._task(task_id, db)
@@ -560,10 +564,10 @@ class Tracking:
                        "WHERE task_id=? AND finished_at IS NULL", (stamp, task_id))
             attempt = db.execute("SELECT COUNT(*) FROM dispatches WHERE task_id=?",
                                  (task_id,)).fetchone()[0] + 1
-            cur = db.execute("INSERT INTO dispatches (task_id,session_id,attempt,model,warm,brief_digest,"
-                             "started_at,receipt,verdict) VALUES (?,?,?,?,0,?,?,?,?)",
-                             (task_id, lease["session_id"], attempt, model, brief_digest, stamp,
-                              receipt, verdict))
+            cur = db.execute("INSERT INTO dispatches (task_id,session_id,attempt,model,continuation,brief_digest,"
+                             "started_at,receipt,verdict) VALUES (?,?,?,?,?,?,?,?)",
+                             (task_id, lease["session_id"], attempt, model, 1 if continuation else 0,
+                              brief_digest, stamp, receipt, verdict))
             return {"dispatch_id": cur.lastrowid, "task": self._task(task_id, db),
                     "dispatch": dict(db.execute("SELECT * FROM dispatches WHERE id=?",
                                                 (cur.lastrowid,)).fetchone()),
