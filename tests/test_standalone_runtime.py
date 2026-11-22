@@ -142,6 +142,22 @@ class NeutralDispatch(unittest.TestCase):
         self.assertEqual(len(server.requests), 2)
         self.assertEqual(self.sup.tracking.fleet()["costs"][0]["cache_read"], 20)
 
+    def test_neutral_tool_refuses_a_path_outside_task_ownership(self):
+        from tests.test_lite_process import FakeEndpoint, SECRET, final, write_call
+        from claude_mux_lite.harness import LiteHarness
+        from unittest import mock
+        self.sup._task_lease("t1", self.worktree)
+        call = write_call()
+        call["content"][0]["input"] = {"path": "outside.json", "content": "never write\n"}
+        with FakeEndpoint([call, final("BRIEF t1 | uncommitted | FAIL")]) as server:
+            with mock.patch.dict(os.environ, {"CLAUDE_MUX_BASE_URL": server.url, "CLAUDE_MUX_API_KEY": SECRET}):
+                harness = LiteHarness(workdir=self.worktree, model="test", task_id="t1",
+                                      tracking=self.sup.tracking, owns=("src/t1.txt",))
+                result = harness.run("Write outside.json.")
+        self.assertFalse((self.worktree / "outside.json").exists())
+        messages = server.requests[1]["body"]["messages"]
+        self.assertIn("does not own", json.dumps(messages[2]["content"]))
+
     def test_direct_ci_marks_verified_merge_only(self):
         self.sup._task_lease("t1", self.worktree)
         (self.worktree / "src").mkdir()
