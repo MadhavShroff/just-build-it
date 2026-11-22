@@ -11,7 +11,8 @@ The founder ordered dispatch-time ownership on 2026-11-22. The founder ordered s
 - WHEN paths overlap a live lease THE SYSTEM SHALL refuse dispatch and name the holder.
 - WHEN an agent writes THE SYSTEM SHALL allow only leased paths, the jbi scratch directory, and the receipt path.
 - WHEN a task merges or is abandoned THE SYSTEM SHALL park the branch, reset the worktree, and release the lease.
-- WHEN claude-mux-lite supports it THE SYSTEM SHALL reuse a warm session for the next task of one node.
+- WHEN claude-mux-lite dispatches a fresh task THE SYSTEM SHALL use a shared cached node prefix, with task content last.
+- WHEN claude-mux-lite dispatches a same-task correction THE SYSTEM SHALL append the correction to that task's history.
 - THE SYSTEM SHALL place stable brief content first and task content last.
 - THE SYSTEM SHALL record cache reads, cache writes, and reported costs for each dispatch.
 - THE SYSTEM SHALL merge only through ci-conductor, after one green run and a verified head SHA.
@@ -24,7 +25,9 @@ The founder ordered dispatch-time ownership on 2026-11-22. The founder ordered s
 
 The service dependencies are ci-conductor and claude-mux-lite. Every Python import is internal or from the standard library. `git`, `tmux`, and `gh` are command-line programs, not service dependencies. claude-mux-lite communicates with its configured model endpoint over raw HTTP; transports inherit the endpoint configuration and credentials.
 
-The founder can veto these defaults: D1 package extraction, D2 direct CI invocation, D3 SQLite, D4 no new TUI, D5 no third-party Python packages, D6 command-line programs. Draft PR #5 lists these defaults.
+A snapshot detects an unleased repository write. The fence restores the path from the base commit, records the refusal, and fails the tool call. Linux uses `bwrap` with a read-only root and writable leaves. Those leaves are the worktree, Git storage, and the scratch directory. A real outside-worktree write refuses. No live shell runs without `bwrap`. The package keeps the MIT notice from its research source in `licenses/RSWARM-MIT.txt`.
+
+The cache rate divides reads by reads, cache writes, and uncached input. A zero denominator gives null. Each task starts a fresh session. A same-task correction continues history. Same-node tasks run consecutively to reuse the provider cache during its TTL.
 
 ## Non-goals
 

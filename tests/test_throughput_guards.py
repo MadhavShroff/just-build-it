@@ -115,7 +115,7 @@ class TestWavesAndStrictSpec(unittest.TestCase):
         ])
         res = waves.wave_preflight(
             plan, 2,
-            open_decisions=[{"id": "voice-6", "status": "open", "task": "t2", "title": "Missing inboxId"}],
+            open_requests=[{"id": "voice-6", "status": "open", "task": "t2", "title": "Missing inboxId"}],
             required_tools=["definitely-missing-binary-xyz"],
         )
         self.assertFalse(res["ok"])

@@ -880,18 +880,20 @@ class LiteHarness:
         limit = max(1.0, min(float(wanted), float(self.bash_max_sec), deadline - self.clock()))
         env = {k: os.environ[k] for k in CHILD_ENV if k in os.environ}
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        proc = subprocess.Popen(["bash", "-c", cmd], cwd=str(self.root), env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            raw, _ = proc.communicate(timeout=limit)
-            note = f"[exit_code={proc.returncode}]"
-        except subprocess.TimeoutExpired:
+        from .sandbox import LinuxSandbox
+        with LinuxSandbox(self.root) as fence:
+            proc = subprocess.Popen(fence.argv(cmd), cwd=str(self.root), env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            raw, _ = proc.communicate()
-            note = f"[timed out after {limit:.0f}s]"
+                raw, _ = proc.communicate(timeout=limit)
+                note = f"[exit_code={proc.returncode}]"
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                raw, _ = proc.communicate()
+                note = f"[timed out after {limit:.0f}s]"
         out = raw.decode("utf-8", errors="replace")
         if len(out) > BASH_OUT_MAX:
             out = out[:BASH_OUT_MAX // 2] + "\n...[truncated]...\n" + out[-BASH_OUT_MAX // 2:]

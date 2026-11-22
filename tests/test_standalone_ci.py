@@ -93,10 +93,16 @@ class HandoverTest(Fixture):
         self.assertEqual(create[create.index("--base") + 1], "main")
         self.assertTrue(tools)
 
-    def test_submit_is_the_default_verb(self) -> None:
+    def test_ready_is_the_default_verb(self) -> None:
         self.reply = self.queued()
         self.adapter().handover(self.repo, self.task)
-        self.assertTrue(any(a[:2] == [EXEC, "submit"] for a in self.calls))
+        self.assertTrue(any(a[:2] == [EXEC, "ready"] for a in self.calls))
+
+    def test_submit_uses_its_real_argument_contract(self) -> None:
+        self.reply = {"type": "queued", "job": "S12", "expect": "notice-on-completion",
+                      "text": "stack S12: 1 of 1 queued.\n#812 queued at " + self.head[:9]}
+        self.adapter().handover(self.repo, self.task, verb="submit")
+        self.assertIn([EXEC, "submit", str(self.pr)], self.calls)
 
     def test_refused_reply_raises(self) -> None:
         self.reply = {"type": "refused", "reason": "shadow-mode", "text": "no"}

@@ -561,7 +561,7 @@ class Tracking:
             attempt = db.execute("SELECT COUNT(*) FROM dispatches WHERE task_id=?",
                                  (task_id,)).fetchone()[0] + 1
             cur = db.execute("INSERT INTO dispatches (task_id,session_id,attempt,model,warm,brief_digest,"
-                             "started_at,receipt,verdict) VALUES (?,?,?,?,1,?,?,?,?)",
+                             "started_at,receipt,verdict) VALUES (?,?,?,?,0,?,?,?,?)",
                              (task_id, lease["session_id"], attempt, model, brief_digest, stamp,
                               receipt, verdict))
             return {"dispatch_id": cur.lastrowid, "task": self._task(task_id, db),
@@ -688,11 +688,15 @@ class Tracking:
         writes = [c["cache_write"] for c in costs if c["cache_write"] is not None]
         total_read = sum(reads) if reads else None
         total_write = sum(writes) if writes else None
-        denom = (total_read or 0) + (total_write or 0)
+        uncached = [c["input_tokens"] for c in costs if c["input_tokens"] is not None]
+        uncached_total = sum(uncached) if uncached else None
+        denom = ((total_read or 0) + (total_write or 0)
+                 + (uncached_total or 0))
         rate = (total_read or 0) / denom if denom else None
         return {"sessions": sessions, "tasks": tasks, "dispatches": dispatches, "leases": leases,
                 "ci_submissions": ci, "merges": merges, "messages": messages, "costs": costs,
-                "cache_read": total_read, "cache_write": total_write, "cache_hit_rate": rate}
+                "cache_read": total_read, "cache_write": total_write,
+                "uncached_input": uncached_total, "cache_hit_rate": rate}
 
     def close(self) -> None:
         """Close the database connection."""

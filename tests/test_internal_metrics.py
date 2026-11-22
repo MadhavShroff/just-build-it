@@ -75,7 +75,7 @@ class StoreDataTest(unittest.TestCase):
         self.assertEqual(data["tokens"]["total"], 150)
         self.assertEqual(data["prs_merged"]["total"], 1)
         self.assertEqual(data["task_ledger"]["completed_count"], 1)
-        self.assertEqual(data["cache"], {"read": 30, "write": 10, "hit_rate": 0.75})
+        self.assertEqual(data["cache"], {"read": 30, "write": 10, "hit_rate": 30 / 140})
         self.assertEqual(len(data["merges"]), 1)
         self.assertTrue(data["generated_at"].endswith("Z"))
         self.assertRegex(data["generated_at"], r"\.\d{3}Z$")

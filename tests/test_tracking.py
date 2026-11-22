@@ -268,7 +268,8 @@ class Costs(Base):
         fleet = self.tr.fleet()
         row = fleet["costs"][0]
         self.assertEqual((row["cache_read"], row["cache_write"], row["input_tokens"]), (30, 10, 5))
-        self.assertEqual(fleet["cache_hit_rate"], 0.75)
+        self.assertEqual(fleet["cache_hit_rate"], 2 / 3)
+        self.assertEqual(fleet["uncached_input"], 5)
         json.dumps(fleet)
 
     def test_zero_denominator_is_null(self):
@@ -276,6 +277,14 @@ class Costs(Base):
         did = self.dispatch()["dispatch_id"]
         self.tr.record_cost(did, cache_read=0, cache_write=0)
         self.assertIsNone(self.tr.fleet()["cache_hit_rate"])
+
+    def test_large_uncached_input_lowers_cache_rate(self):
+        self.make_task()
+        did = self.dispatch()["dispatch_id"]
+        self.tr.record_cost(did, input_tokens=10000, cache_read=10, cache_write=5)
+        fleet = self.tr.fleet()
+        self.assertAlmostEqual(fleet["cache_hit_rate"], 10 / 10015)
+        self.assertNotAlmostEqual(fleet["cache_hit_rate"], 2 / 3)
 
     def test_bad_counts_refused(self):
         self.make_task()

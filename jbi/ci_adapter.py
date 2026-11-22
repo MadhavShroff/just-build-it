@@ -130,11 +130,18 @@ class CIAdapter:
     def _queue(self, repo: Path, verb: str, pr_number: int, head_sha: str) -> dict[str, Any]:
         if not _full_sha(head_sha):
             raise CIAdapterError(f"head {head_sha!r} is not a full lowercase 40-hex commit")
-        reply = self._service(repo, verb, [str(pr_number), "--head", head_sha])
+        if verb == "submit":
+            reply = self._service(repo, verb, [str(pr_number)])
+        else:
+            reply = self._service(repo, verb, [str(pr_number), "--head", head_sha])
         text = str(reply.get("text") or "")
         if reply["type"] != "queued" or not reply.get("job"):
             raise CIAdapterError(f"ci {verb} did not queue PR #{pr_number}: reply type {reply['type']}")
-        if f"#{pr_number}" not in text or head_sha[:9] not in text:
+        if verb == "submit":
+            numbers = re.findall(r"#(\d+)\S*\s+queued(?:\s+at\s+([0-9a-f]{7,40}))?", text)
+            if not any(int(number) == pr_number for number, _ in numbers):
+                raise CIAdapterError(f"ci submit reply does not queue PR #{pr_number}")
+        elif f"#{pr_number}" not in text or head_sha[:9] not in text:
             raise CIAdapterError(f"ci {verb} reply does not name PR #{pr_number} at head {head_sha[:9]}")
         return reply
 
@@ -145,7 +152,7 @@ class CIAdapter:
         return self._queue(repo, "submit", pr_number, head_sha)
 
     def handover(self, repo: Path, task: dict[str, Any], *, base: str = wt.MAIN,
-                 verb: str = "submit", tracking: Any | None = None) -> HandoverResult:
+                 verb: str = "ready", tracking: Any | None = None) -> HandoverResult:
         if verb not in VERBS:
             raise CIAdapterError(f"unknown CI verb {verb!r}")
         tid = task["id"]

@@ -183,6 +183,28 @@ class UsageAndTransport(Base):
             H.HttpTransport(env={"CLAUDE_MUX_HEADERS": "[1]"})
 
 
+class OperatingSystemFence(Base):
+    def test_outside_worktree_write_is_absent_and_lease_write_survives(self):
+        from claude_mux_lite.sandbox import LinuxSandbox
+        outside = self.tmp / "external.txt"
+        sibling = self.tmp / "sibling.txt"
+        with LinuxSandbox(self.repo) as fence:
+            good = subprocess.run(fence.argv("printf good > src/owned.txt && mkdir -p .git/testdir"),
+                                  capture_output=True, text=True)
+            bad = subprocess.run(fence.argv(f"printf bad > {outside}"), capture_output=True, text=True)
+            parent = subprocess.run(fence.argv(f"printf bad > {sibling}"), capture_output=True, text=True)
+            temp = subprocess.run(fence.argv("mkdir -p \"$TMPDIR/scratch-task\" && printf local > \"$TMPDIR/scratch-task/x\""),
+                                  capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotEqual(parent.returncode, 0)
+        self.assertFalse(outside.exists())
+        self.assertFalse(sibling.exists())
+        self.assertTrue((self.repo / "src/owned.txt").exists())
+        self.assertTrue((self.repo / ".git/testdir").is_dir())
+        self.assertEqual(temp.returncode, 0)
+
+
 class Tools(Base):
     def run_tools(self, *uses, followup="done"):
         t = Script(reply(*uses), reply(text(followup)))
