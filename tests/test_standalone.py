@@ -69,7 +69,7 @@ def scan_imports(root: Path) -> dict:
                 record = {"file": str(rel), "line": node.lineno, "module": module}
                 imports.append(record)
                 top = module.split(".")[0]
-                if top != "jbi" and top not in sys.stdlib_module_names:
+                if top not in {"jbi", "claude_mux_lite"} and top not in sys.stdlib_module_names:
                     third_party.append(record)
     return {"imports": imports, "third_party": third_party}
 
@@ -171,12 +171,10 @@ class TestStandaloneGuards(unittest.TestCase):
             (package / "a.py").write_text("x = 'decision.answer'\ny = f'/decisions/{n}'\n")
             self.assertEqual(run_scanner("--forbidden", Path(tmp)).returncode, 0)
 
-    @unittest.expectedFailure
     def test_lanes_has_no_direct_landing_and_supervisor_has_no_local_merge(self):
         # Required missing behavior: ci-conductor lands every merge (SPEC.md).
         self.assertEqual(lanes_landing(ROOT), [])
 
-    @unittest.expectedFailure
     def test_agents_dispatch_uses_claude_mux_lite_only(self):
         # Required missing behavior: final dispatch uses claude-mux-lite only (SPEC.md).
         self.assertEqual(agents_dispatch(ROOT), [])

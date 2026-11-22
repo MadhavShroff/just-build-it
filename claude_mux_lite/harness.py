@@ -675,7 +675,8 @@ class LiteHarness:
                  max_turns: int = 200, max_output_tokens: int = 16384, effort: str = "high",
                  timeout_sec: float = 1800.0, bash_max_sec: int = 1800, receipt: Path | None = None,
                  repo_context: str = "", frozen_contracts: str = "",
-                 before_run: Callable[[], None] | None = None, checkpoint: Path | None = None,
+                 before_run: Callable[[], None] | None = None, before_turn: Callable[[], str] | None = None,
+                 checkpoint: Path | None = None,
                  allowed_commits: bool = False, sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
         self.workdir = Path(workdir)
@@ -687,6 +688,7 @@ class LiteHarness:
         self.receipt = Path(receipt) if receipt else None
         self.system = build_system(repo_context, frozen_contracts)
         self.before_run, self.sleep, self.clock = before_run, sleep, clock
+        self.before_turn = before_turn
         self.checkpoint = Path(checkpoint) if checkpoint else None
         if self.checkpoint is not None and inside(self.root, Path(os.path.realpath(self.checkpoint))):
             raise ValueError("checkpoint path must be outside the workspace")
@@ -715,6 +717,9 @@ class LiteHarness:
         last_text = ""
         try:
             for turn in range(1, self.max_turns + 1):
+                message = self.before_turn() if self.before_turn else ""
+                if message:
+                    self._messages.append({"role": "user", "content": [{"type": "text", "text": message}]})
                 if self.clock() >= deadline:
                     return self._fail(result, "timeout", last_text, timed_out=True, code=124)
                 payload = build_payload(model=self.model, max_tokens=self.max_output_tokens,

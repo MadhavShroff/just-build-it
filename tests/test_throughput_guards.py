@@ -179,8 +179,7 @@ class TestModelsPoolAnd429Retry(unittest.TestCase):
                 raise providers.CallFailed(1, "HTTP 429 rate limit exceeded", "")
             return "ok-from-claude", {"tokens_in": 10, "tokens_out": 5}
 
-        with mock.patch.object(providers, "_cli_call", side_effect=fake_cli), \
-             mock.patch("jbi.cascade.read", return_value=None):
+        with mock.patch.object(providers, "_cli_call", side_effect=fake_cli):
             complete = providers.completer(lambda: state, cooldowns=cd, max_429_retries=1, retry_backoff_s=0.0, cooldown_s=30.0)
             res = complete(Prompt(role="implement", system="sys", user="usr"))
         self.assertEqual(res.provider, "claude")

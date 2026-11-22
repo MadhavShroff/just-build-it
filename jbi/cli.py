@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, netinfo, protocol
+from . import __version__, metrics, netinfo, protocol
 from .planner import slug
 from .client import Client, ClientError, Control
 from .engine import Engine
@@ -53,9 +53,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--name", default="new-app", help="the working name of a new project")
     start.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
     start.add_argument("--max-sessions", type=int, default=3, help="agents that run at the same time")
-    start.add_argument("--lanes", type=int, default=0, help="CI lanes (default: from the CPU count)")
-    start.add_argument("--ci-service", choices=("local", "illm"), default="local",
-                       help="CI service for the merge stage (default: local lanes)")
+    start.add_argument("--lanes", type=int, default=0, help="legacy parallelism field; CI owns its own queue")
+    start.add_argument("--ci-service", choices=("ci-conductor",), default="ci-conductor",
+                       help="the only service that can merge a verified task")
     start.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
     start.add_argument("--provider", default="agy", choices=("agy", "openai-compatible", "claude", "codex"),
                        help="the provider that dispatches agent stages. Default agy: the standing order of "
@@ -80,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--registry", type=Path, default=None,
                        help="write a small JSON record of this run (port, base path, DAG, run id) "
                             "so another service can find the preview. Defaults to "
-                            "~/.tangram-dev/jbi-preview.json for a preview run.")
+                            "~/.just-build-it/preview.json for a preview run.")
     start.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
     start.add_argument("--no-menu", action="store_true", help="do not show the interactive control menu")
 
@@ -88,15 +88,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     status.add_argument("run_dir", nargs="?", type=Path)
     links = sub.add_parser("links", help="print fresh one-time sign-in links for a running dashboard")
     links.add_argument("run_dir", nargs="?", type=Path)
-    send = sub.add_parser("send", help="send one protocol command to a running dashboard")
-    send.add_argument("type")
+    fleet = sub.add_parser("fleet", help="print internal sessions, tasks, leases, CI, messages, and costs")
+    fleet.add_argument("--run-dir", type=Path)
+    fleet.add_argument("--offline", action="store_true", help="read the SQLite record directly")
+    send = sub.add_parser("send", help="send one protocol command or agent message")
+    send.add_argument("type", nargs="?", help="protocol command type")
     send.add_argument("payload", nargs="?", default="{}")
     send.add_argument("--run-dir", type=Path)
+    send.add_argument("--agent", help="target an agent session; use 'all' for every session")
+    send.add_argument("--all", action="store_true", help="send to every session")
+    send.add_argument("--text", help="message text for --agent or --all")
     resume = sub.add_parser("resume", help="reopen a stored run and continue from stored task states")
     resume.add_argument("run_dir", nargs="?", type=Path)
     resume.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
-    resume.add_argument("--ci-service", choices=("local", "illm"), default=None,
-                        help="override CI service on resume")
+    resume.add_argument("--ci-service", choices=("ci-conductor",), default=None,
+                        help="the only service that can merge a verified task")
     resume.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
     resume.add_argument("--offline", action="store_true", help="use the offline simulator for every model")
     resume.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
@@ -306,6 +312,7 @@ class Run:
         self.app = App(self.store, self.engine, self.auth,
                        extra_info=lambda: {"pid": os.getpid(), "run_dir": str(self.dir)},
                        link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified],
+                       fleet_reader=lambda: metrics.read_tracking(self.dir),
                        base_path=getattr(args, "base_path", "") or "",
                        public_paths=public_paths)
         self.server = Server(self.app, netinfo.hosts(tailnet), args.port).start()
@@ -331,7 +338,7 @@ class Run:
             # --registry still publishes, so a real preview and its test can both work.
             if os.environ.get("PYTEST_CURRENT_TEST") or "unittest" in sys.modules:
                 return
-            path = Path.home() / ".tangram-dev" / "jbi-preview.json"
+            path = HOME / "preview.json"
         path = Path(path).expanduser()
         dag = getattr(args, "dag", None)
         record = {
@@ -368,7 +375,7 @@ class Run:
         # The supervisor reads the repository from state.run.target, which the user sets in
         # the stack step. Offline runs enable only the simulator account, so selection picks it.
         return Supervisor(self.store, RunHooks(self), self.dir, parent_pid=os.getpid(),
-                          ci_service=getattr(self.args, "ci_service", "local"))
+                          ci_service=getattr(self.args, "ci_service", "ci-conductor"))
 
     def link_lines(self) -> list[str]:
         lines = []
@@ -382,6 +389,7 @@ class Run:
 
     def close(self) -> None:
         self.server.stop()
+        self.runtime.tracking.close()
         self.store.close()
 
 
@@ -524,11 +532,62 @@ def run_client(run_dir: Path | None) -> Client:
         raise SystemExit(f"No running dashboard at {path.parent}. Start one with: just-build-it")
 
 
+def _fail(code: str, message: str) -> int:
+    print(json.dumps({"error": {"code": code, "message": message}}), file=sys.stderr)
+    return 1
+
+
+def _check_send(args: argparse.Namespace) -> None:
+    """Refuse a bad `send` before any server contact. One target only."""
+    from .tracking import ID_RE
+    message_mode = bool(args.all or args.agent is not None or args.text is not None)
+    if not message_mode:
+        if args.type is None:
+            raise ClientError(400, "payload_invalid", "Give a protocol type, or --agent/--all with --text")
+        return
+    if args.all and args.agent is not None:
+        raise ClientError(400, "payload_invalid", "Choose only one of --agent and --all")
+    if args.type is not None:
+        raise ClientError(400, "payload_invalid", "Use no protocol type with --agent or --all")
+    if not args.all and args.agent is None:
+        raise ClientError(400, "payload_invalid", "--text needs --agent or --all")
+    if not args.text or not args.text.strip():
+        raise ClientError(400, "payload_invalid", "An agent message needs --text")
+    if args.agent is not None and args.agent != "all" and not ID_RE.match(args.agent):
+        raise ClientError(400, "payload_invalid", f"Bad agent id: {args.agent!r}")
+
+
+def _fleet_offline(run_dir: Path | None) -> int:
+    """Read the SQLite store directly. The store must exist; a read never creates it."""
+    from .tracking import Tracking
+    run_dir = run_dir or latest_run_dir()
+    if not (run_dir / "fleet.db").is_file():
+        raise SystemExit(f"No internal tracking store at {run_dir / 'fleet.db'}")
+    tr = Tracking(run_dir / "fleet.db")
+    try:
+        print(json.dumps(tr.fleet(), indent=2))
+    finally:
+        tr.close()
+    return 0
+
+
 def client_command(args: argparse.Namespace) -> int:
-    """`status`, `links` and `send`: one protocol call; machine-readable errors on stderr."""
+    """`status`, `links`, `fleet` and `send`: one protocol call; machine-readable errors on stderr."""
+    if args.command == "fleet" and args.offline:
+        return _fleet_offline(getattr(args, "run_dir", None))
+    if args.command == "send":
+        try:
+            _check_send(args)
+        except ClientError as error:
+            return _fail(error.code, error.message)
     client = run_client(getattr(args, "run_dir", None))
     try:
-        if args.command == "status":
+        if args.command == "fleet":
+            print(json.dumps(client.fleet(), indent=2))
+        elif args.command == "send" and (args.all or args.agent is not None):
+            print(json.dumps(client.send("message.send", {"target": args.agent or "all", "text": args.text,
+                                                        "all_sessions": bool(args.all)})))
+        elif args.command == "status":
             print(json.dumps(client.state(), indent=2))
         elif args.command == "links":
             for link in client.links():
@@ -540,18 +599,15 @@ def client_command(args: argparse.Namespace) -> int:
                 raise ClientError(400, "payload_invalid", f"The payload is not valid JSON: {error.msg}.")
             print(json.dumps(client.send(args.type, payload)))
     except ClientError as error:
-        print(json.dumps({"error": {"code": error.code, "message": error.message}}), file=sys.stderr)
-        return 1
+        return _fail(error.code, error.message)
     except OSError:
-        print(json.dumps({"error": {"code": "unreachable", "message": "The dashboard does not answer. "
-                                    "The run has stopped."}}), file=sys.stderr)
-        return 1
+        return _fail("unreachable", "The dashboard does not answer. The run has stopped.")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.command in ("status", "links", "send"):
+    if args.command in ("status", "links", "send", "fleet"):
         return client_command(args)
     if args.command == "resume":
         return resume_command(args)

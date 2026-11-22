@@ -167,20 +167,36 @@ class FreshProcess(ProcessBase):
         self.assertTrue(receipt.startswith("BRIEF t1 | uncommitted | PASS"))
         self.assertEqual(Path(self.tmp / "state" / "ck.json").exists(), True)
 
-    def test_fresh_stores_no_history_no_cost_and_no_secret(self):
+    def test_fresh_stores_cost_but_no_history_or_secret(self):
         dispatch_id = self.dispatch()
         with FakeEndpoint([final(RECEIPT_TEXT, {"input_tokens": 1})]) as ep:
             spec = self.spec(dispatch_id)
             proc = self.run_process(spec, ep.url)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.tracking.session_history("s1"), [])
-        self.assertEqual(self.tracking.fleet()["costs"], [])
+        self.assertEqual(len(self.tracking.fleet()["costs"]), 1)
+        self.assertEqual(self.tracking.fleet()["costs"][0]["input_tokens"], 1)
         self.assertNotIn(SECRET, json.dumps(spec))
         for blob in (self.store_text(), (self.tmp / "state" / "usage.json").read_text(),
                      (self.tmp / "state" / "ck.json").read_text(), proc.stdout, proc.stderr):
             self.assertNotIn(SECRET, blob)
         for path in self.db.parent.iterdir():
             self.assertNotIn(SECRET.encode(), path.read_bytes())
+
+
+class MessageProcess(ProcessBase):
+    def test_message_enters_next_turn_and_is_never_read_twice(self):
+        did = self.dispatch()
+        messages = self.tracking.send("s1", "Change the parse rule", sender="operator")
+        self.tracking.message_receipt(messages[0]["id"], "sent", "stored by the runtime")
+        with FakeEndpoint([write_call(), final(RECEIPT_TEXT)]) as ep:
+            proc = self.run_process(self.spec(did), ep.url)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        text = json.dumps(ep.requests[1]["body"]["messages"])
+        self.assertIn("Change the parse rule", text)
+        final_messages = self.tracking.fleet()["messages"]
+        self.assertEqual(final_messages[0]["delivery_state"], "delivered")
+        self.assertEqual(self.tracking.pending_messages("s1"), [])
 
 
 class ContinuationProcess(ProcessBase):

@@ -176,6 +176,14 @@ class CIAdapter:
         return HandoverResult(task=tid, branch=branch, pr_number=pr_number, head_sha=head_sha,
                               reply=reply, base_commit=base_commit)
 
+    def pending(self, repo: Path, result: HandoverResult) -> bool:
+        """Read the direct job record. A running job has not produced a verdict."""
+        job = result.reply.get("job")
+        if not job:
+            raise CIAdapterError("the handover has no direct job identifier")
+        reply = self._service(repo, "job", [str(job)])
+        return bool(re.search(r"\bfinished running\b", str(reply.get("text") or "")))
+
     def confirm_merge(self, repo: Path, result: HandoverResult, *, job: str | None = None,
                       tracking: Any | None = None) -> dict[str, Any]:
         """Read the job record. Return merge evidence, or raise when any piece is missing.

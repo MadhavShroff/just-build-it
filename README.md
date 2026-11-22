@@ -55,11 +55,13 @@ To add features to an existing project: `./just-build-it --repo ~/my-project`.
 
 The browser, the CLI and scripts use one HTTP contract: one state document, one event
 stream of JSON Patch operations, and one command endpoint. `GET /api/v1/schema` describes
-every command and event. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
+every command and event. `GET /api/v1/fleet` returns the fleet read. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ```
 ./just-build-it status                         # the state document as JSON
 ./just-build-it send run.configure '{"rigor":"high","profile":"balanced"}'
+./just-build-it fleet                          # sessions, tasks, dispatches, leases, CI, merges, messages, costs
+./just-build-it send --agent ID --text TEXT    # message.send to one session; use --all for every session
 ```
 
 ## Documents

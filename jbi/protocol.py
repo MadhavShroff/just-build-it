@@ -19,7 +19,7 @@ DETAIL_LEVELS = ("user", "guided", "delegate")
 STOP_MODES = ("quit", "standdown", "finish", "kill")
 CI_VERDICTS = ("red", "void", "merge-blocked", "green", "merged")
 TASK_STATUSES = ("blocked", "ready", "running", "verifying", "queued",
-                 "merging", "merged", "failed", "paused", "decision", "skipped",
+                 "merging", "merged", "failed", "paused", "request", "skipped",
                  "waiting-model")
 TASK_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 COMMAND_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
@@ -126,8 +126,8 @@ COMMANDS: dict[str, Command] = {c.type: c for c in (
              "retry_allowed": Field("bool", required=False),
              "merge_sha": Field("string", required=False, max_length=64),
              "data": Field("object", required=False)}),
-    Command("decision.answer", ANY_PHASE, "Answer an open decision.",
-            {"decision": Field("string", max_length=64), "answer": Field("string", max_length=4000)}),
+    Command("request.answer", ANY_PHASE, "Answer an open request.",
+            {"request": Field("string", max_length=64), "answer": Field("string", max_length=4000)}),
     Command("account.set", ANY_PHASE, "Enable or disable a provider, optionally with an API key.",
             {"provider": Field("string", max_length=40), "enabled": Field("bool"),
              "api_key": Field("string", required=False, max_length=400, secret=True)}),
@@ -155,8 +155,8 @@ EVENTS: dict[str, str] = {
     "task.override": "A per-task override changed.",
     "session.status": "An agent session started, changed or ended.",
     "lane.status": "A CI lane changed.",
-    "decision.opened": "The run needs an answer from the user.",
-    "decision.answered": "The user answered a decision.",
+    "request.opened": "The run needs an answer from the user.",
+    "request.answered": "The user answered a request.",
     "architecture.updated": "The architecture graph changed.",
     "telemetry.sample": "A usage or timing sample was recorded.",
     "account.status": "A provider account or probe result changed.",
@@ -263,7 +263,7 @@ def initial_state(run_id: str, created: str, *, name: str, mode: str, target: st
         "bootstrap": {"status": "pending", "detail": "", "commit": None},
         "sessions": {},
         "lanes": {},
-        "decisions": {},
+        "requests": {},
         "architecture": {"revision": 0, "nodes": {}, "edges": {}},
         "telemetry": {"tokens_in": 0, "tokens_out": 0, "cost_usd": None, "samples": 0},
         "timeline": [],

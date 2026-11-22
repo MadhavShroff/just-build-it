@@ -419,7 +419,10 @@ class Stages(Base):
         with self.assertRaises(LeaseError):
             self.tr.message_receipt(999, "sent")
         self.tr.message_receipt(a["id"], "sent", "r1")
-        self.assertEqual([m["id"] for m in self.tr.pending_messages("s1")], [b["id"]])
+        self.assertEqual([m["id"] for m in self.tr.pending_messages("s1")], [a["id"], b["id"]])
+        self.assertEqual(self.tr.pending_messages("s1")[0]["delivery_state"], "sent")
+        self.tr.message_receipt(b["id"], "delivered")
+        self.assertEqual([m["id"] for m in self.tr.pending_messages("s1")], [a["id"]])
         self.tr.message_receipt(a["id"], "delivered")
         self.tr.message_receipt(a["id"], "read")
 

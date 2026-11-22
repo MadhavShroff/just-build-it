@@ -36,7 +36,7 @@ This ticket changes no fleet board, slot, registry, or guard. This ticket import
 ## Slices
 
 1. SPEC, design, static guards, SQLite store, lease lifecycle, and dirty-release refusal.
-2. claude-mux-lite dispatch, lease-fenced tools, warm sessions, messages, and cache accounting.
+2. claude-mux-lite dispatch, lease-fenced tools, fresh sessions, messages, and cache accounting.
 3. Direct CI, merge recording, fleet reads, installation checks, and complete verification.
 
 Each slice gets a draft PR and fresh acceptance. Draft PRs compose into main; no slice bypasses CI.
@@ -47,4 +47,4 @@ Run `python3 -m unittest discover -s tests -v`. The command exits non-zero on a 
 
 ## Interfaces
 
-`just-build-it fleet [--run-dir PATH]` prints sessions, tasks, dispatches, leases, CI, merges, costs, and cache rates. `just-build-it send TARGET TEXT [--run-dir PATH]` sends to one session or `--all`. The existing protocol route `message.send` performs the same operation. `docs/STANDALONE-DESIGN.md` defines the schema and lifecycle contracts.
+`just-build-it fleet [--run-dir PATH] [--offline]` prints sessions, tasks, dispatches, leases, CI, merges, costs, and cache rates. `just-build-it send --agent ID --text TEXT [--run-dir PATH]` sends to one session. `just-build-it send --all --text TEXT [--run-dir PATH]` sends to every session. The existing protocol route `message.send` performs the same operation. `docs/STANDALONE-DESIGN.md` defines the schema and lifecycle contracts.

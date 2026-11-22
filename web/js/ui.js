@@ -106,7 +106,7 @@ function trapFocus(event, container) {
 
 export const TASK_TONE = {
   blocked: 'gray', ready: 'teal', running: 'blue', verifying: 'violet', queued: 'amber',
-  merging: 'violet', merged: 'green', failed: 'red', paused: 'amber', decision: 'amber', skipped: 'gray',
+  merging: 'violet', merged: 'green', failed: 'red', paused: 'amber', request: 'amber', skipped: 'gray',
   'waiting-model': 'amber',
 };
 export const NODE_TONE = { planned: 'gray', building: 'blue', built: 'green', failed: 'red' };

@@ -182,22 +182,11 @@ def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
     if len(stable) + len(header) + len(middle) + len(footer) <= MAX_LINES:
         return "\n".join([*stable, *header, *middle, *footer]) + "\n"
 
-    if len(stable) + len(header) + len(footer) > MAX_LINES and len(owns_items) > 1:
-        max_owns_lines = max(3, MAX_LINES - len(stable) - len(header) - len(tail))
-        keep_count = max(1, max_owns_lines - 3)
-        if keep_count < len(owns_items):
-            rem = len(owns_items) - keep_count
-            owns = _flatten(["## Owns", *(f"- {p}" for p in owns_items[:keep_count]), f"- ... ({rem} more)", ""])
-            footer = [*owns, *tail]
-    if len(stable) + len(header) + len(footer) > MAX_LINES:
-        step_tail = _flatten([f"Step {step[0]}. {step[1]}", ""]) if step else []
-        h_budget = max(0, MAX_LINES - len(stable) - len(footer))
-        if step_tail and h_budget > len(step_tail):
-            header = [*header[:h_budget - len(step_tail)], *step_tail]
-        else:
-            header = header[:h_budget]
-    if len(stable) + len(header) + len(footer) > MAX_LINES:
-        stable = stable[:max(0, MAX_LINES - len(header) - len(footer))]
+    if len(owns_items) > 16:
+        owns = _flatten(["## Owns", *owns_items[:16], f"- ... ({len(owns_items) - 16} more)", ""])
+        footer = [*owns, *tail]
+    essential = [*header, *footer]
+    stable = [*stable[:max(0, MAX_LINES - len(essential) - 2)], "... (truncated)", ""]
 
     budget = max(0, MAX_LINES - len(stable) - len(header) - len(footer))
     if budget >= 2:

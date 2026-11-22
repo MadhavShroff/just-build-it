@@ -6,7 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .harness import LiteHarness, redact, strip_marks
+from .harness import LiteHarness, strip_marks
 from jbi.store import now
 from jbi.tracking import Tracking
 
@@ -29,21 +29,29 @@ def main(arguments: list[str]) -> int:
     try:
         if spec.get("continuation"):
             history = tracking.session_history(spec["session_id"])
+        def inbox() -> str:
+            text = []
+            for message in tracking.pending_messages(spec["session_id"]):
+                text.append(f"Message from {message['sender']}: {message['text']}")
+                tracking.message_receipt(message["id"], "delivered", "injected before the next model turn")
+            return "\n".join(text).strip()
+
         harness = LiteHarness(
             workdir=Path(spec["workdir"]), model=spec["model"], task_id=spec["task_id"],
             tracking=tracking, owns=tuple(spec["owns"]), session=history,
             receipt=Path(spec["receipt"]) if spec.get("receipt") else None,
-            checkpoint=Path(spec["checkpoint"]), timeout_sec=float(spec.get("timeout_sec", 1800)),
+            checkpoint=Path(spec["checkpoint"]), timeout_sec=float(spec.get("timeout_sec", 1800)), before_turn=inbox,
             max_turns=int(spec.get("max_turns", 200)), effort=spec.get("effort", "high"),
             repo_context=spec.get("repo_context", ""), frozen_contracts=spec.get("frozen_contracts", ""),
         )
         result = harness.run(spec["brief"])
-        history = harness.take_messages() if spec.get("continuation") else []
+        history = harness.take_messages()
         dispatch = int(spec["dispatch_id"])
-        if spec.get("continuation"):
-            tracking.record_cost(dispatch, input_tokens=result.usage.input_tokens,
-                                 output_tokens=result.usage.output_tokens, cache_read=result.usage.cache_read,
-                                 cache_write=result.usage.cache_write)
+        tracking.record_cost(dispatch, input_tokens=result.usage.input_tokens,
+                             output_tokens=result.usage.output_tokens, cache_read=result.usage.cache_read,
+                             cache_write=result.usage.cache_write)
+        if spec.get("continuation") and history:
+            tracking.record_session_history(spec["session_id"], strip_marks(history), status="idle")
         usage = {"dispatch_id": dispatch, "input_tokens": result.usage.input_tokens,
                  "output_tokens": result.usage.output_tokens, "cache_read": result.usage.cache_read,
                  "cache_write": result.usage.cache_write, "exit_code": result.exit_code,
@@ -55,8 +63,6 @@ def main(arguments: list[str]) -> int:
                                          "final_text": f"internal store error: {error}", "ended_at": now()}))
         return 3
     finally:
-        if spec.get("continuation") and history:
-            tracking.record_session_history(spec["session_id"], strip_marks(history))
         tracking.close()
 
 

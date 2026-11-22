@@ -7,10 +7,10 @@ meet only through these two protocols, so either side can be replaced or faked.
 State ownership (who may commit changes under which top-level key):
 
     engine   run, config, accounts, intake, plan (structure), stack, bootstrap.status
-             transitions, architecture, decisions it opens itself
-    runtime  sessions, lanes, telemetry, tasks/<id>/{status, stage, stages, attempts,
+             transitions, architecture, requests it opens itself
+    runtime  sessions, submissions, telemetry, tasks/<id>/{status, stage, stages, attempts,
              attempt_history, resume_after, blocked_reason, commit, receipt, findings},
-             bootstrap.detail, bootstrap.commit and bootstrap.branch, decisions it opens
+             bootstrap.detail, bootstrap.commit and bootstrap.branch, requests it opens
 
 Both sides write through `Store.commit` or `Store.log`, never by mutating state.
 """
@@ -57,8 +57,8 @@ class Runtime(Protocol):
     def ci_notice(self, task: str, notice: dict) -> None:
         """Deliver a structured CI verdict or failure notice to a waiting task."""
 
-    def answer(self, decision: str, answer: str) -> None:
-        """A decision that the runtime opened has an answer."""
+    def answer(self, request_id: str, answer: str) -> None:
+        """The user answered one open request."""
 
     def send_message(self, target: str, text: str, all_sessions: bool = False) -> None:
         """Queue one message for a session, or for every session when `all_sessions` is true."""

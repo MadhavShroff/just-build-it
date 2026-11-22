@@ -196,10 +196,17 @@ class ConfirmMergeTest(Fixture):
         return self.adapter().handover(self.repo, self.task)
 
     def job_text(self, verdict: str = "GREEN", merge: bool = True) -> dict:
-        lines = [f"prs: #{self.pr}@{self.head[:9]}", f"verdict {verdict}  failed gates: none"]
+        lines = [f"prs: #{self.pr}@{self.head[:9]}", f"verdict {verdict}  failed gates: none", "finished 1"]
         if merge:
             lines.append(f"merge: #{self.pr}->{self.base[:9]}; stopped=None")
         return {"type": "data", "job": "pr-812", "text": "\n".join(lines)}
+
+    def test_running_job_is_pending_and_terminal_job_is_not(self):
+        result = self.result()
+        self.reply = {"type": "data", "job": "pr-812", "text": "started 1  finished running\n"}
+        self.assertTrue(self.adapter().pending(self.repo, result))
+        self.reply = self.job_text()
+        self.assertFalse(self.adapter().pending(self.repo, result))
 
     def test_submit_reply_alone_proves_no_merge(self) -> None:
         result = self.result()

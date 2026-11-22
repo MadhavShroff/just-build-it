@@ -80,6 +80,9 @@ class Client:
     def schema(self) -> dict:
         return self._request("GET", "/api/v1/schema")
 
+    def fleet(self) -> dict:
+        return self._request("GET", "/api/v1/fleet")["fleet"]
+
     def events(self, after: int = 0, limit: int = 200) -> dict:
         return self._request("GET", f"/api/v1/events.json?after={after}&limit={limit}")
 

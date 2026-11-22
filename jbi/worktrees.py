@@ -87,8 +87,6 @@ def dirty_paths(worktree: Path) -> list[str]:
 def path_owned(path: str, owns: Iterable[str]) -> bool:
     """Return True when `path` matches at least one owned path, directory prefix, or glob."""
     normalized = path.strip().lstrip("./")
-    if normalized == ".jbi/architecture.patch.json":
-        return True
     for raw in owns:
         pattern = raw.strip().lstrip("./").rstrip("/")
         if not pattern:

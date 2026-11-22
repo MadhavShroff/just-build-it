@@ -489,6 +489,18 @@ class Tracking:
             row["service_reply"] = json.loads(row["service_reply"])
             return row
 
+    def pending_ci(self, task_id: str) -> list[dict]:
+        """Return submitted CI records whose direct job evidence has not arrived."""
+        _check_id(task_id, "task")
+        rows = self._all("SELECT * FROM ci_submissions WHERE task_id=? AND state='submitted' "
+                         "ORDER BY created_at", (task_id,))
+        for row in rows:
+            try:
+                row["service_reply"] = json.loads(row["service_reply"])
+            except (TypeError, ValueError):
+                row["service_reply"] = {}
+        return rows
+
     def record_merge(self, task_id: str, pr_number: int, head_sha: str, squash_sha: str,
                      green_run: str) -> dict:
         """Record one merge. It needs a green CI record with exact PR, head, and evidence."""
@@ -530,12 +542,14 @@ class Tracking:
             row = self._one("SELECT 1 FROM tasks WHERE id=?", (task_id,))
         if row is None:
             try:
-                return self.create_task(title=title, goal=goal, owns=owns, branch=branch,
+                task = self.create_task(title=title, goal=goal, owns=owns, branch=branch,
                                         worktree=worktree, base_commit=base_commit,
                                         task_id=task_id, node=node)
             except LeaseError:
                 if not self._one("SELECT 1 FROM tasks WHERE id=?", (task_id,)):
                     raise
+            else:
+                return task
         _check_sha(base_commit, "base")
         owned = normalize_owns(owns)
         task = self._task(task_id)
@@ -644,9 +658,9 @@ class Tracking:
                        (status, receipt, message_id))
 
     def pending_messages(self, session_id: str) -> list[dict]:
-        """Return queued rows for one session in id order. The rows stay queued."""
+        """Return queued or sent rows for one session in id order. Read-only."""
         _check_id(session_id, "session")
-        return self._all("SELECT * FROM messages WHERE target=? AND delivery_state='queued' ORDER BY id",
+        return self._all("SELECT * FROM messages WHERE target=? AND delivery_state IN ('queued','sent') ORDER BY id",
                          (session_id,))
 
     def mark_task_state(self, task_id: str, state: str) -> dict:
@@ -693,8 +707,9 @@ class Tracking:
             dispatches = self._all("SELECT * FROM dispatches ORDER BY id")
             merges = self._all("SELECT * FROM merges ORDER BY id")
             messages = self._all("SELECT * FROM messages ORDER BY id")
-        reads = [c["cache_read"] for c in costs if c["cache_read"] is not None]
-        writes = [c["cache_write"] for c in costs if c["cache_write"] is not None]
+        with self._lock:
+            reads = [c["cache_read"] for c in costs if c["cache_read"] is not None]
+            writes = [c["cache_write"] for c in costs if c["cache_write"] is not None]
         total_read = sum(reads) if reads else None
         total_write = sum(writes) if writes else None
         uncached = [c["input_tokens"] for c in costs if c["input_tokens"] is not None]

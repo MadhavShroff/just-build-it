@@ -1,5 +1,5 @@
 // The main board (execute and complete): summary, DAG and architecture tabs, sessions,
-// CI lanes, telemetry, decisions and the live timeline.
+// CI lanes, telemetry, requests and the live timeline.
 
 import { h, reconcile, setText, beat, elapsed, relativeTime, compactNumber, money, shortSha, trackOverflow } from './dom.js';
 import { icon } from './icons.js';
@@ -30,7 +30,7 @@ export function mountBoard(ctx, root, { onOpenTask }) {
   const tmux = h('code', { class: 'tmux-cmd' });
   const copy = h('button', { class: 'btn btn-sm btn-icon', type: 'button', 'aria-label': 'Copy the tmux attach command', 'data-tip': 'Copy' }, icon('copy', { size: 13 }));
   const lanes = h('div', { class: 'lanes' });
-  const decisions = h('div', { class: 'decisions' });
+  const requests = h('div', { class: 'requests' });
   const timeline = h('ol', { class: 'timeline', 'aria-live': 'polite', 'aria-label': 'Timeline' });
 
   root.append(
@@ -45,7 +45,7 @@ export function mountBoard(ctx, root, { onOpenTask }) {
     h('div', { class: 'board-grid' },
       main,
       h('div', { class: 'board-side' },
-        h('section', { class: 'card decisions-card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('inbox'), 'Decisions', h('span', { class: 'card-count decisions-count' }))), decisions),
+        h('section', { class: 'card requests-card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('inbox'), 'Requests', h('span', { class: 'card-count requests-count' }))), requests),
         h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('lane'), 'CI lanes', h('span', { class: 'card-count lanes-count' }))), lanes),
         h('section', { class: 'card timeline-card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('clock'), 'Timeline')), timeline))));
 
@@ -194,20 +194,20 @@ export function mountBoard(ctx, root, { onOpenTask }) {
     });
   });
 
-  // ---- decisions ----------------------------------------------------------------
-  ctx.store.subscribe(['decisions', 'plan'], (state) => {
-    const list = Object.entries(state.decisions).map(([id, d]) => ({ id, ...d }))
+  // ---- requests ----------------------------------------------------------------
+  ctx.store.subscribe(['requests', 'plan'], (state) => {
+    const list = Object.entries(state.requests).map(([id, d]) => ({ id, ...d }))
       .sort((a, b) => (a.status === 'open' ? 0 : 1) - (b.status === 'open' ? 0 : 1));
     const open = list.filter((d) => d.status === 'open').length;
-    const count = root.querySelector('.decisions-count');
+    const count = root.querySelector('.requests-count');
     setText(count, open ? `${open} open` : '');
     count.classList.toggle('is-alert', open > 0);
-    if (!list.length) { decisions.replaceChildren(h('p', { class: 'empty', text: 'Nothing needs your answer.' })); return; }
-    if (decisions.querySelector('.empty')) decisions.replaceChildren();
-    reconcile(decisions, list, {
+    if (!list.length) { requests.replaceChildren(h('p', { class: 'empty', text: 'Nothing needs your answer.' })); return; }
+    if (requests.querySelector('.empty')) requests.replaceChildren();
+    reconcile(requests, list, {
       key: (d) => d.id,
-      create: (d) => createDecision(ctx, d),
-      update: (el, d) => updateDecision(el, d, state),
+      create: (d) => createRequest(ctx, d),
+      update: (el, d) => updateRequest(el, d, state),
     });
   });
 
@@ -224,42 +224,42 @@ export function mountBoard(ctx, root, { onOpenTask }) {
   });
 }
 
-function createDecision(ctx, decision) {
+function createRequest(ctx, request) {
   const slot = errorSlot();
-  const field = h('input', { class: 'input', placeholder: 'Or write an answer', 'aria-label': `Answer: ${decision.title}` });
+  const field = h('input', { class: 'input', placeholder: 'Or write an answer', 'aria-label': `Answer: ${request.title}` });
   const submit = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Answer');
-  const answer = (control, value) => act(control, slot, () => ctx.api.send('decision.answer',
-    payloadFor(ctx.store.schema, 'decision.answer', { decision: decision.id, answer: value })));
+  const answer = (control, value) => act(control, slot, () => ctx.api.send('request.answer',
+    payloadFor(ctx.store.schema, 'request.answer', { request: request.id, answer: value })));
   submit.addEventListener('click', () => (field.value.trim() ? answer(submit, field.value) : slot.show('Write an answer or pick an option.')));
   field.addEventListener('keydown', (event) => { if (event.key === 'Enter') submit.click(); });
-  const el = h('article', { class: 'decision' },
-    h('div', { class: 'decision-top' }, h('span', { class: 'decision-badge' }), h('span', { class: 'decision-task faint' })),
-    h('h3', { class: 'decision-title' }), h('p', { class: 'decision-body muted' }),
-    h('div', { class: 'decision-options' }),
-    h('div', { class: 'decision-free input-group' }, field, submit),
-    h('p', { class: 'decision-answer' }), slot);
+  const el = h('article', { class: 'request' },
+    h('div', { class: 'request-top' }, h('span', { class: 'request-badge' }), h('span', { class: 'request-task faint' })),
+    h('h3', { class: 'request-title' }), h('p', { class: 'request-body muted' }),
+    h('div', { class: 'request-options' }),
+    h('div', { class: 'request-free input-group' }, field, submit),
+    h('p', { class: 'request-answer' }), slot);
   el.answer = answer;
   return el;
 }
 
-function updateDecision(el, decision, state) {
-  const open = decision.status === 'open';
-  el.dataset.status = decision.status;
-  el.querySelector('.decision-badge').replaceChildren(pill(open ? 'Needs you' : 'Answered', open ? 'amber' : 'green'));
-  setText(el.querySelector('.decision-task'), decision.task ? (state.plan.tasks[decision.task]?.title || decision.task) : '');
-  setText(el.querySelector('.decision-title'), decision.title);
-  setText(el.querySelector('.decision-body'), decision.body);
-  const options = el.querySelector('.decision-options');
+function updateRequest(el, request, state) {
+  const open = request.status === 'open';
+  el.dataset.status = request.status;
+  el.querySelector('.request-badge').replaceChildren(pill(open ? 'Needs you' : 'Answered', open ? 'amber' : 'green'));
+  setText(el.querySelector('.request-task'), request.task ? (state.plan.tasks[request.task]?.title || request.task) : '');
+  setText(el.querySelector('.request-title'), request.title);
+  setText(el.querySelector('.request-body'), request.body);
+  const options = el.querySelector('.request-options');
   options.hidden = !open;
-  el.querySelector('.decision-free').hidden = !open;
-  if (open && options.childElementCount !== (decision.options || []).length) {
-    options.replaceChildren(...(decision.options || []).map((option) => {
-      const button = h('button', { class: 'btn btn-sm decision-option', type: 'button', text: option });
+  el.querySelector('.request-free').hidden = !open;
+  if (open && options.childElementCount !== (request.options || []).length) {
+    options.replaceChildren(...(request.options || []).map((option) => {
+      const button = h('button', { class: 'btn btn-sm request-option', type: 'button', text: option });
       button.addEventListener('click', () => el.answer(button, option));
       return button;
     }));
   }
-  const answer = el.querySelector('.decision-answer');
+  const answer = el.querySelector('.request-answer');
   answer.hidden = open;
-  answer.replaceChildren(open ? '' : h('span', null, icon('check', { size: 12 }), ` ${decision.answer || ''}`));
+  answer.replaceChildren(open ? '' : h('span', null, icon('check', { size: 12 }), ` ${request.answer || ''}`));
 }
