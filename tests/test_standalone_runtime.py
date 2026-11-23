@@ -104,6 +104,20 @@ class NeutralDispatch(unittest.TestCase):
                                          self.run_dir / "sessions/s-t1-implement-1", 300)
         self.assertFalse(json.loads(path.read_text())["continuation"])
 
+    def test_long_node_and_task_have_bounded_stable_lease_identity(self):
+        task_id = "w-" + "x" * 60
+        self.store.commit("fixture", Changes().replace("run", "name", "bench-" + "z" * 35))
+        wt.create_worktree(self.repo, task_id, self.base, self.run_dir / "worktrees")
+        self.sup.tracking.create_task(title="Large", owns=["src"], branch="jbi/" + task_id,
+                                      worktree=self.run_dir / "worktrees" / task_id,
+                                      base_commit=self.base, task_id=task_id)
+        self.store.commit("fixture", Changes().set("plan", "tasks", task_id,
+            waves.normalize({"id": task_id, "title": "Large", "goal": "Long", "deps": [], "owns": ["src"],
+                             "acceptance": "true", "node": self.store.read("/run/name")})))
+        first = self.sup._task_lease(task_id, self.run_dir / "worktrees" / task_id)
+        self.assertRegex(first["session_id"], r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+        self.assertEqual(first["session_id"], self.sup._task_lease(task_id, self.run_dir / "worktrees" / task_id)["session_id"])
+
     def test_long_task_and_stage_names_have_bounded_stable_history_keys(self):
         self.store.commit("fixture", Changes().replace("run", "name", "tangram-wave4"))
         task_id = "wave4-auth-api"
@@ -164,6 +178,20 @@ class NeutralDispatch(unittest.TestCase):
         self.assertEqual(self.sup.tracking.fleet()["merges"], [])
         self.assertNotIn("t2", self.sup._handovers)
         self.assertNotEqual(self.store.read("/plan/tasks/t2/status"), "merged")
+
+    def test_standdown_preserves_dotfiles_that_look_owned_after_bad_normalization(self):
+        self.sup._task_lease("t1", self.worktree)
+        (self.worktree / "cfg").mkdir()
+        (self.worktree / ".env").write_text("preserved\n")
+        task = self.sup.tracking.get_task("t1")
+        task["owns"] = ["env"]
+        original_get = self.sup.tracking.get_task
+        self.sup.tracking.get_task = lambda tid: {**original_get(tid), "owns": ["env"]}
+        self.addCleanup(lambda: setattr(self.sup.tracking, "get_task", original_get))
+        self.sup._stop("standdown")
+        self.assertEqual((self.worktree / ".env").read_text(), "preserved\n")
+        self.assertIsNone(self.sup.tracking.fleet()["leases"][0]["released_at"])
+        self.assertEqual(wt.head(self.worktree, "HEAD"), self.base)
 
     def test_standdown_refuses_to_commit_unowned_work_and_preserves_lease(self):
         from unittest import mock
@@ -435,6 +463,23 @@ class NeutralDispatch(unittest.TestCase):
         other = wt.restore_worktree(self.repo, "other", self.base, self.run_dir / "worktrees")
         self.assertEqual(wt.head(other, "HEAD"), self.base)
         self.assertEqual(wt.git(other, "symbolic-ref", "-q", "--short", "HEAD"), "jbi/other")
+
+    def test_merge_does_not_reuse_another_tasks_green_commit(self):
+        self.store.commit("fixture", Changes().set("plan", "tasks", "t2", {
+            "id": "t2", "title": "Other", "goal": "other", "deps": [], "owns": ["src/t2.txt"],
+            "acceptance": "true", "model": "sim-l", "status": "ready", "commit": self.base}))
+        self.sup._task_lease("t1", self.worktree)
+        self.sup.tracking.record_ci("t1", pr_number=901, head_sha=self.base, base_commit=self.base,
+                                    service_reply={"job": "job1"})
+        self.sup.ci_adapter = type("CI", (), {
+            "handover": lambda repo, task, *args, **kw: ci_adapter.HandoverResult(
+                "t2", "jbi/t2", 902, self.base, {"job": "job2"}, self.base),
+            "pending": lambda *_: False,
+            "confirm_merge": lambda repo, result, *args, **kw: (_ for _ in ()).throw(
+                AssertionError("old evidence reused; new direct proof required"))})()
+        with self.assertRaisesRegex(AssertionError, "new direct proof required"):
+            self.sup._merge("t2", "vibe", self.worktree)
+        self.assertEqual(self.sup.tracking.fleet()["merges"], [])
 
     def test_direct_ci_marks_verified_merge_only(self):
         self.sup._task_lease("t1", self.worktree)

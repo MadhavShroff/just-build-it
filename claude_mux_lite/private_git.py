@@ -101,6 +101,8 @@ class PrivateGit:
     def checkpoint(self) -> None:
         """Keep an ordered checkpoint of a private commit before checking ownership."""
         from .harness import host_git_argv, host_git_env
+        if self.guard.branch != self.guard._git("symbolic-ref", "-q", "HEAD")[1].decode().strip():
+            self.checkpoint_error = "the private command switched the leased branch"
         head = self.guard._rev()
         if not OID.fullmatch(head) or self._objects(head):
             return
@@ -118,6 +120,9 @@ class PrivateGit:
         if not OID.fullmatch(self.before):
             raise RuntimeError("the pinned base is not a full commit id")
         head = self.guard._rev()
+        for xy, rel, original in self.guard._status():
+            if (xy[1] in "ADMU" or xy[:1] in "ADMU") and rel in self.guard.baseline:
+                raise RuntimeError("changes to initially dirty tracked files do not publish a branch")
         if not OID.fullmatch(head):
             raise RuntimeError("the private Git transaction produced no commit")
         if self.guard.branch != self.guard._git("symbolic-ref", "-q", "HEAD")[1].decode().strip():
@@ -138,13 +143,26 @@ class PrivateGit:
         if ancestry.returncode != 0:
             raise RuntimeError("private Git history does not extend the leased base")
         try:
-            # Before copying objects, every changed path must still have this task's live lease.
+            # Before copying objects, every commit and every changed path needs the live lease.
+            names = set()
+            for sha in commits:
+                changed = subprocess.run(host_git_argv("diff-tree", "--no-commit-id", "--name-only", "-r",
+                                                       "-z", "--root", sha, git_dir=self.git_dir,
+                                                       work_tree=self.guard.root),
+                                         env=host_git_env(), capture_output=True, timeout=60, check=True)
+                names.update(raw.decode("utf-8", "surrogateescape") for raw in changed.stdout.split(b"\0") if raw)
+            if any(not self.guard.owned(name) for name in names):
+                raise RuntimeError("one private commit touches a path outside the task lease")
             diff = subprocess.run(host_git_argv("diff", "--name-only", "-z", self.before, head,
                                                git_dir=self.git_dir, work_tree=self.guard.root),
                                   env=host_git_env(), capture_output=True, timeout=60, check=True)
             names = [raw.decode("utf-8", "surrogateescape") for raw in diff.stdout.split(b"\0") if raw]
             if not self.guard.allow_commits or any(not self.guard.owned(name) for name in names):
                 raise RuntimeError("the private commit is outside the task lease")
+            for xy, rel, original in self.guard._status():
+                for path in (rel, original):
+                    if path and path in names and not self.guard.owned(path):
+                        raise RuntimeError("the command changed an unowned path: " + path)
             if self._git_head() != self.before:
                 raise RuntimeError("the real leased ref changed during the command")
             bundle = self.root / "accepted.bundle"
@@ -163,30 +181,57 @@ class PrivateGit:
                                      capture_output=True, timeout=120)
             if fetched.returncode != 0 or not self._objects(head):
                 raise RuntimeError("the real Git store rejected private commit objects")
+            for xy, path, original in self.guard._status():
+                if xy[1] in "ADMU" or xy[:1] in "ADMU":
+                    raise RuntimeError("uncommitted tracked edits must be preserved before ref publication")
             for name in names:
                 current = self.guard.root / name
                 if current.is_dir() and not current.is_symlink():
                     raise RuntimeError("a published path is unexpectedly a directory: " + name)
-            # Once the fixed tree matches the live worktree, object I/O cannot overwrite paths by name.
-            index = subprocess.run(host_git_argv("read-tree", "--reset", "-u", head,
+            # Update only the index. Commit-created paths below get checked individually.
+            index = subprocess.run(host_git_argv("read-tree", head,
                                                 git_dir=self.real_git, work_tree=self.guard.root),
                                    env=host_git_env(), stdin=subprocess.DEVNULL,
                                    capture_output=True, timeout=120)
             if index.returncode != 0:
                 raise RuntimeError("the live worktree did not accept the validated commit")
+            for name in names:
+                current = self.guard.root / name
+                if os.path.lexists(current) and os.path.islink(current.parent) is False:
+                    committed = subprocess.run(host_git_argv("show", head + ":" + name,
+                                                            git_dir=self.real_git, work_tree=self.guard.root),
+                                               env=host_git_env(), stdin=subprocess.DEVNULL,
+                                               capture_output=True, timeout=60)
+                    if committed.returncode == 0 and current.is_file() and current.read_bytes() != committed.stdout:
+                        raise RuntimeError("publication would overwrite another uncommitted path: " + name)
+                if not current.is_file():
+                    # Symlinks are accepted only if their stored target stays in this worktree.
+                    mode = subprocess.run(host_git_argv("ls-tree", head, "--", name,
+                                                       git_dir=self.real_git, work_tree=self.guard.root),
+                                          env=host_git_env(), stdin=subprocess.DEVNULL,
+                                          capture_output=True, timeout=60, check=True)
+                    if b"120000 blob" in mode.stdout:
+                        target = subprocess.run(host_git_argv("show", head + ":" + name,
+                                                             git_dir=self.real_git, work_tree=self.guard.root),
+                                               env=host_git_env(), stdin=subprocess.DEVNULL,
+                                               capture_output=True, timeout=60, check=True).stdout.decode("utf-8")
+                        if Path(os.path.normpath(current.parent / target)) != Path(os.path.normpath(current)):
+                            raise RuntimeError("an escaping symlink is outside the task worktree")
+                    elif not current.exists() and any(os.path.islink(p) for p in current.parents):
+                        raise RuntimeError("a published path crosses a source symlink")
+                checkout = subprocess.run(host_git_argv("checkout-index", "-f", "--", name,
+                                                       git_dir=self.real_git, work_tree=self.guard.root),
+                                          env=host_git_env(), stdin=subprocess.DEVNULL,
+                                          capture_output=True, timeout=60)
+                if checkout.returncode:
+                    raise RuntimeError("committed path could not be restored after index publication")
             update = subprocess.run(host_git_argv("update-ref", self.guard.branch, head, self.before,
                                                  git_dir=self.real_git, work_tree=self.guard.root),
                                     env=host_git_env(), stdin=subprocess.DEVNULL,
                                     capture_output=True, timeout=60)
             if update.returncode != 0:
                 raise RuntimeError("the leased branch did not accept the new commit")
-            # An index refresh follows publication rather than using agent-written state.
-            refresh = subprocess.run(host_git_argv("read-tree", head, git_dir=self.real_git,
-                                                  work_tree=self.guard.root), env=host_git_env(),
-                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-            if refresh.returncode != 0:
-                raise RuntimeError("the real index did not accept the validated commit: "
-                                   + refresh.stderr.decode("utf-8", "replace")[-400:])
+            # The ref uses compare-and-swap after the exact source checks above.
             return head, names
         finally:
             self.guard.head = self._git_head()

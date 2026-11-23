@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -79,6 +80,41 @@ class TestWorktreeHygiene(unittest.TestCase):
             notes2 = wt.prepare_worktree(root, setup_commands=[f"echo hi >> {marker_file}"], cache_key="sha-1")
             self.assertTrue(any("cache hit" in n for n in notes2))
             self.assertEqual(len(marker_file.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_dotfile_owns_boundary_and_zero_terminated_dirt(self):
+        for bad in [".env", ".github/workflows/ci.yml", "../env"]:
+            self.assertFalse(wt.path_owned(bad, ["env", "github"]))
+        self.assertTrue(wt.path_owned("./env", ["env"]))
+        self.assertTrue(wt.path_owned(".env", [".env"]))
+        self.assertFalse(wt.path_owned(".github", [".github/workflows"]))
+
+    def test_rewritten_pointer_never_replaces_the_registered_worktree_metadata(self):
+        tmp = Path(tempfile.mkdtemp(prefix="jbi-pin-restart-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        repo = tmp / "repo"
+        wt.init_repo(repo)
+        (repo / "base").write_text("base")
+        base = wt.commit_all(repo, "base")
+        path = wt.create_worktree(repo, "task", base, tmp / "worktrees")
+        before = wt.pin_git_metadata(path, repo)
+        hostile = path / "fakegit"
+        hostile.mkdir()
+        (hostile / "HEAD").write_text("ref: refs/heads/evil")
+        (hostile / "commondir").mkdir()
+        (path / ".git").write_text("gitdir: fakegit")
+        after = wt.pin_git_metadata(path, repo)
+        self.assertEqual(before, after)
+        self.assertNotEqual(after[0], hostile.resolve())
+        wt.unpin_git_metadata(path)
+        self.assertEqual(wt.pin_git_metadata(path, repo), before)
+        self.assertEqual(wt.current_branch_or_none(path), "jbi/task")
+        wt.pin_git_metadata(path, repo)
+        self.assertEqual(wt.head(path), wt.head(repo, "jbi/task"))
+        import jbi.resume as resume
+        ok, why = resume._worktree_contents_committed(repo, path)
+        self.assertFalse(ok, why)
+        self.assertEqual(wt.git(path, "rev-parse", "HEAD"), base)
+        self.assertEqual(wt.git(path, "status", "--porcelain"), "?? fakegit/")
 
     def test_host_admission_check(self) -> None:
         with mock.patch("os.getloadavg", return_value=(40.0, 30.0, 20.0)), mock.patch("os.cpu_count", return_value=8):

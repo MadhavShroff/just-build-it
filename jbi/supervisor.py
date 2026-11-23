@@ -37,6 +37,14 @@ STAGE_STATUS = {"implement": "running", "merge": "queued"}
 WINDOW_NAME = re.compile(r"^[a-z0-9-]+-wave\d+-task\d+-[a-z-]+$")    # REQUIREMENT 1.2
 
 
+def _bounded_id(prefix: str, *parts: str) -> str:
+    """Preserve readable short ids and bound longer unique task identities."""
+    raw = "-".join((prefix, *parts))
+    if len(raw) <= 64:
+        return raw
+    return prefix + "-" + hashlib.blake2s(raw.encode(), digest_size=16).hexdigest()
+
+
 @dataclass(frozen=True)
 class Window:
     """One tmux window: the name it shows and the id that stays unique.
@@ -294,7 +302,8 @@ class Supervisor:
         for lease in self.tracking.fleet()["leases"]:
             if lease["task_id"] == task_id and lease["released_at"] is None:
                 return lease
-        grant = self.tracking.dispatch(task_id, session_id=f"s-{self.dag_name()}-{task_id}", owns=owns,
+        session_id = _bounded_id("s", self.dag_name(), task_id)
+        grant = self.tracking.dispatch(task_id, session_id=session_id, owns=owns,
                                        branch=branch, worktree=worktree)
         return grant["lease"]
 
@@ -944,7 +953,8 @@ class Supervisor:
                                                          row["service_reply"], row["base_commit"])
                     elif original.get("head_commit") == task.get("commit"):
                         records = [row for row in self.tracking.fleet()["ci_submissions"]
-                                   if row["state"] == "green" and row["head_sha"] == task.get("commit")]
+                                   if row["task_id"] == tid and row["state"] == "green"
+                                   and row["head_sha"] == task.get("commit")]
                         if len(records) == 1:
                             row = records[0]
                             handover = ci_mod.HandoverResult(tid, f"jbi/{tid}", row["pr_number"], row["head_sha"],

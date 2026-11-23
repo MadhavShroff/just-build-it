@@ -452,12 +452,14 @@ class BashGuard:
                  allow_commits: bool = False):
         self.root = Path(os.path.realpath(workdir))
         self.owns = tuple(owns)
+        self._ignored_backup: dict[str, tuple[str, os.stat_result | None, bytes | None, str | None]] = {}
         self.authorize = authorize
         self.allow_commits = allow_commits
         from .sandbox import discover_git
         self.git_dir, self.common_dir = discover_git(self.root)
         self.head = self._rev()
         self.branch = self._git("symbolic-ref", "-q", "HEAD")[1].decode().strip()
+        self.baseline: dict[str, tuple[str, str]] = {}
         self.baseline = self.snapshot()
 
     # -- git helpers --
@@ -485,7 +487,28 @@ class BashGuard:
         rc, out = self._git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching")
         if rc != 0:
             raise GuardError("git status failed")
-        return parse_status(out)
+        ignored_rc, ignored_raw = self._git(
+            "ls-files", "-o", "-i", "--exclude-standard", "--directory", "-z")
+        if ignored_rc != 0:
+            raise GuardError("Git ignored-file discovery failed")
+        ignored = [("!!", item.decode("utf-8", "surrogateescape"), None)
+                   for item in ignored_raw.split(b"\0") if item]
+        return self._ignored_entries(parse_status(out) + ignored)
+
+    def _ignored_entries(self, entries: list[tuple[str, str, str | None]]) -> list[tuple[str, str, str | None]]:
+        """Enumerate known ignored trees. Other ignored files stay explicit entries."""
+        current = {rel: (xy, rel, orig) for xy, rel, orig in entries}
+        for xy, rel, original in entries:
+            if xy != "!!" or not rel.endswith("/") or not any(item.startswith(rel) for item in self.baseline):
+                continue
+            rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", rel)
+            if rc != 0 or raw.count(b"\0") > 10000:
+                continue
+            for item in raw.split(b"\0"):
+                child = item.decode("utf-8", "surrogateescape") if item else ""
+                if child != rel:
+                    current[child] = ("!!", child, None)
+        return list(current.values())
 
     def _signature(self, path: str) -> str:
         full = self.root / path
@@ -505,10 +528,30 @@ class BashGuard:
     def snapshot(self) -> dict[str, tuple[str, str]]:
         """Map each dirty path to (status, content signature)."""
         snap: dict[str, tuple[str, str]] = {}
-        for xy, path, orig in self._status():
+        entries = self._status()
+        for xy, path, orig in entries:
             for p in (path, orig):
                 if p:
                     snap[p] = (xy, self._signature(p))
+        directories = [path for xy, path, _ in entries if xy == "!!" and path.endswith("/")]
+        for directory in directories:
+            # Enumerate real ignored leaves, not the aggregate directory status.
+            rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", directory)
+            if rc != 0 or raw.count(b"\0") > 10000:
+                continue
+            for item in raw.split(b"\0"):
+                if item:
+                    child = item.decode("utf-8", "surrogateescape")
+                    snap[child] = ("!!", self._signature(child))
+                    if child not in self._ignored_backup:
+                        file = self._safe(child)
+                        try:
+                            if file and not file.is_symlink() and file.is_file() and file.stat().st_size <= 4_000_000:
+                                self._ignored_backup[child] = ("file", file.stat(), file.read_bytes(), None)
+                            elif file and file.is_symlink():
+                                self._ignored_backup[child] = ("link", None, None, os.readlink(file))
+                        except OSError:
+                            continue
         return snap
 
     def owned(self, path: str) -> bool:
@@ -582,7 +625,7 @@ class BashGuard:
                 return "Git directory and execution options are reserved for the runtime"
             subcommand = args[verb] if verb is not None else ""
             read_commands = {"add", "commit", "diff", "log", "show", "status", "ls-files", "rev-list",
-                             "rev-parse", "cat-file", "checkout", "restore", "grep", "rm", "blame",
+                             "rev-parse", "cat-file", "checkout", "grep", "rm", "blame",
                              "describe", "shortlog", "show-ref", "for-each-ref", "branch", "reset", "clean"}
             if subcommand not in read_commands:
                 return f"git {subcommand or '<unspecified>'} is confined to the private task index"
@@ -592,13 +635,26 @@ class BashGuard:
                 return "this task does not allow shell Git mutations"
             if subcommand == "reset" and "--" not in args:
                 return "a shell reset may name only paths"
-            if subcommand == "checkout" and any(a in ("-b", "-B", "-c", "-C", "--orphan", "--detach")
-                                               for a in args):
-                return "a shell cannot create or detach a leased branch"
+            if subcommand == "checkout" and (any(a in ("-b", "-B", "-c", "-C", "--orphan", "--detach", "-f", "--force")
+                                                for a in args) or "--" not in args):
+                return "a shell checkout may restore only files from the pinned HEAD"
             if subcommand in ("checkout", "switch") and any(a in ("-b", "-B", "-c", "-C", "--orphan", "--detach") for a in args):
                 return "a shell cannot create or detach a leased branch"
             if any(a in ("--global", "--system", "--file", "-f") for a in args if subcommand == "config"):
                 return "only local leased config is permitted"
+            if subcommand == "reset" and any(a not in ("HEAD", "--") for a in args[1:]):
+                return "a shell reset may restore only HEAD paths"
+            if subcommand == "checkout" and any(
+                    (a.startswith("-") or re.fullmatch(r"[0-9a-fA-F]{4,64}", a))
+                    and a not in ("HEAD", "--") for a in args[1:]):
+                return "a shell checkout may restore only current HEAD paths"
+            if subcommand in ("add", "rm", "checkout", "reset") and "--" in args:
+                for path in args[args.index("--") + 1:]:
+                    if path.startswith("("):
+                        return "Git pathspec expressions are refused"
+                    if not self.owned(path):
+                        # Metadata and parent symlink changes cannot become leased source.
+                        return f"staged path is outside the task lease: {path}"
             for j, arg in enumerate(args):
                 value = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else None
                 if arg in ("-C", "--git-dir", "--work-tree") and j + 1 < len(args):
@@ -687,6 +743,29 @@ class BashGuard:
         if full is None or "U" in xy or xy in ("DD", "AA"):
             return False
         if xy in ("??", "!!"):
+            restored = self._ignored_backup.get(rel)
+            if restored:
+                kind, metadata, content, target = restored
+                try:
+                    if kind == "link" and target is not None:
+                        if full.is_dir() and not full.is_symlink():
+                            shutil.rmtree(full)
+                        else:
+                            full.unlink(missing_ok=True)
+                        full.parent.mkdir(parents=True, exist_ok=True)
+                        full.symlink_to(target)
+                        return True
+                    if content is not None:
+                        if full.is_dir() and not full.is_symlink():
+                            shutil.rmtree(full)
+                        full.parent.mkdir(parents=True, exist_ok=True)
+                        full.write_bytes(content)
+                        if metadata is not None:
+                            os.chmod(full, metadata.st_mode & 0o777)
+                        return True
+                    return False
+                except OSError:
+                    return False
             try:
                 if os.path.islink(full) or full.is_file():
                     full.unlink()
@@ -740,7 +819,10 @@ class BashGuard:
                 if known == (xy, self._signature(rel)):
                     continue
                 if known is not None:
-                    errors.append(f"{rel} changed from its baseline. Left for the dispatcher lease check")
+                    if self._revert(xy, rel, is_orig):
+                        reverted.append(rel)
+                    else:
+                        errors.append(f"{rel} changed from its baseline and cannot be restored")
                 elif self._revert(xy, rel, is_orig):
                     reverted.append(rel)
                 else:
@@ -839,14 +921,13 @@ class LiteHarness:
         self._shell_rejected: list[str] = []
         self.usage = Usage()
 
-    def _finish(self, result: HarnessResult, *, publish: bool = True) -> HarnessResult:
+    def _finish(self, result: HarnessResult) -> HarnessResult:
         """Accept only valid owned private commits. Destroy all other private Git operations."""
         if self._finalized:
             return result
         error = None
         try:
-            if publish:
-                self._private_git.publish()
+            self._private_git.publish()
         except Exception as exc:
             error = f"ERROR: private Git publication refused: {redact(str(exc), self._secrets)}"
         finally:
@@ -918,7 +999,7 @@ class LiteHarness:
             return self._fail(result, f"max_turns {self.max_turns} reached", last_text, code=2)
         finally:
             result.usage = self.usage
-            self._finish(result, publish=result.exit_code == 0 and not self._shell_rejected)
+            self._finish(result)
 
     # -- internals --
     def _authorized(self, rel: str) -> bool:
@@ -1067,9 +1148,8 @@ class LiteHarness:
                 note = f"[timed out after {limit:.0f}s]"
         out = raw.decode("utf-8", errors="replace")
         self._private_git.checkpoint()
-        if proc.returncode != 0 or proc.returncode is None:
+        if proc.returncode != 0:
             self._shell_rejected.append("command failed after writing")
-            self._private_git.checkpoint_error = "a failed command invalidated the private Git transaction"
         if len(out) > BASH_OUT_MAX:
             out = out[:BASH_OUT_MAX // 2] + "\n...[truncated]...\n" + out[-BASH_OUT_MAX // 2:]
         reverted, errors = self.guard.reconcile()

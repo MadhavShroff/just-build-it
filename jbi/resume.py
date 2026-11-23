@@ -181,12 +181,10 @@ def _worktree_contents_committed(repo: Path, path: Path) -> tuple[bool, str]:
     Returns (ok, why).
     """
     try:
-        out = subprocess.run(
-            ["git", "-C", str(path), "status", "--ignored", "--porcelain", "-uall"],
-            capture_output=True, text=True,
-        )
-    except OSError as error:
-        return False, f"git status unavailable: {error}"
+        git_dir, common = wt.pin_git_metadata(path, repo)
+        out = wt.trusted_git(git_dir, common, path, "status", "--ignored", "--porcelain", "-uall", result=True)
+    except (OSError, wt.GitError) as error:
+        return False, f"commit proof refused: {str(error)[:200]}"
     if out.returncode != 0:
         return False, f"git status failed: {(out.stderr or out.stdout).strip()[:200]}"
     if out.stdout.strip():

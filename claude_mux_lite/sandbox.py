@@ -93,9 +93,9 @@ class LinuxSandbox:
         args = (["--bind", str(common), str(common)] if self.private_git else self._ro(common))
         if git_dir != common:
             args += (["--bind", str(git_dir), str(git_dir)] if self.private_git else self._ro(git_dir))
-            entry = self.workdir / ".git"
-            if entry.is_file():
-                args += self._ro(entry)
+        entry = self.workdir / ".git"
+        if entry.is_file():
+            args += self._ro(entry)
         if self.private_git and self.real_common_dir is not None:
             args += self._ro(Path(self.real_common_dir))
         return args
@@ -160,8 +160,6 @@ def fenced_bash(guard: object, command: str, private: object, scratch: Path, *,
     reverted, errors = guard.reconcile()
     if errors or reverted:
         private.checkpoint_error = "the command changed an unowned path; private commits are refused"
-    if result.returncode != 0:
-        private.checkpoint_error = "a failed command invalidated the private Git transaction"
     if reverted or errors:
         result.stderr += "\n" + "; ".join([f"reverted {', '.join(reverted)}"] if reverted else [] + errors)
         result.returncode = result.returncode or 1

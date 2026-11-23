@@ -25,61 +25,107 @@ def _host_env() -> dict[str, str]:
     return {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 
 
-_RUNTIME_GIT: dict[tuple[Path, Path], tuple[Path, Path]] = {}
+_RUNTIME_GIT: dict[Path, tuple[Path, Path]] = {}
 
 
-def pin_git_metadata(worktree: Path) -> tuple[Path, Path]:
-    """Keep this runtime's trusted metadata, independent of later worktree edits."""
-    pinned = _RUNTIME_GIT.get((Path(__file__).resolve(), Path(worktree).resolve()))
-    if pinned is None:
-        pinned = trusted_git_metadata(worktree)
-        _RUNTIME_GIT[(Path(__file__).resolve(), Path(worktree).resolve())] = pinned
-    return pinned
+def pin_git_metadata(worktree: Path, repository: Path | None = None) -> tuple[Path, Path]:
+    """Bind the registered identity of a task worktree before trust-dependent Git calls."""
+    key = Path(worktree).resolve()
+    if key not in _RUNTIME_GIT or repository is not None:
+        _RUNTIME_GIT[key] = trusted_git_metadata(worktree, repository)
+    return _RUNTIME_GIT[key]
 
 
 def unpin_git_metadata(worktree: Path) -> None:
-    _RUNTIME_GIT.pop((Path(__file__).resolve(), Path(worktree).resolve()), None)
+    _RUNTIME_GIT.pop(Path(worktree).resolve(), None)
 
 
 class GitError(RuntimeError):
     """A git command failed. The message holds git's own error text."""
 
 
-def trusted_git_metadata(workdir: Path) -> tuple[Path, Path]:
-    """Read storage paths without Git. The runtime calls this before an agent can edit the pointer."""
+def trusted_git_metadata(workdir: Path, repository: Path | None = None) -> tuple[Path, Path]:
+    """Pin trusted paths without Git. Repositories supply their trusted task registrations."""
     from claude_mux_lite.sandbox import discover_git
+    path = Path(workdir).resolve()
+    if repository is not None:
+        root, common = discover_git(Path(repository).resolve())
+        entry = path / ".git"
+        if entry.is_dir():
+            if root.resolve() != entry.resolve():
+                raise GitError(f"the plain worktree {workdir} differs from repository {repository}")
+            return root, common
+        if not entry.is_file() or entry.is_symlink():
+            raise GitError(f"cannot pin linked worktree {workdir}: its .git file is irregular")
+        linked = (common / "worktrees").resolve()
+        owner = linked / path.name
+        record = owner / "gitdir"
+        try:
+            if owner.is_symlink() or not record.is_file() or record.is_symlink():
+                raise GitError(f"no trusted registration for task worktree {workdir}")
+            if owner.resolve().parent != linked or os.path.realpath(record.read_text().strip()) != str(entry):
+                raise GitError(f"worktree registration mismatch for {workdir}")
+        except OSError as exc:
+            raise GitError(f"cannot inspect task worktree registrations: {exc}") from exc
+        git_dir = owner.resolve()
+        pointer = git_dir / "commondir"
+        try:
+            if pointer.read_text(encoding="utf-8").strip() != "../..":
+                raise GitError(f"worktree {workdir} leaves repository metadata {repository}")
+        except OSError as exc:
+            raise GitError(f"cannot read the registered worktree commondir: {exc}") from exc
+        current_common = common
+        if not (git_dir / "HEAD").is_file():
+            raise GitError(f"the registered worktree {workdir} has no HEAD")
+        if current_common != common:
+            raise GitError(f"worktree {workdir} resolves outside repository {repository}")
+        return git_dir, current_common
     try:
-        return discover_git(Path(workdir).resolve())
+        return discover_git(path)
     except (OSError, RuntimeError) as exc:
         raise GitError(f"cannot pin trusted Git storage for {workdir}: {exc}") from exc
 
 
-def trusted_git(git_dir: Path, common_dir: Path, workdir: Path, *args: str, check: bool = True) -> str:
+def trusted_git(git_dir: Path, common_dir: Path, workdir: Path, *args: str,
+                check: bool = True, result: bool = False) -> str | subprocess.CompletedProcess:
     """Run fixed host Git operations on pinned metadata and an empty attribute source."""
-    from claude_mux_lite.harness import host_git_argv, host_git_env
+    from claude_mux_lite.harness import host_git_env
     if not common_dir.is_dir() or (common_dir / "objects" == git_dir / "objects" and common_dir != git_dir):
         raise GitError("pinned Git metadata does not name its shared repository")
-    argv = host_git_argv(*IDENTITY, "--no-replace-objects", "-c", "extensions.worktreeConfig=false",
-                         "-c", "core.bare=false", *args,
-                         work_tree=Path(workdir).resolve(), git_dir=Path(git_dir).resolve())
+    argv = ["git", *IDENTITY, "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false", "-c", "diff.external=", "-c", "protocol.file.allow=never",
+            "-c", "core.attributesFile=/dev/null", "-c", "core.untrackedCache=false",
+            "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "-c", "commit.gpgSign=false", "-c", "extensions.worktreeConfig=false",
+            "-c", "core.bare=false", *args]
     env = host_git_env()
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_ATTR_NOSYSTEM"] = "1"
     env["GIT_COMMON_DIR"] = str(Path(common_dir).resolve())
-    result = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
-    if check and result.returncode != 0:
-        raise GitError(f"git {' '.join(args)}: {(result.stderr or result.stdout).strip()}")
-    return result.stdout.strip()
+    env["GIT_DIR"] = str(Path(git_dir).resolve())
+    env["GIT_WORK_TREE"] = str(Path(workdir).resolve())
+    proc = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+    if result:
+        return proc
+    if result:
+        return proc
+    if check and proc.returncode != 0:
+        raise GitError(f"git {' '.join(args)}: {(proc.stderr or proc.stdout).strip()}")
+    if "-z" in args:
+        return proc.stdout
+    return proc.stdout.strip()
 
 
 def git(repo: Path | str, *args: str, check: bool = True) -> str:
-    pinned = _RUNTIME_GIT.get((Path(__file__).resolve(), Path(repo).resolve()))
+    pinned = _RUNTIME_GIT.get(Path(repo).resolve())
     if pinned is not None:
         return trusted_git(*pinned, Path(repo).resolve(), *args, check=check)
     result = subprocess.run(["git", *IDENTITY, *HOST_CONFIG, "-C", str(repo), *args],
                             capture_output=True, text=True, stdin=subprocess.DEVNULL, env=_host_env())
     if check and result.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {(result.stderr or result.stdout).strip()}")
+    if "-z" in args:
+        return result.stdout
     return result.stdout.strip()
 
 
@@ -132,29 +178,42 @@ def commit_all(path: Path, message: str) -> str | None:
     return git(path, "rev-parse", "HEAD")
 
 
+def _path_text(value: str) -> str:
+    """Remove only the explicit repository-relative prefix and one offered quote."""
+    text = value.strip()
+    if len(text) > 1 and text[0] == text[-1] == '"':
+        text = text[1:-1]
+    return text[2:] if text.startswith("./") else text
+
+
 def dirty_paths(worktree: Path) -> list[str]:
     """Return every modified, added, deleted, renamed, or untracked path in `worktree`."""
-    out = git(worktree, "status", "--porcelain", "-uall")
+    out = git(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     if not out:
         return []
+    from claude_mux_lite.harness import parse_status
     paths: list[str] = []
-    for raw in out.splitlines():
-        parts = raw.lstrip().split(None, 1)
-        if len(parts) < 2:
-            continue
-        rest = parts[1].strip()
-        for item in (rest.split(" -> ") if " -> " in rest else [rest]):
-            clean = item.strip().strip('"').lstrip("./")
-            if clean and clean not in paths:
-                paths.append(clean)
+    if not out.endswith("\0"):
+        for raw in out.splitlines():
+            parts = raw.split(None, 1)
+            if len(parts) == 2:
+                for item in (parts[1].split(" -> ") if " -> " in parts[1] else [parts[1]]):
+                    cleaned = _path_text(item)
+                    if cleaned and cleaned not in paths:
+                        paths.append(cleaned)
+        return paths
+    for xy, path, origin in parse_status(out.encode("utf-8", "surrogateescape")):
+        for item in (path, origin):
+            if item and item not in paths:
+                paths.append(item)
     return paths
 
 
 def path_owned(path: str, owns: Iterable[str]) -> bool:
     """Return True when `path` matches at least one owned path, directory prefix, or glob."""
-    normalized = path.strip().lstrip("./")
+    normalized = _path_text(path)
     for raw in owns:
-        pattern = raw.strip().lstrip("./").rstrip("/")
+        pattern = _path_text(raw).rstrip("/")
         if not pattern:
             continue
         if normalized == pattern or normalized.startswith(pattern + "/"):
@@ -192,6 +251,10 @@ def create_worktree(repo: Path, task: str, base: str, root: Path) -> Path:
 def restore_worktree(repo: Path, task: str, base: str, root: Path, expected_head: str | None = None) -> Path:
     """Attach a released task to its exact parked branch. Never overwrite existing work."""
     path = root / task
+    if not (path / ".git").exists():
+        unpin_git_metadata(path)
+    else:
+        pin_git_metadata(path, Path(repo))
     branch = f"jbi/{task}"
     if not (path / ".git").exists():
         existing = git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/jbi-parked/").splitlines()
@@ -222,7 +285,7 @@ def restore_worktree(repo: Path, task: str, base: str, root: Path, expected_head
     if matches[0] != branch:
         git(repo, "branch", "-m", matches[0].removeprefix("refs/heads/"), branch)
     git(path, "checkout", branch)
-    pin_git_metadata(path)
+    pin_git_metadata(path, Path(repo))
     return path
 
 

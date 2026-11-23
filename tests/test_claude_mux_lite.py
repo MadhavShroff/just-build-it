@@ -363,6 +363,25 @@ class NeonFenceRegressions(GitFence):
         self.assertFalse((self.work / "secret.env").exists())
         self.assertIn("secret.env", reverted)
 
+    def test_writes_in_a_preexisting_ignored_directory_are_reconciled(self):
+        ignored = self.work / "build" / "sub"
+        ignored.mkdir(parents=True)
+        original = ignored / "existing.txt"
+        original.write_text("keep\n")
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = self.guarded()
+        changed = ignored / "new.txt"
+        from claude_mux_lite.sandbox import LinuxSandbox
+        with LinuxSandbox(self.work, git_dir=guard.git_dir, common_dir=guard.common_dir) as fence:
+            subprocess.run(fence.argv("printf changed > build/sub/existing.txt; printf new > build/sub/new.txt"),
+                           capture_output=True, text=True)
+        original.write_text("changed\n")
+        changed.write_text("new\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(original.read_text(), "keep\n")
+        self.assertFalse(changed.exists())
+        self.assertEqual(guard.reconcile()[1], [])
+
     def test_dynamic_git_verbs_cannot_bypass_the_precheck(self):
         guard = self.guarded()
         for command in ("a=stash; git $a", "x=update-ref; git \"$x\" refs/heads/other HEAD",
@@ -390,10 +409,57 @@ class NeonFenceRegressions(GitFence):
         self.assertEqual(done.returncode, 0, done.stderr)
 
 
-class NeonHostAndSandboxRegression(Base):
+class NeonHostAndSandboxRegression(GitFence):
+    def test_a_private_git_command_cannot_rewrite_the_linked_pointer(self):
+        from claude_mux_lite.private_git import PrivateGit
+        from claude_mux_lite.sandbox import LinuxSandbox
+        from claude_mux_lite.private_git import PrivateGit
+        guard = BashGuard(self.work, ("src",), lambda p: False)
+        private = PrivateGit(guard, self.tmp)
+        self.addCleanup(private.__exit__)
+        with LinuxSandbox(self.work, git_dir=guard.git_dir, common_dir=guard.common_dir,
+                          private_git=True, real_common_dir=private.real_common) as fence:
+            done = subprocess.run(fence.argv("printf 'gitdir: /tmp/evil' > .git"), capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("worktrees/t1", (self.work / ".git").read_text())
+
+    def test_two_commits_cannot_hide_an_unowned_file_then_restore_it(self):
+        from claude_mux_lite.sandbox import LinuxSandbox
+        from claude_mux_lite.private_git import PrivateGit
+        guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)
+        private = PrivateGit(guard, self.tmp)
+        self.addCleanup(private.__exit__)
+        with LinuxSandbox(self.work, git_dir=guard.git_dir, common_dir=guard.common_dir,
+                          private_git=True, real_common_dir=private.real_common) as fence:
+            for cmd in ("cp src/a.py src/b.py; printf bad > other/b.txt; git add -A; git -c user.name=t -c user.email=t@t commit -qm bad",
+                        "git checkout HEAD^ -- other/b.txt; git -c user.name=t -c user.email=t@t commit -qm good"):
+                done = subprocess.run(fence.argv(cmd), env=H.fence_env(), capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+        with self.assertRaisesRegex(RuntimeError, "one private commit"):
+            private.publish()
+
+    def test_a_failed_test_does_not_invalidate_later_valid_private_commits(self):
+        guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)
+        result = leased_shell(guard, "false; printf next > src/new.txt && git add src/new.txt && "
+                             "git -c user.name=a -c user.email=b commit -qm correct")
+        self.assertIn("correct", subprocess.run(["git", "-C", str(self.repo), "log", "-1", "--format=%s", "jbi/t1"],
+                                               capture_output=True, text=True).stdout)
+        self.assertEqual(result.returncode, 0)
+
+    def test_polishing_one_file_does_not_overwrite_a_second_uncommitted_file(self):
+        harness = LiteHarness(workdir=self.work, model="m", task_id="t1", tracking=self.tr,
+                              owns=("src",), allowed_commits=True, transport=Script(reply(use("b", "bash", command="true"))))
+        (self.work / "src" / "b.py").write_text("uncommitted\n")
+        deadline = harness.clock() + 5
+        command = "printf good > src/a.py && git add src/a.py && git -c user.name=a -c user.email=b commit -qm owned"
+        harness._t_bash({"command": command}, deadline)
+        result = harness._finish(H.HarnessResult())
+        self.assertEqual(result.exit_code, 0, result.final_text)
+        self.assertEqual((self.work / "src" / "b.py").read_text(), "uncommitted\n")
+
     def test_a_rewritten_worktree_pointer_cannot_run_a_host_filter(self):
         from jbi import worktrees as wt
-        path = linked_worktree(self.tmp, self.repo)
+        path = self.work
         git_dir, common = wt.trusted_git_metadata(path)
         marker = self.tmp / "host-filter-ran"
         hostile = path / "fakegit"
