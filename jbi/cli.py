@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -23,7 +24,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, metrics, netinfo, protocol
+from . import __version__, metrics, netinfo, protocol, worktrees as wt
 from .planner import slug
 from .client import Client, ClientError, Control
 from .engine import Engine
@@ -54,6 +55,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
     start.add_argument("--max-sessions", type=int, default=3, help="agents that run at the same time")
     start.add_argument("--lanes", type=int, default=0, help="legacy parallelism field; CI owns its own queue")
+    start.add_argument("--base", default=None,
+                       help="the branch every task branch is cut from. Default: main")
+    start.add_argument("--branch", default=None,
+                       help="the branch where verified work lands. Default: the --base branch")
+    start.add_argument("--cascade", default=None,
+                       help="'founder', or a JSON list of {provider, model} entries in failover "
+                            "order. The founder cascade is claude-opus-5-5, then Gemini Neon, "
+                            "then Carbon. A morph model is refused.")
     start.add_argument("--ci-service", choices=("ci-conductor",), default="ci-conductor",
                        help="the only service that can merge a verified task")
     start.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
@@ -128,6 +137,67 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def default_lanes() -> int:
     return max(1, min(4, (os.cpu_count() or 4) // 4))
+
+
+def apply_branch_flags(store: Store, repo: Path | None, base: str | None,
+                       branch: str | None) -> None:
+    """Validate --base and --branch at start, then store them for the runtime.
+
+    A refusal happens here, before any agent runs. A --base that names no branch is a
+    named refusal: task branches would cut from nothing. A commit SHA as --branch is
+    refused because `fast_forward_main` needs a branch to advance. A --branch that
+    names no branch is created from --base, and the start log says so. An empty
+    --branch means the landing branch is the --base branch.
+    """
+    from .store import Changes
+    base = (base or "").strip()
+    branch = (branch or "").strip()
+    if not base and not branch:
+        return
+    if branch and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", branch):
+        raise SystemExit("branch_refused: --branch must name a branch, not a commit: "
+                         "fast_forward_main needs a branch to advance")
+    base = base or wt.MAIN
+    landing = branch or base
+    if repo is not None:
+        if wt.missing_branch(repo, base):
+            raise SystemExit(f"base_missing: base branch {base!r} does not exist in {repo}; "
+                             "every task branch would cut from nothing")
+        if wt.missing_branch(repo, landing):
+            wt.ensure_branch(repo, landing, base)
+            store.log("run", f"created branch {landing} from base {base}", etype="run.config")
+    store.commit("run.config", Changes().set("bootstrap", "base_branch", base)
+                 .set("bootstrap", "branch", landing), {})
+
+
+def install_cascade(store: Store, cascade: str | None) -> None:
+    """Store the run's cascade override in `provider_cascade`. 'founder' installs the founder order.
+
+    The cascade is an ordered list of {provider, model} entries. `models.select` walks
+    it before the account default. A morph model refuses at start: morph answers 401,
+    and nothing in jbi may depend on it.
+    """
+    from . import models
+    from .store import Changes
+    if cascade == "founder":
+        entries = [dict(entry) for entry in models.FOUNDER_CASCADE]
+    else:
+        try:
+            entries = json.loads(cascade or "")
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"cascade_invalid: --cascade is 'founder' or a JSON list of "
+                             f"{{provider, model}} entries: {error.msg}")
+        if not isinstance(entries, list) or not entries:
+            raise SystemExit("cascade_invalid: --cascade needs 'founder' or a non-empty JSON list")
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("provider"):
+            raise SystemExit("cascade_invalid: every cascade entry names a provider")
+        if "morph" in str(entry.get("model") or ""):
+            raise SystemExit(f"morph_refused: cascade model {entry.get('model')!r} is a morph "
+                             "model; morph answers 401 and nothing in jbi may depend on it")
+    store.commit("config", Changes().set("config", "provider_cascade", entries), {})
+    order = ", ".join(f"{entry.get('provider')}/{entry.get('model')}" for entry in entries)
+    store.log("config", f"Cascade installed: {order}", etype="run.config")
 
 
 def make_completer(store: Store, *, offline: bool):
@@ -263,7 +333,8 @@ class Run:
                                              tmux=tmux)
             self.store = Store(self.dir / "run.db", initial)
             self._seed_accounts(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False),
-                                agent_provider=getattr(args, "provider", "agy"))
+                                agent_provider=getattr(args, "provider", "agy"),
+                                cascade=getattr(args, "cascade", None) == "founder")
             if getattr(args, "dry_run", False) or getattr(args, "preview", False):
                 from .store import Changes as _Changes
                 cfg_changes = _Changes()
@@ -275,6 +346,11 @@ class Run:
                 if getattr(args, "preview", False):
                     cfg_changes.set("config", "preview", True)
                 self.store.commit("config", cfg_changes, {})
+            if getattr(args, "base", None) or getattr(args, "branch", None):
+                apply_branch_flags(self.store, Path(target) if args.repo else None,
+                                   getattr(args, "base", None), getattr(args, "branch", None))
+            if getattr(args, "cascade", None):
+                install_cascade(self.store, getattr(args, "cascade"))
 
         completer = make_completer(
             self.store,
@@ -355,18 +431,22 @@ class Run:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record, indent=2) + "\n")
 
-    def _seed_accounts(self, offline: bool, agent_provider: str = "agy") -> None:
+    def _seed_accounts(self, offline: bool, agent_provider: str = "agy",
+                       cascade: bool = False) -> None:
         """Enable the provider that dispatches agents.
 
         FOUNDER ORDER 2026-11-13: no Claude model in any subagent. The default
         is therefore agy, not claude. A Claude run needs the founder to name it.
+        The founder cascade runs on claude and agy, so it enables both.
         """
         from . import providers
         from .store import Changes
         changes = Changes()
         for name in providers.catalog()["providers"]:
             account = providers.blank_account(name)
-            account["enabled"] = name == "simulator" if offline else name in (agent_provider, "simulator")
+            account["enabled"] = name == "simulator" if offline else (
+                name in (agent_provider, "simulator")
+                or (cascade and name in ("claude", "agy")))
             changes.set("accounts", name, account)
         self.store.commit("account.status", changes)
 

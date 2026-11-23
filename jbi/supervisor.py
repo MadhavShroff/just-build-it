@@ -197,6 +197,10 @@ class Supervisor:
         self.recorded_pids: set[int] = set()
         self.identities: dict[str, dict[int, str]] = {}   # sid -> {pid: start time} at spawn
         self.branch: str = wt.MAIN
+        # --base: what every task branch cuts from. --branch: where verified work lands.
+        # Both are set once at start and never reassigned. They may differ; the landing
+        # branch alone advances (fast_forward_main), the base stays pinned.
+        self.base_branch: str = wt.MAIN
         self._lock = threading.RLock()
         self.cooldowns = models.ProviderCooldowns()
         raw_pool = store.read("/config/provider_pool") or []
@@ -292,7 +296,7 @@ class Supervisor:
         existing = self.tracking.get_task(task_id)
         base = (existing or {}).get("base_commit")
         if existing is None:
-            base = wt.head(self.repo, self.store.read("/bootstrap/branch") or self.branch)
+            base = wt.head(self.repo, self.store.read("/bootstrap/base_branch") or self.base_branch)
         if base is None:
             raise ValueError(f"task {task_id} needs a base commit")
         branch = f"jbi/{task_id}"
@@ -518,10 +522,24 @@ class Supervisor:
     def _bootstrap(self) -> None:
         from . import bootstrap
         state = self.store.snapshot()[1]
-        self.branch = wt.init_repo(self.repo)
+        current = wt.init_repo(self.repo)
+        # A named --base or --branch was stored at start. Bootstrap runs on whatever
+        # branch the repository is on, but it must never overwrite that stored choice
+        # with the repository's current branch.
+        self.branch = self.store.read("/bootstrap/branch") or current
+        self.base_branch = self.store.read("/bootstrap/base_branch") or self.branch
+        if wt.missing_branch(self.repo, self.base_branch):
+            raise wt.GitError(f"base branch {self.base_branch!r} does not exist in {self.repo}; "
+                              "every task branch would cut from nothing")
+        if wt.missing_branch(self.repo, self.branch) and wt.ensure_branch(self.repo, self.branch,
+                                                                          self.base_branch):
+            self.store.log("bootstrap", f"created branch {self.branch} from base {self.base_branch}",
+                           etype="bootstrap.status")
+        self.store.commit("bootstrap.status", Changes()
+                          .set("bootstrap", "branch", self.branch)
+                          .set("bootstrap", "base_branch", self.base_branch))
         task = {"id": "bootstrap", "title": "Bootstrap", "goal": "configure the target repository",
                 "owns": ["*"], "acceptance": "build and lint exit 0"}
-        self.store.commit("bootstrap.status", Changes().set("bootstrap", "branch", self.branch))
         base = wt.head(self.repo, self.branch)
         if base is None:
             wt.git(self.repo, "commit", "--allow-empty", "-m", "Initialize the repository base")
@@ -560,6 +578,7 @@ class Supervisor:
 
     def start_execution(self) -> None:
         self.branch = self.store.read("/bootstrap/branch") or self.branch
+        self.base_branch = self.store.read("/bootstrap/base_branch") or self.branch
         self._restore_handovers()
         self._scheduler = threading.Thread(target=self._schedule, name="jbi-scheduler", daemon=True)
         self._scheduler.start()
@@ -657,9 +676,9 @@ class Supervisor:
                 self._task_update(tid, status="waiting-model", waiting_reason=reason)
                 self.store.log("task", f"{tid} waits: {reason}", task=tid)
             return
-        base = wt.head(self.repo, self.branch)
+        base = wt.head(self.repo, self.base_branch)
         if base is None:
-            raise wt.GitError(f"base branch {self.branch} has no commit")
+            raise wt.GitError(f"base branch {self.base_branch} has no commit")
         existing = self.tracking.get_task(tid)
         if existing is not None:
             base = existing["base_commit"]
