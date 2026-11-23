@@ -586,24 +586,14 @@ class BashGuard:
             safe = re.sub(r'(?<!\\)\$TMPDIR(?:/[\w.-]+)*', "", word)
             if "$" in safe:
                 return "expanded shell commands and command options are refused"
+        if any(os.path.basename(word) in WRAPPERS for word in words):
+            return "command wrappers are refused"
         i = 0
         while i < len(words) and "=" in words[i] and not words[i].startswith("-"):
-            i += 1
-        wrapped = False
-        while i < len(words) and words[i] in WRAPPERS:
-            i += 1
-            wrapped = True
-        while i < len(words) and (words[i].startswith("-") or words[i].isdigit()):
-            i += 1
             i += 1
         if i >= len(words):
             return None
         cmd, args = os.path.basename(words[i]), words[i + 1:]
-        if wrapped:
-            return "command wrappers may carry no command arguments"
-        if cmd in ("env", "nohup", "nice", "timeout", "exec", "command", "builtin", "xargs"):
-            if len(words) != i + 1:
-                return "command wrappers may have no command arguments"
         if cmd in ("sudo", "su", "doas", "eval"):
             return "privilege escalation is refused"
         if cmd in ("mkdir", "rmdir"):
@@ -701,26 +691,34 @@ class BashGuard:
                     bad = self._bad_path(arg)
                 if bad:
                     return f"{cmd} argument refused: {bad}"
+        if cmd in ("bash", "sh", "zsh"):
+            positionals = [a for a in args if not a.startswith("-")]
+            command_flag = next((a for a in args if a == "-c" or re.fullmatch(r"-[A-Za-z]*c", a)), None)
+            if command_flag is not None:
+                after = args[args.index(command_flag) + 1:]
+                if len(after) != 1 or after[0].startswith("-"):
+                    return "a shell command string needs exactly one checked word"
+                return self.check(after[0])
+            if not positionals:
+                return "a bare shell interpreter may read unchecked input"
+            if len(positionals) > 1:
+                return "a shell script may take no positional arguments"
+            script = self._safe(positionals[0])
+            if script is None or not script.is_file():
+                return "shell script cannot be read safely"
+            return self.check(script.read_text(encoding="utf-8", errors="replace"))
         if cmd.startswith("python") or cmd in INTERPRETERS:
-            for arg in args:
-                if arg.startswith("-") and len(arg) < 4:
-                    continue
-                if ABS_IN_CODE.search(arg):
-                    for m in ABS_IN_CODE.finditer(arg):
-                        if not inside(self.root, Path(os.path.realpath(m.group(0)))):
-                            return f"{cmd} code names a path outside the workspace: {m.group(0)}"
-                if DOTDOT_IN_CODE.search(arg):
-                    return f"{cmd} code uses parent traversal"
-            if cmd in ("bash", "sh", "zsh"):
-                if "-c" in args and args.index("-c") + 1 < len(args):
-                    return self.check(args[args.index("-c") + 1])
-                script_args = [arg for arg in args if not arg.startswith("-")]
-                if script_args:
-                    script = self._safe(script_args[-1])
-                    try:
-                        return self.check(script.read_text(encoding="utf-8", errors="replace"))
-                    except OSError:
-                        return "shell script cannot be read safely"
+            if any(a == "-c" or re.fullmatch(r"-[A-Za-z]*[cer]", a) for a in args):
+                return "interpreter inline code cannot be checked"
+            module_flag = next((a for a in args if a == "-m"), None)
+            if module_flag is not None:
+                after = args[args.index(module_flag) + 1:]
+                if len(after) != 1 or not re.fullmatch(r"[A-Za-z_][\w.]*", after[0]):
+                    return "an interpreter module must be one plain identifier"
+                return None
+            if any(not a.startswith("-") for a in args):
+                return "interpreter script files cannot be checked; use shell commands"
+            return None
         return None
 
     def check(self, command: str) -> str | None:
@@ -799,16 +797,20 @@ class BashGuard:
                     full.unlink()
                     return True
                 if rel.endswith("/") and full.is_dir():
-                    protected = any(self.owned(rel) or rel.startswith(pattern.rstrip("/") + "/")
+                    base = rel.rstrip("/")
+                    protected = any(pattern == base or pattern.startswith(base + "/")
                                     for pattern in self.owns)
                     if protected:
                         return False
                     if self.baseline and any(name.startswith(rel) for name in self.baseline):
                         for child in full.iterdir():
                             rel_child = child.relative_to(self.root).as_posix()
-                            reserved = any(name == rel_child or name.startswith(rel_child + "/") or self.owned(name)
-                                           for name in self.baseline)
-                            if not self.owned(rel_child) and not reserved:
+                            reserved = any(name == rel_child or name.startswith(rel_child + "/")
+                                           or self.owned(name) for name in self.baseline)
+                            leased = (self.owned(rel_child)
+                                      or any(pattern == rel_child or pattern.startswith(rel_child + "/")
+                                             for pattern in self.owns))
+                            if not leased and not reserved:
                                 if child.is_dir() and not child.is_symlink():
                                     shutil.rmtree(child)
                                 else:
@@ -856,6 +858,12 @@ class BashGuard:
         for xy, path, orig in entries:
             for rel, is_orig in ((path, False), (orig, True)):
                 if not rel or self.owned(rel):
+                    continue
+                if rel.endswith("/") and (any(name.startswith(rel) for name in self.baseline)
+                                          or any(p == rel.rstrip("/") or p.startswith(rel.rstrip("/") + "/")
+                                                 for p in self.owns)):
+                    # An aggregate ignored-directory entry changes signature when any
+                    # leaf appears. Its leaves and owned descendants are judged alone.
                     continue
                 known = self.baseline.get(rel)
                 if known == (xy, self._signature(rel)):
