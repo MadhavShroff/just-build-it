@@ -148,6 +148,26 @@ def head(repo: Path, ref: str = MAIN) -> str | None:
     return out or None
 
 
+def missing_branch(repo: Path, name: str) -> bool:
+    """True when `name` names no branch under `refs/heads`.
+
+    A tag, a short SHA, or HEAD is not a branch: `fast_forward_main` advances
+    `refs/heads/<name>`, so only a real branch counts."""
+    if git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{name}", check=False):
+        return False
+    return name != git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+
+
+def ensure_branch(repo: Path, name: str, base: str) -> bool:
+    """Create branch `name` at `base` when `name` names no branch. True when created."""
+    if not missing_branch(repo, name):
+        return False
+    if head(repo, base) is None:
+        raise GitError(f"cannot create branch {name}: base branch {base} has no commit")
+    git(repo, "branch", name, base)
+    return True
+
+
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     """Check ancestry without changing the repository."""
     result = subprocess.run(["git", *IDENTITY, *HOST_CONFIG, "-C", str(repo), "merge-base",

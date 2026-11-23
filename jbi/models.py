@@ -27,6 +27,14 @@ AGENT_PROVIDERS = ("agy", "claude", "codex", "openai-compatible")
 # founder order 2026-11-13 puts no Claude model in any subagent. Claude is kept on
 # the list because a run may name it explicitly; it is not the default.
 PREFERENCE = ("agy", "codex", "claude", "openai-compatible", "simulator")
+# The founder cascade, amended 2026-11-24: opus 5.5 first, then Gemini Neon, falling
+# back to Carbon. `--cascade founder` installs it as the run's provider order. No
+# morph model is in it: morph answers 401, and nothing in jbi may depend on it.
+FOUNDER_CASCADE = (
+    {"provider": "claude", "model": "claude-opus-5-5"},
+    {"provider": "agy", "model": "gemini-4-neon-high"},
+    {"provider": "agy", "model": "gemini-4-carbon-high"},
+)
 
 
 @dataclass(frozen=True)
@@ -130,12 +138,14 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     """The provider and model for one stage.
 
     The scheduler picks a model in this order: the task pin, the task preference
-    list, the provider pool, then the enabled account preference.
+    list, the run cascade, the provider pool, then the enabled account preference.
 
     pin      the task names ONE provider and model and runs on nothing else. The
              stage does not start until that model is available. `blocked()`
              answers that question for the supervisor.
     prefer   the task names providers in order. The first usable one wins.
+    cascade  the run names providers in order (`--cascade founder`). The first
+             usable entry wins.
     pool     the weighted provider pool, when one is supplied.
     default  the first enabled provider in PREFERENCE order.
 
@@ -160,21 +170,35 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
         return _choice(str(pinned["provider"]), str(pinned["model"]), tier)
 
     # A PREFERENCE list is tried in order, then the pool, then the account preference.
+    # Without a task preference, the run's cascade (`--cascade founder`) is the order.
+    # One entry is skipped while its provider is cooling, or while its own lane key
+    # `provider/model` cools: that is how Neon falls back to Carbon.
     prefer = override.get("prefer")
+    if not (isinstance(prefer, list) and prefer):
+        prefer = (state.get("config") or {}).get("provider_cascade")
     if isinstance(prefer, list) and prefer:
+        def lane_burned(want: dict, respect_provider_cooldown: bool) -> bool:
+            provider, model = want.get("provider"), want.get("model")
+            if model and cooldowns is not None and cooldowns.cooling(f"{provider}/{model}"):
+                return True
+            return bool(respect_provider_cooldown and cooldowns is not None
+                        and cooldowns.cooling(str(provider)))
+
         for want in prefer:
             if not isinstance(want, dict):
                 continue
             provider = want.get("provider")
-            if provider and provider in up and (cooldowns is None or not cooldowns.cooling(provider)):
-                model = want.get("model") or catalog()["providers"][provider]["models"][tier]
+            model = want.get("model")
+            if provider and provider in up and not lane_burned(want, True):
+                model = model or catalog()["providers"][provider]["models"][tier]
                 return _choice(str(provider), str(model), tier)
         for want in prefer:
             if not isinstance(want, dict):
                 continue
             provider = want.get("provider")
-            if provider and provider in up:
-                model = want.get("model") or catalog()["providers"][provider]["models"][tier]
+            model = want.get("model")
+            if provider and provider in up and not lane_burned(want, False):
+                model = model or catalog()["providers"][provider]["models"][tier]
                 return _choice(str(provider), str(model), tier)
         # None of the preferred providers is usable. Fall through to the pool or the account preference.
 
