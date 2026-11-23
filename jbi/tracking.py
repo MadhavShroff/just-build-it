@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .worktrees import GitError, git
+from .worktrees import GitError, git, pin_git_metadata, trusted_git, unpin_git_metadata
 
 ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -372,20 +372,18 @@ class Tracking:
             raise LeaseError(f"release of task {task_id} needs reason 'merged' or abandon")
         wt, branch, base = Path(task["worktree"]), task["branch"], task["base_commit"]
         expected = task["head_commit"] or base
+        git_dir, common_dir = pin_git_metadata(wt)
         if not wt.is_dir():
             raise LeaseError(f"worktree {wt} is missing for task {task_id}")
         try:
-            top = git(wt, "rev-parse", "--show-toplevel", check=False)
-            if not top or os.path.realpath(top) != os.path.realpath(wt):
-                raise LeaseError(f"{wt} is not the root of a git worktree")
-            current = git(wt, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+            current = trusted_git(git_dir, common_dir, wt, "symbolic-ref", "-q", "--short", "HEAD", check=False)
             if current != branch:
                 raise LeaseError(f"worktree {wt} HEAD is {current or 'detached'}, not branch {branch}")
-            dirty = git(wt, "status", "--porcelain", "-uall")
+            dirty = trusted_git(git_dir, common_dir, wt, "status", "--porcelain", "-uall")
             if dirty:
                 raise LeaseError(f"worktree {wt} has {len(dirty.splitlines())} dirty or untracked path(s). "
                                  "The lease stays live")
-            at = git(wt, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}", check=False)
+            at = trusted_git(git_dir, common_dir, wt, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}", check=False)
             if at != expected:
                 raise LeaseError(f"branch {branch} is at {at[:12] or 'nothing'}, expected {expected[:12]}")
             parked = f"jbi-parked/{task_id}-{uuid.uuid4().hex}"
@@ -393,11 +391,11 @@ class Tracking:
                 raise LeaseError(f"parked ref name {parked!r} is not a valid git ref")
             if git(wt, "rev-parse", "--verify", "-q", f"refs/heads/{parked}", check=False):
                 raise LeaseError(f"parked ref {parked} already exists")
-            git(wt, "checkout", "--detach", base)
+            trusted_git(git_dir, common_dir, wt, "checkout", "--detach", base)
             try:
-                git(wt, "branch", "-m", branch, parked)
+                trusted_git(git_dir, common_dir, wt, "branch", "-m", branch, parked)
             except GitError:
-                git(wt, "checkout", branch, check=False)
+                trusted_git(git_dir, common_dir, wt, "checkout", branch, check=False)
                 raise
         except GitError as exc:
             raise LeaseError(f"git refused release of task {task_id}: {exc}") from exc
@@ -413,6 +411,7 @@ class Tracking:
                        (final, reason, stamp, task_id))
             db.execute("UPDATE sessions SET status='idle', reset_at=?, updated_at=? WHERE id=?",
                        (stamp, stamp, lease["session_id"]))
+            unpin_git_metadata(wt)
             return {"task": self._task(task_id, db), "parked_ref": parked,
                     "lease": dict(db.execute("SELECT * FROM leases WHERE id=?", (lease["id"],)).fetchone())}
 

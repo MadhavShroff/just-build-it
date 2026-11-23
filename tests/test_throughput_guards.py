@@ -108,6 +108,34 @@ class TestWavesAndStrictSpec(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertEqual((conflicts[0]["task_a"], conflicts[0]["task_b"]), ("a", "b"))
 
+    def test_ready_tasks_stay_with_their_node(self) -> None:
+        plan = waves.compile_plan([
+            {"id": "a1", "title": "A1", "goal": "One", "deps": [], "owns": ["src/a1.ts"], "acceptance": "true", "node": "alpha"},
+            {"id": "b1", "title": "B1", "goal": "One", "deps": [], "owns": ["src/b1.ts"], "acceptance": "true", "node": "beta"},
+            {"id": "a2", "title": "A2", "goal": "Two", "deps": [], "owns": ["src/a2.ts"], "acceptance": "true", "node": "alpha"},
+            {"id": "b2", "title": "B2", "goal": "Two", "deps": [], "owns": ["src/b2.ts"], "acceptance": "true", "node": "beta"},
+        ])
+        self.assertEqual(waves.prioritize_ready(plan, ["a1", "b1", "a2", "b2"]), ["a1", "a2", "b1", "b2"])
+
+    def test_a_missing_worktree_can_restore_the_exact_parked_ref(self) -> None:
+        import tempfile, shutil
+        tmp = Path(tempfile.mkdtemp(prefix="jbi-restore-missing-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        repo = tmp / "repo"
+        wt.init_repo(repo)
+        (repo / "base").write_text("base")
+        base = wt.commit_all(repo, "base")
+        path = wt.create_worktree(repo, "task", base, tmp / "worktrees")
+        (path / "new").write_text("preserved")
+        saved = wt.commit_all(path, "saved")
+        parked = "jbi-parked/task-20261123"
+        wt.git(repo, "branch", "-m", "jbi/task", parked)
+        wt.remove_worktree(repo, path)
+        recovered = wt.restore_worktree(repo, "task", base, tmp / "worktrees", expected_head=saved)
+        self.assertEqual(wt.head(recovered, "HEAD"), saved)
+        self.assertEqual((recovered / "new").read_text(), "preserved")
+
+
     def test_wave_preflight_blocks_open_decision_and_missing_tool(self) -> None:
         plan = waves.compile_plan([
             {"id": "t1", "title": "T1", "goal": "Task one detailed goal.", "deps": [], "owns": ["src/t1.ts"], "acceptance": "echo 1"},

@@ -25,11 +25,57 @@ def _host_env() -> dict[str, str]:
     return {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 
 
+_RUNTIME_GIT: dict[tuple[Path, Path], tuple[Path, Path]] = {}
+
+
+def pin_git_metadata(worktree: Path) -> tuple[Path, Path]:
+    """Keep this runtime's trusted metadata, independent of later worktree edits."""
+    pinned = _RUNTIME_GIT.get((Path(__file__).resolve(), Path(worktree).resolve()))
+    if pinned is None:
+        pinned = trusted_git_metadata(worktree)
+        _RUNTIME_GIT[(Path(__file__).resolve(), Path(worktree).resolve())] = pinned
+    return pinned
+
+
+def unpin_git_metadata(worktree: Path) -> None:
+    _RUNTIME_GIT.pop((Path(__file__).resolve(), Path(worktree).resolve()), None)
+
+
 class GitError(RuntimeError):
     """A git command failed. The message holds git's own error text."""
 
 
+def trusted_git_metadata(workdir: Path) -> tuple[Path, Path]:
+    """Read storage paths without Git. The runtime calls this before an agent can edit the pointer."""
+    from claude_mux_lite.sandbox import discover_git
+    try:
+        return discover_git(Path(workdir).resolve())
+    except (OSError, RuntimeError) as exc:
+        raise GitError(f"cannot pin trusted Git storage for {workdir}: {exc}") from exc
+
+
+def trusted_git(git_dir: Path, common_dir: Path, workdir: Path, *args: str, check: bool = True) -> str:
+    """Run fixed host Git operations on pinned metadata and an empty attribute source."""
+    from claude_mux_lite.harness import host_git_argv, host_git_env
+    if not common_dir.is_dir() or (common_dir / "objects" == git_dir / "objects" and common_dir != git_dir):
+        raise GitError("pinned Git metadata does not name its shared repository")
+    argv = host_git_argv(*IDENTITY, "--no-replace-objects", "-c", "extensions.worktreeConfig=false",
+                         "-c", "core.bare=false", *args,
+                         work_tree=Path(workdir).resolve(), git_dir=Path(git_dir).resolve())
+    env = host_git_env()
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_ATTR_NOSYSTEM"] = "1"
+    env["GIT_COMMON_DIR"] = str(Path(common_dir).resolve())
+    result = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+    if check and result.returncode != 0:
+        raise GitError(f"git {' '.join(args)}: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
 def git(repo: Path | str, *args: str, check: bool = True) -> str:
+    pinned = _RUNTIME_GIT.get((Path(__file__).resolve(), Path(repo).resolve()))
+    if pinned is not None:
+        return trusted_git(*pinned, Path(repo).resolve(), *args, check=check)
     result = subprocess.run(["git", *IDENTITY, *HOST_CONFIG, "-C", str(repo), *args],
                             capture_output=True, text=True, stdin=subprocess.DEVNULL, env=_host_env())
     if check and result.returncode != 0:
@@ -126,6 +172,7 @@ def create_worktree(repo: Path, task: str, base: str, root: Path) -> Path:
     """A worktree for `task` on branch jbi/<task>. An existing worktree is reused."""
     path = root / task
     if (path / ".git").exists():
+        pin_git_metadata(path)
         return path
     root.mkdir(parents=True, exist_ok=True)
     branch = f"jbi/{task}"
@@ -138,6 +185,7 @@ def create_worktree(repo: Path, task: str, base: str, root: Path) -> Path:
         git(path, "checkout", "-q", "-b", branch, base)
     else:
         git(repo, "worktree", "add", "-q", "-b", branch, str(path), base)
+    pin_git_metadata(path)
     return path
 
 
@@ -160,14 +208,21 @@ def restore_worktree(repo: Path, task: str, base: str, root: Path, expected_head
     matches = [ref for ref in refs if expected_head is None or head(repo, ref) == expected_head]
     if len(matches) != 1:
         raise GitError(f"task {task} has {len(matches)} parked refs matching its recorded head")
-    if dirty_paths(path):
+    if (path / ".git").exists() and dirty_paths(path):
         raise GitError(f"task {task} has dirty or untracked work; parked-checkout refused")
+    if not (path / ".git").exists():
+        git(repo, "worktree", "prune", check=False)
     existing = head(repo, branch)
     if existing and existing != head(repo, matches[0]):
         raise GitError(f"task {task} already has a different branch {branch}")
+    if not (path / ".git").exists():
+        if path.exists():
+            raise GitError(f"task {task} has files but no worktree metadata")
+        git(repo, "worktree", "add", "-q", "--detach", str(path), matches[0])
     if matches[0] != branch:
         git(repo, "branch", "-m", matches[0].removeprefix("refs/heads/"), branch)
     git(path, "checkout", branch)
+    pin_git_metadata(path)
     return path
 
 
@@ -215,6 +270,7 @@ def fast_forward_main(repo: Path, sha: str, expected: str, branch: str = MAIN) -
 
 
 def remove_worktree(repo: Path, path: Path) -> None:
+    unpin_git_metadata(path)
     if path.exists():
         git(repo, "worktree", "remove", "--force", str(path), check=False)
     git(repo, "worktree", "prune", check=False)

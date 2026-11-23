@@ -12,6 +12,33 @@ from jbi.store import now
 from jbi.tracking import Tracking
 
 
+def _continuation_messages(messages: list[dict]) -> tuple[list[dict], str]:
+    """Keep complete exchanges; a correction supplies the next valid user turn."""
+    kept = list(messages)
+    discarded: list[str] = []
+    while kept:
+        last = kept[-1]
+        content = last.get("content")
+        if last.get("role") == "assistant":
+            blocks = content if isinstance(content, list) else []
+            if any(block.get("type") == "tool_use" for block in blocks if isinstance(block, dict)):
+                discarded.append("an unanswered tool call")
+                kept.pop()
+                continue
+            break
+        if last.get("role") == "user":
+            blocks = content if isinstance(content, list) else []
+            if not any(block.get("type") == "tool_result" for block in blocks if isinstance(block, dict)):
+                discarded.append("the incomplete previous turn")
+                kept.pop()
+                continue
+        break
+    if not discarded:
+        return kept, ""
+    return kept, ("The previous attempt ended before a valid reply. Its incomplete exchange is omitted. "
+                  "Continue the same task with this correction: " + " and ".join(discarded) + ".\n\n")
+
+
 def bootstrap(spec_path: str) -> int:
     """Read the real credentials once, start the private broker, then exec the neutral child.
 
@@ -46,7 +73,9 @@ def main(arguments: list[str]) -> int:
     try:
         history_key = spec.get("history_session_id") or spec["session_id"]
         if spec.get("continuation"):
-            history = tracking.session_history(history_key)
+            history, correction_note = _continuation_messages(tracking.session_history(history_key))
+        else:
+            correction_note = ""
         def inbox() -> str:
             text = []
             for message in tracking.pending_messages(spec["session_id"]):
@@ -62,7 +91,7 @@ def main(arguments: list[str]) -> int:
             max_turns=int(spec.get("max_turns", 200)), effort=spec.get("effort", "high"),
             repo_context=spec.get("repo_context", ""), frozen_contracts=spec.get("frozen_contracts", ""),
         )
-        result = harness.run(spec["brief"])
+        result = harness.run(correction_note + spec["brief"])
         history = harness.take_messages()
         dispatch = int(spec["dispatch_id"])
         tracking.record_cost(dispatch, input_tokens=result.usage.input_tokens,

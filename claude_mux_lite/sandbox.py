@@ -1,6 +1,7 @@
 """A Linux shell fence. Namespace mounts expose only authorized writable directories.
 
 The fence needs `bwrap`. It allows no live shell fallback when the executable is absent.
+Git refs and configuration remain read-only. The parent publishes a validated private commit.
 
 Derived from the harness of the MIT-licensed research project.
 The full notice is in licenses/RSWARM-MIT.txt.
@@ -12,12 +13,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-
-# Files in the Git folder of the task that the fenced shell may write: the index, the merge and
-# commit state, the objects and the one leased branch. The brief lists them by name.
-STATE_FILES = ("index", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "COMMIT_EDITMSG", "ORIG_HEAD")
-# Files in the per-worktree Git folder that steer the host Git. They stay read-only.
-STEERING_FILES = ("gitdir", "commondir", "config.worktree", "config", "hooks", "info", "packed-refs")
 
 
 def discover_git(workdir: Path) -> tuple[Path, Path]:
@@ -38,29 +33,24 @@ def discover_git(workdir: Path) -> tuple[Path, Path]:
     return git_dir, common
 
 
-def _branch_ref(git_dir: Path) -> str | None:
-    """The leased branch ref, such as refs/heads/jbi/t1. None on a detached HEAD."""
-    try:
-        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return head.split(":", 1)[1].strip() if head.startswith("ref:") else None
-
-
 class SandboxError(RuntimeError):
     """The required operating-system fence cannot run."""
 
 
 class LinuxSandbox:
-    """Expose the worktree, one leased branch and an own scratch directory as writable locations."""
+    """Expose the worktree, one private Git repository and an own scratch directory."""
 
     def __init__(self, workdir: Path, *, executable: str | None = None, scratch: Path | None = None,
-                 git_dir: Path | None = None, common_dir: Path | None = None):
+                 git_dir: Path | None = None, common_dir: Path | None = None,
+                 private_git: bool = False, real_common_dir: Path | None = None):
         self.workdir = workdir.resolve()
         self.executable = executable or shutil.which("bwrap")
         self.scratch = scratch
         self.root: Path | None = None
         self.git_dir, self.common_dir = git_dir, common_dir
+        self.private_git = private_git
+        self.real_common_dir = real_common_dir
+        self.no_hooks: Path | None = None
         if not self.executable:
             raise SandboxError("bwrap is required for live bash dispatch")
         if not (self.workdir / ".git").exists():
@@ -79,6 +69,8 @@ class LinuxSandbox:
         scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(scratch, 0o700)
         self.scratch = scratch
+        self.no_hooks = self.root / "no-hooks"
+        self.no_hooks.mkdir(mode=0o700)
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -94,74 +86,18 @@ class LinuxSandbox:
     def _ro(path: Path) -> list[str]:
         return ["--ro-bind", str(path), str(path)]
 
-    @staticmethod
-    def _rw(path: Path) -> list[str]:
-        return ["--bind", str(path), str(path)]
-
-    def _seal_siblings(self, folder: Path, keep: Path | None) -> list[str]:
-        """Read-only mounts of every entry in `folder` except `keep`. A mount cannot be unlinked."""
-        out: list[str] = []
-        for entry in sorted(folder.iterdir()):
-            if keep is not None and entry == keep:
-                continue
-            out += self._ro(entry)
-        return out
-
     def git_mounts(self) -> list[str]:
-        """Mounts for Git storage. The remaining storage stays read-only.
-
-        A linked worktree has its own folder, which is writable except the files that steer Git.
-        Common storage opens the objects and the one leased branch with its log. A second task
-        branch stays read-only. Every item mounts only when it exists, with its own type."""
+        """Make all Git storage read-only. The parent uses no pointer controlled by the shell."""
         git_dir, common = self.git_dir, self.common_dir
         assert git_dir is not None and common is not None
-        linked = git_dir != common
-        ref = _branch_ref(git_dir)
-        args: list[str] = []
-        if linked:
-            args += self._ro(common)
-            args += self._rw(git_dir)
-            for name in STEERING_FILES:
-                if (git_dir / name).exists():
-                    args += self._ro(git_dir / name)
-            head = git_dir / "HEAD"
-            if ref and head.is_file():
-                args += self._ro(head)
-        else:
-            args += self._rw(git_dir)
-            for entry in sorted(git_dir.iterdir()):
-                if entry.name in STATE_FILES or (entry.name == "refs" and ref is not None):
-                    continue
+        args = (["--bind", str(common), str(common)] if self.private_git else self._ro(common))
+        if git_dir != common:
+            args += (["--bind", str(git_dir), str(git_dir)] if self.private_git else self._ro(git_dir))
+            entry = self.workdir / ".git"
+            if entry.is_file():
                 args += self._ro(entry)
-        args += self._rw(common / "objects") if (common / "objects").is_dir() else []
-        root_refs = common / "refs"
-        if root_refs.is_dir() and ref is None:
-            args += self._ro(root_refs)
-        if ref and ref.startswith("refs/"):
-            leaf = common / ref
-            args += self._rw(root_refs) + self._seal_siblings(root_refs, root_refs / "heads")
-            lead = common / "refs/heads"
-            lead.mkdir(parents=True, exist_ok=True)
-            leaf.parent.mkdir(parents=True, exist_ok=True)
-            args += self._rw(lead)
-            args += self._seal_siblings(lead, leaf.parent if leaf.parent != lead else leaf)
-            if leaf.parent != lead:
-                args += self._rw(leaf.parent)
-                # The leased ref file remains unmounted. Git replaces it by rename.
-                args += self._seal_siblings(leaf.parent, leaf)
-        if ref:
-            logs = common / "logs"
-            if logs.is_dir():
-                args += self._ro(logs)
-            leaf = common / "logs" / ref
-            parent = leaf.parent
-            if parent.is_dir():
-                args += self._rw(parent) + self._seal_siblings(parent, leaf)
-            elif leaf.parent.parent.is_dir():
-                args += self._rw(leaf.parent.parent) + self._seal_siblings(leaf.parent.parent, parent)
-            reflog = git_dir / "logs" / "HEAD"
-            if reflog.exists():
-                args += self._rw(reflog)
+        if self.private_git and self.real_common_dir is not None:
+            args += self._ro(Path(self.real_common_dir))
         return args
 
     def argv(self, command: str) -> list[str]:
@@ -169,14 +105,83 @@ class LinuxSandbox:
         if self.root is None:
             raise SandboxError("the sandbox must be entered before bash dispatch")
         argv = [self.executable, "--unshare-all", "--die-with-parent", "--new-session",
+                "--clearenv", "--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin"),
+                "--setenv", "HOME", os.environ.get("HOME", str(self.workdir)),
+                "--setenv", "USER", os.environ.get("USER", "jbi"),
                 "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
                 "--tmpfs", "/tmp",
                 "--bind", str(self.workdir), str(self.workdir),
                 *self.git_mounts(),
                 "--bind", str(self.scratch), str(self.scratch),
-                "--setenv", "JBI_WORKDIR", str(self.workdir), "--setenv", "TMPDIR", str(self.scratch),
-                "--", "bash", "-c", 'cd "$JBI_WORKDIR" && ' + command]
+                "--ro-bind", str(self.no_hooks), str(self.no_hooks),
+                "--setenv", "JBI_WORKDIR", str(self.workdir), "--setenv", "TMPDIR", str(self.scratch)]
+        if self.private_git:
+            argv += ["--setenv", "GIT_DIR", str(self.git_dir),
+                     "--setenv", "GIT_COMMON_DIR", str(self.common_dir),
+                     "--setenv", "GIT_WORK_TREE", str(self.workdir),
+                     "--setenv", "GIT_CONFIG_COUNT", "6",
+                     "--setenv", "GIT_CONFIG_KEY_0", "commit.gpgSign",
+                     "--setenv", "GIT_CONFIG_VALUE_0", "false",
+                     "--setenv", "GIT_CONFIG_KEY_1", "core.hooksPath",
+                     "--setenv", "GIT_CONFIG_VALUE_1", str(self.no_hooks),
+                     "--setenv", "GIT_CONFIG_KEY_2", "core.fsmonitor",
+                     "--setenv", "GIT_CONFIG_VALUE_2", "false",
+                     "--setenv", "GIT_CONFIG_KEY_3", "tag.gpgSign",
+                     "--setenv", "GIT_CONFIG_VALUE_3", "false",
+                     "--setenv", "GIT_CONFIG_KEY_4", "core.untrackedCache",
+                     "--setenv", "GIT_CONFIG_VALUE_4", "false",
+                     "--setenv", "GIT_CONFIG_KEY_5", "diff.external",
+                     "--setenv", "GIT_CONFIG_VALUE_5", ""]
+        argv += ["--", "bash", "-c", 'cd "$JBI_WORKDIR" && ' + command]
         return argv
+
+
+def fenced_argv(guard: object, command: str, private: object, scratch: Path) -> tuple[list[str], LinuxSandbox]:
+    """Return the production private-Git shell invocation. The caller owns process timing."""
+    refusal = guard.check(command)
+    if refusal:
+        raise ValueError("command refused by the fence: " + refusal)
+    fence = LinuxSandbox(guard.root, git_dir=guard.git_dir, common_dir=guard.common_dir,
+                         scratch=scratch / "command", private_git=True,
+                         real_common_dir=private.real_common)
+    fence.__enter__()
+    return fence.argv(command), fence
+
+
+def fenced_bash(guard: object, command: str, private: object, scratch: Path, *,
+                timeout: float = 120) -> subprocess.CompletedProcess:
+    """A focused direct-shell check uses the same private Git mechanism as the harness."""
+    argv, fence = fenced_argv(guard, command, private, scratch)
+    from .harness import ToolError, fence_env
+    with fence:
+        result = subprocess.run(argv, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, env=fence_env(), timeout=timeout)
+    private.checkpoint()
+    reverted, errors = guard.reconcile()
+    if errors or reverted:
+        private.checkpoint_error = "the command changed an unowned path; private commits are refused"
+    if result.returncode != 0:
+        private.checkpoint_error = "a failed command invalidated the private Git transaction"
+    if reverted or errors:
+        result.stderr += "\n" + "; ".join([f"reverted {', '.join(reverted)}"] if reverted else [] + errors)
+        result.returncode = result.returncode or 1
+    return result
+
+
+def leased_shell(guard: object, command: str) -> subprocess.CompletedProcess:
+    """Run a complete direct-shell transaction. Test fixtures use this boundary."""
+    from .private_git import PrivateGit
+    scratch = Path(tempfile.mkdtemp(prefix="jbi-shell-test-"))
+    private = PrivateGit(guard, scratch)
+    try:
+        result = fenced_bash(guard, command, private, scratch)
+        private.publish()
+        return result
+    except (ValueError, RuntimeError) as error:
+        return subprocess.CompletedProcess(command, 1, "", str(error))
+    finally:
+        private.__exit__()
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def shell_command(workdir: Path, command: str, *, scratch: Path | None = None) -> tuple[list[str], LinuxSandbox]:

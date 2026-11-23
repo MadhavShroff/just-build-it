@@ -104,10 +104,29 @@ class NeutralDispatch(unittest.TestCase):
                                          self.run_dir / "sessions/s-t1-implement-1", 300)
         self.assertFalse(json.loads(path.read_text())["continuation"])
 
+    def test_long_task_and_stage_names_have_bounded_stable_history_keys(self):
+        self.store.commit("fixture", Changes().replace("run", "name", "tangram-wave4"))
+        task_id = "wave4-auth-api"
+        stage = "methodology-audit-index"
+        self.store.commit("fixture", Changes().set("plan", "tasks", task_id,
+            waves.normalize({"id": task_id, "title": "Long", "goal": "Long",
+                             "deps": [], "owns": ["src/t1.txt"], "acceptance": "true", "node": "tangram-wave4"})))
+        long_worktree = wt.create_worktree(self.repo, task_id, self.base, self.run_dir / "worktrees")
+        self.sup._task_lease(task_id, long_worktree)
+        keys = [self.sup._stage_dispatch(f"s-{task_id}-{role}-1", task_id, long_worktree, "m")
+                for role in (stage, "methodology-security-audit", "implement")]
+        for dispatch in keys:
+            self.assertRegex(dispatch["history_session_id"], r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+        self.assertEqual(keys[0]["history_session_id"],
+                         self.sup._stage_dispatch(f"s-{task_id}-{stage}-2",
+                                                 task_id, long_worktree, "m")["history_session_id"])
+        self.assertNotEqual(keys[0]["history_session_id"], keys[1]["history_session_id"])
+        self.assertNotEqual(keys[0]["history_session_id"], keys[2]["history_session_id"])
+
     def test_same_task_correction_retains_history(self):
         self.sup._task_lease("t1", self.worktree)
         session = self.sup._stage_dispatch("s-t1-implement-1", "t1", self.worktree, "m", attempt=0)["session_id"]
-        self.sup.tracking.record_session_history(f"{session}-h-s-t1-implement",
+        self.sup.tracking.record_session_history(f"h-{session}-s-t1-implement",
                                                [{"role": "user", "content": "first task"}])
         path = self.sup._store_lite_spec(
             "t1", "implement", self.worktree, "model", 1,
@@ -131,6 +150,87 @@ class NeutralDispatch(unittest.TestCase):
         self.assertFalse(review["continuation"])
         self.assertEqual(self.sup.tracking.fleet()["dispatches"][-1]["session_id"],
                          implement["session_id"])
+
+    def test_a_notice_cannot_use_another_tasks_green_job(self):
+        self.store.commit("fixture", Changes().set("plan", "tasks", "t2", {
+            "id": "t2", "title": "Other", "goal": "other", "deps": [], "owns": ["src/t2.txt"],
+            "acceptance": "true", "model": "sim-l", "status": "ready"}))
+        self.sup.ci_adapter = type("CI", (), {"confirm_merge": lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("another task's evidence was offered to CI"))})()
+        self.sup._task_lease("t1", self.worktree)
+        self.sup.tracking.record_ci("t1", pr_number=901, head_sha=self.base, base_commit=self.base,
+                                    state="submitted", service_reply={"job": "job-t1"})
+        self.sup.ci_notice("t2", {"job": "job-t1", "verdict": "green"})
+        self.assertEqual(self.sup.tracking.fleet()["merges"], [])
+        self.assertNotIn("t2", self.sup._handovers)
+        self.assertNotEqual(self.store.read("/plan/tasks/t2/status"), "merged")
+
+    def test_standdown_refuses_to_commit_unowned_work_and_preserves_lease(self):
+        from unittest import mock
+        self.sup._task_lease("t1", self.worktree)
+        unowned = self.worktree / "unowned.txt"
+        unowned.write_text("preserve without committing\n")
+        self.sup._running["t1"] = object()
+        self.sup.tmux.kill_server = lambda: None
+        self.sup._wait_sessions = lambda timeout: None
+        self.sup._signal_sessions = lambda sig, groups_too: None
+        self.sup.hooks.stopped = lambda mode: None
+        original = wt.commit_all
+        calls = []
+        self.addCleanup(lambda: setattr(wt, "commit_all", original))
+        def tracked_commit(path, message):
+            calls.append((path, message))
+            return original(path, message)
+        wt.commit_all = tracked_commit
+        self.sup._stop("standdown")
+        self.assertTrue(unowned.exists())
+        self.assertEqual(wt.head(self.worktree, "HEAD"), self.base)
+        self.assertIsNone(self.sup.tracking.fleet()["leases"][0]["released_at"])
+        self.assertFalse(calls)
+
+    def test_a_failed_first_attempt_does_not_resume_as_consecutive_user_messages(self):
+        from unittest import mock
+        from tests.test_lite_process import FakeEndpoint, SECRET, final
+        with FakeEndpoint([final("BRIEF t1 | uncommitted | PASS")]) as server:
+            with mock.patch.dict(os.environ, {"CLAUDE_MUX_BASE_URL": server.url, "CLAUDE_MUX_API_KEY": SECRET}):
+                self.sup._task_lease("t1", self.worktree)
+                stage = self.sup._stage_dispatch("s-t1-implement-1", "t1", self.worktree, "m", attempt=0)
+                self.sup.tracking.record_session_history(stage["history_session_id"],
+                    [{"role": "user", "content": [{"type": "text", "text": "failed first brief"}]}])
+                spec_path = self.run_dir / "failed-retry-spec.json"
+                spec = {"tracking": str(self.sup.tracking.path), "usage_path": str(self.run_dir / "usage.json"),
+                        "workdir": str(self.worktree), "model": "m", "task_id": "t1", "owns": ["src/t1.txt"],
+                        "session_id": stage["session_id"], "history_session_id": stage["history_session_id"],
+                        "dispatch_id": self.sup.tracking.renew_dispatch("t1", model="m")["dispatch_id"],
+                        "continuation": True, "receipt": str(self.run_dir / "receipt"),
+                        "checkpoint": str(self.run_dir / "checkpoint.json"), "brief": "correct the failure"}
+                spec_path.write_text(json.dumps(spec))
+                from claude_mux_lite.__main__ import main
+                self.assertEqual(main([str(spec_path)]), 0)
+                brief = server.requests[0]["body"]["messages"][0]["content"]
+                self.assertIn(r"Brief:", json.dumps(brief))
+                self.assertIn(r"correct the failure", json.dumps(brief))
+
+    def test_a_failed_tool_call_is_not_saved_as_unanswered_history(self):
+        from claude_mux_lite.__main__ import _continuation_messages
+        history = [{"role": "user", "content": "first"},
+                   {"role": "assistant", "content": [{"type": "tool_use", "id": "u1", "name": "bash", "input": {}}]}]
+        retained, note = _continuation_messages(history)
+        self.assertEqual(retained, [])
+        self.assertIn("unanswered tool", note)
+        completed = [*history[:-1], {"role": "assistant", "content": [{"type": "text", "text": "done"}]}]
+        retained, note = _continuation_messages(completed)
+        self.assertEqual(retained, completed)
+        self.assertEqual(note, "")
+
+    def test_rich_findings_do_not_change_the_stable_brief_prefix(self):
+        receipt = self.run_dir / "receipt.txt"
+        text = briefs.render(task=self.store.read("/plan/tasks/t1"), role="implement", stage="implement",
+                             attempt=0, receipt=receipt)
+        changed = briefs.render(task=self.store.read("/plan/tasks/t1"), role="implement", stage="implement",
+                                attempt=1, receipt=receipt, findings=[f"finding {i}" for i in range(120)])
+        self.assertTrue(changed.startswith(text.split("# Brief ", 1)[0]))
+        self.assertLessEqual(len(changed.splitlines()), briefs.MAX_LINES)
 
     def test_supervisor_lease_is_live_before_real_neutral_execution_and_usage_survives(self):
         from tests.test_lite_process import FakeEndpoint, SECRET, final, write_call
@@ -251,6 +351,40 @@ class NeutralDispatch(unittest.TestCase):
         self.assertEqual((self.worktree / "src/t1.txt").read_text(), "preserve this\n")
         self._task_lease = self.sup._task_lease("t1", self.worktree)
         self.assertIsNone(self._task_lease["released_at"])
+
+    def test_release_uses_runtime_pinned_metadata_not_an_agent_pointer(self):
+        (self.worktree / "src").mkdir()
+        (self.worktree / "src" / "t1.txt").write_text("owned\n")
+        head = wt.commit_all(self.worktree, "owned")
+        self.sup._task_lease("t1", self.worktree)
+        self.sup.tracking.mark_task_state("t1", "paused")
+        self.sup.tracking.record_commit("t1", head)
+        self.sup.tracking.release("t1", reason="abandon", abandon=True)
+        self.worktree = wt.restore_worktree(self.repo, "t1", self.base, self.run_dir / "worktrees", expected_head=head)
+        self.sup._task_lease("t1", self.worktree)
+        wt.pin_git_metadata(self.worktree)
+        (self.worktree / "src").mkdir(exist_ok=True)
+        (self.worktree / ".git").write_text("gitdir: fakegit\n")
+        (self.worktree / "unowned.txt").write_text("preserve\n")
+        hostile = self.worktree / "fakegit"
+        hostile.mkdir()
+        (hostile / "config").write_text("[filter \"pwn\"]\n clean = touch runtime-marker\n [core]\n fsmonitor = false\n")
+        seen = []
+        real = wt.trusted_git
+        def record(git_dir, common_dir, workdir, *args, check=True):
+            seen.append((Path(git_dir), Path(common_dir), args))
+            return real(git_dir, common_dir, workdir, *args, check=check)
+        from jbi import tracking
+        tracking.trusted_git = record
+        self.addCleanup(lambda: setattr(tracking, "trusted_git", real))
+        from jbi.tracking import LeaseError
+        with self.assertRaises(LeaseError):
+            self.sup.tracking.release("t1", reason="abandon", abandon=True)
+        self.assertTrue(seen)
+        self.assertTrue(all(entry[0] != hostile for entry in seen))
+        self.assertFalse(Path("runtime-marker").exists())
+        self.assertTrue(any(lease["released_at"] is None for lease in self.sup.tracking.fleet()["leases"]
+                            if lease["task_id"] == "t1"))
 
     def test_dirty_green_ci_preserves_base_live_lease_and_file(self):
         from tests.test_runtime import FakeCI

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -352,10 +353,13 @@ DISCOVERY_GIT = ("--no-optional-locks", "-c", "protocol.file.allow=never")
 
 def host_git_argv(*args: str, work_tree: Path | str | None = None, git_dir: Path | str | None = None,
                   discovery: bool = True) -> list[str]:
-    """A Git argument list for the host. It never reads an agent hook, monitor or external diff.
+    """Build a Git argument list for fixed host code.
 
-    A pinned `git_dir` ignores the `.git` file of the worktree, which the agent can rewrite."""
-    argv = ["git", *SAFE_GIT]
+    The caller must authorize writes and pin storage before an agent can edit the worktree."""
+    argv = ["git", *SAFE_GIT,
+            "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "-c", "core.attributesFile=/dev/null", "-c", "core.untrackedCache=false",
+            "-c", "commit.gpgSign=false", "-c", "gpg.program=true", "-c", "core.pager=cat"]
     if discovery:
         argv += list(DISCOVERY_GIT)
     if git_dir is not None:
@@ -464,22 +468,21 @@ class BashGuard:
         return proc.returncode, proc.stdout
 
     def _git_fenced(self, *args: str) -> int:
-        """A Git call that changes the index or files. It runs inside the bwrap fence."""
-        from .sandbox import LinuxSandbox
-        try:
-            with LinuxSandbox(self.root, git_dir=self.git_dir, common_dir=self.common_dir) as fence:
-                return subprocess.run(fence.argv("git " + " ".join(shlex.quote(a) for a in args)),
-                                      capture_output=True, stdin=subprocess.DEVNULL, timeout=120,
-                                      env=fence_env()).returncode
-        except Exception:
+        """Only fixed reconciliation operations use host Git with pinned storage."""
+        if not args or args[0] not in ("checkout", "reset", "rm", "read-tree", "update-ref"):
             return 1
+        proc = subprocess.run(host_git_argv(*args, work_tree=self.root, git_dir=self.git_dir),
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=120,
+                              env=host_git_env())
+        return proc.returncode
 
     def _rev(self) -> str:
         rc, out = self._git("rev-parse", "--verify", "-q", "HEAD")
         return out.decode().strip() if rc == 0 else ""
 
     def _status(self) -> list[tuple[str, str, str | None]]:
-        rc, out = self._git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        # Ignored dependency trees remain compact at their first matched directory.
+        rc, out = self._git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching")
         if rc != 0:
             raise GuardError("git status failed")
         return parse_status(out)
@@ -521,9 +524,10 @@ class BashGuard:
 
     # -- pre-check --
     def _bad_path(self, arg: str) -> str | None:
-        if "$" in arg or "`" in arg or arg.startswith("~"):
+        unresolved = arg.replace("${TMPDIR}", "").replace("$TMPDIR", "")
+        if "$" in unresolved or "`" in arg or arg.startswith("~"):
             return f"unresolved expansion in {arg!r}"
-        if arg in SAFE_DEV:
+        if arg in SAFE_DEV or arg == "$TMPDIR" or arg.startswith(("$TMPDIR/", "${TMPDIR}/")):
             return None
         if any(part == ".." for part in arg.split("/")):
             return f"parent traversal in {arg!r}"
@@ -554,16 +558,43 @@ class BashGuard:
                 if bad:
                     return f"tee target refused: {bad}"
         if cmd == "git":
+            if any(any(ch in a for ch in "$`~") for a in args):
+                return "expanded Git options and verbs are refused"
+            if any(a in ("-c", "--config-env") or a.startswith(("-c", "--config-env=")) for a in args):
+                i = 0
+                configs: list[str] = []
+                while i < len(args) and (args[i] == "-c" or args[i].startswith("-c")):
+                    if args[i] == "-c" and i + 1 < len(args):
+                        configs.append(args[i + 1])
+                        i += 2
+                    elif args[i].startswith("-c") and len(args[i]) > 2:
+                        configs.append(args[i][2:])
+                        i += 1
+                    else:
+                        return "Git configuration is reserved for the runtime"
+                if any(not re.fullmatch(r"(?:user\.name|user\.email)=[^\x00\r\n]{1,256}", item)
+                       for item in configs):
+                    return "Git configuration is reserved for the runtime"
             gargs = [a for a in args if not a.startswith("-")]
             verb = next((i for i, a in enumerate(args) if not a.startswith("-")
                          and (i == 0 or args[i - 1] not in ("-C", "--git-dir", "--work-tree", "--exec-path", "-c"))), None)
             if any(a in ("--exec-path", "--work-tree", "--git-dir", "-C") for a in args):
                 return "Git directory and execution options are reserved for the runtime"
             subcommand = args[verb] if verb is not None else ""
-            if subcommand in ("update-ref", "symbolic-ref", "worktree", "remote", "tag", "stash"):
-                return f"git {subcommand} is confined to the leased branch and is refused"
+            read_commands = {"add", "commit", "diff", "log", "show", "status", "ls-files", "rev-list",
+                             "rev-parse", "cat-file", "checkout", "restore", "grep", "rm", "blame",
+                             "describe", "shortlog", "show-ref", "for-each-ref", "branch", "reset", "clean"}
+            if subcommand not in read_commands:
+                return f"git {subcommand or '<unspecified>'} is confined to the private task index"
             if subcommand == "branch" and (not gargs or len(gargs) > 1 or any(a.startswith("-") for a in args)):
                 return "git branch mutations are confined to the runtime"
+            if subcommand in ("commit", "rm") and not self.allow_commits:
+                return "this task does not allow shell Git mutations"
+            if subcommand == "reset" and "--" not in args:
+                return "a shell reset may name only paths"
+            if subcommand == "checkout" and any(a in ("-b", "-B", "-c", "-C", "--orphan", "--detach")
+                                               for a in args):
+                return "a shell cannot create or detach a leased branch"
             if subcommand in ("checkout", "switch") and any(a in ("-b", "-B", "-c", "-C", "--orphan", "--detach") for a in args):
                 return "a shell cannot create or detach a leased branch"
             if any(a in ("--global", "--system", "--file", "-f") for a in args if subcommand == "config"):
@@ -655,10 +686,14 @@ class BashGuard:
         full = self._safe(rel)
         if full is None or "U" in xy or xy in ("DD", "AA"):
             return False
-        if xy == "??":
+        if xy in ("??", "!!"):
             try:
                 if os.path.islink(full) or full.is_file():
                     full.unlink()
+                    return True
+                if rel.endswith("/") and full.is_dir():
+                    # This directory did not exist in the baseline. Do not follow symlinks below it.
+                    shutil.rmtree(full)
                     return True
             except OSError:
                 pass
@@ -793,7 +828,37 @@ class LiteHarness:
         self._ran = False
         self._secrets = _secrets(dict(os.environ))
         self.guard = BashGuard(self.root, self.owns, self._authorized, allowed_commits)
+        self._shell_root = Path(tempfile.mkdtemp(prefix="jbi-lite-shell-"))
+        try:
+            from .private_git import PrivateGit
+            self._private_git = PrivateGit(self.guard, self._shell_root)
+        except Exception:
+            shutil.rmtree(self._shell_root, ignore_errors=True)
+            raise
+        self._finalized = False
+        self._shell_rejected: list[str] = []
         self.usage = Usage()
+
+    def _finish(self, result: HarnessResult, *, publish: bool = True) -> HarnessResult:
+        """Accept only valid owned private commits. Destroy all other private Git operations."""
+        if self._finalized:
+            return result
+        error = None
+        try:
+            if publish:
+                self._private_git.publish()
+        except Exception as exc:
+            error = f"ERROR: private Git publication refused: {redact(str(exc), self._secrets)}"
+        finally:
+            self._private_git.__exit__()
+            self._finalized = True
+            shutil.rmtree(self._shell_root, ignore_errors=True)
+        if error:
+            if result.exit_code:
+                result.final_text += "\n" + error
+            else:
+                result.exit_code, result.final_text = 1, error
+        return result
 
     # -- public --
     def take_messages(self) -> list[dict]:
@@ -806,7 +871,7 @@ class LiteHarness:
             problem = self._check_before_run()
             if problem:
                 result.exit_code, result.final_text = 1, f"ERROR: before_run refused: {problem}"
-                return result
+                return self._finish(result)
         self._messages.append({"role": "user", "content": build_user_content(brief, not self._messages)})
         self._ran = True
         deadline = self.clock() + self.timeout_sec
@@ -853,6 +918,7 @@ class LiteHarness:
             return self._fail(result, f"max_turns {self.max_turns} reached", last_text, code=2)
         finally:
             result.usage = self.usage
+            self._finish(result, publish=result.exit_code == 0 and not self._shell_rejected)
 
     # -- internals --
     def _authorized(self, rel: str) -> bool:
@@ -973,6 +1039,10 @@ class LiteHarness:
         cmd = inp.get("command")
         if not isinstance(cmd, str) or not cmd.strip():
             raise ToolError("empty command")
+        try:
+            self.tracking.authorize_write(self.task_id, self.owns[0] if self.owns else "source", tool_write=False)
+        except Exception as exc:
+            raise ToolError(f"bash refused: {redact(str(exc), self._secrets)}") from None
         reason = self.guard.check(cmd)
         if reason:
             raise ToolError(f"command refused by the fence: {reason}")
@@ -980,8 +1050,9 @@ class LiteHarness:
         wanted = wanted if isinstance(wanted, int) and not isinstance(wanted, bool) and wanted > 0 else 180
         limit = max(1.0, min(float(wanted), float(self.bash_max_sec), deadline - self.clock()))
         env = fence_env()
-        from .sandbox import LinuxSandbox
-        with LinuxSandbox(self.root, git_dir=self.guard.git_dir, common_dir=self.guard.common_dir) as fence:
+        from .sandbox import fenced_argv
+        argv, new_fence = fenced_argv(self.guard, cmd, self._private_git, self._shell_root)
+        with new_fence as fence:
             proc = subprocess.Popen(fence.argv(cmd), cwd=str(self.root), env=env, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
             try:
@@ -995,6 +1066,10 @@ class LiteHarness:
                 raw, _ = proc.communicate()
                 note = f"[timed out after {limit:.0f}s]"
         out = raw.decode("utf-8", errors="replace")
+        self._private_git.checkpoint()
+        if proc.returncode != 0 or proc.returncode is None:
+            self._shell_rejected.append("command failed after writing")
+            self._private_git.checkpoint_error = "a failed command invalidated the private Git transaction"
         if len(out) > BASH_OUT_MAX:
             out = out[:BASH_OUT_MAX // 2] + "\n...[truncated]...\n" + out[-BASH_OUT_MAX // 2:]
         reverted, errors = self.guard.reconcile()

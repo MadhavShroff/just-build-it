@@ -303,7 +303,10 @@ class Supervisor:
         """Renew a dispatch. Only a prior dispatch in this same task supplies history."""
         lease = self._task_lease(task_id, cwd)
         stage_key = re.sub(r"-\d+$", "", sid)
-        history_key = f"{lease['session_id']}-h-{stage_key}"
+        history_key = f"h-{lease['session_id']}-{stage_key}"
+        if len(history_key) > 64:
+            digest = hashlib.sha256(f"{lease['session_id']}\0{stage_key}".encode()).hexdigest()
+            history_key = f"h-{digest[:32]}-{lease['task_id'][-12:]}-{stage_key[-12:]}"
         self.tracking.start_history_session(history_key, node=self.dag_name())
         history = self.tracking.session_history(history_key) if attempt > 0 else []
         digest = hashlib.sha256(brief.read_bytes()).hexdigest() if brief else None
@@ -653,6 +656,7 @@ class Supervisor:
             base = existing["base_commit"]
         worktree = wt.restore_worktree(self.repo, tid, base, self.run_dir / "worktrees",
                                        expected_head=(existing or {}).get("head_commit"))
+        wt.pin_git_metadata(worktree)
         setup_cmds = self.store.read("/config/worktree_setup_commands") or ()
         wt.prepare_worktree(worktree, setup_commands=setup_cmds, cache_key=base)
         self._task_lease(tid, worktree)
@@ -1056,7 +1060,7 @@ class Supervisor:
             if handover is None and (notice.get("job") or notice.get("job_id")):
                 wanted = str(notice.get("job") or notice.get("job_id"))
                 rows = [row for row in self.tracking.fleet()["ci_submissions"]
-                        if row["service_reply"].get("job") == wanted]
+                        if row["task_id"] == tid and row["service_reply"].get("job") == wanted]
                 if len(rows) == 1:
                     row = rows[0]
                     handover = ci_mod.HandoverResult(
@@ -1195,6 +1199,13 @@ class Supervisor:
             for tid in list(self._running):
                 worktree = self.run_dir / "worktrees" / tid
                 if (worktree / ".git").exists():
+                    task = self.tracking.get_task(tid) or {}
+                    unsafe = [rel for rel in wt.dirty_paths(worktree)
+                              if not wt.path_owned(rel, task.get("owns") or [])]
+                    if unsafe:
+                        self.store.log("task", f"{tid}: unowned work preserved; stand-down commit refused: "
+                                       f"{', '.join(unsafe)}", task=tid)
+                        continue
                     try:
                         wt.commit_all(worktree, f"{tid}: work in progress (stand down)")
                     except wt.GitError as error:

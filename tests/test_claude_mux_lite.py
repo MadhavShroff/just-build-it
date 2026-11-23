@@ -12,6 +12,7 @@ from pathlib import Path
 
 from claude_mux_lite import harness as H
 from claude_mux_lite.harness import BashGuard, HttpError, LiteHarness, Usage
+from claude_mux_lite.sandbox import leased_shell
 
 
 class FakeTracking:
@@ -189,18 +190,19 @@ class OperatingSystemFence(Base):
         outside = self.tmp / "external.txt"
         sibling = Path("/var/tmp") / f"jbi-sibling-{os.getpid()}.txt"
         with LinuxSandbox(self.repo) as fence:
-            good = subprocess.run(fence.argv("printf good > src/owned.txt && mkdir -p .git/testdir"),
-                                  capture_output=True, text=True)
+            good = subprocess.run(fence.argv("printf good > src/owned.txt"), capture_output=True, text=True)
+            metadata = subprocess.run(fence.argv("mkdir -p .git/testdir"), capture_output=True, text=True)
             bad = subprocess.run(fence.argv(f"printf bad > {outside}"), capture_output=True, text=True)
             parent = subprocess.run(fence.argv(f"printf bad > {sibling}"), capture_output=True, text=True)
             temp = subprocess.run(fence.argv("mkdir -p \"$TMPDIR/scratch-task\" && printf local > \"$TMPDIR/scratch-task/x\""),
                                   capture_output=True, text=True)
         self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertNotEqual(metadata.returncode, 0)
         self.assertFalse(outside.exists())      # /tmp is a private tmpfs: the write never reaches the host
         self.assertNotEqual(parent.returncode, 0)
         self.assertFalse(sibling.exists())
         self.assertTrue((self.repo / "src/owned.txt").exists())
-        self.assertTrue((self.repo / ".git/testdir").is_dir())
+        self.assertFalse((self.repo / ".git/testdir").is_dir())
         self.assertEqual(temp.returncode, 0)
 
 
@@ -222,9 +224,10 @@ class GitFence(Base):
         self.addCleanup(lambda: self.marker.exists() and self.marker.unlink())
 
     def shell(self, command, work=None):
-        from claude_mux_lite.sandbox import LinuxSandbox
-        with LinuxSandbox(work or self.work) as fence:
-            return subprocess.run(fence.argv(command), capture_output=True, text=True, timeout=60)
+        from claude_mux_lite.sandbox import leased_shell
+        target = work or self.work
+        guard = BashGuard(target, ("src",), lambda p: p.startswith("src"), allow_commits=True)
+        return leased_shell(guard, command)
 
     def test_fsmonitor_config_write_refuses_and_host_status_makes_no_marker(self):
         attack = self.shell(f"git config --local core.fsmonitor 'touch {self.marker}; false'")
@@ -246,7 +249,7 @@ class GitFence(Base):
         self.assertFalse(self.marker.exists())
 
     def test_owned_git_writes_succeed_in_a_linked_worktree(self):
-        done = self.shell("printf one > src.txt && git add src.txt && "
+        done = self.shell("printf one > src/owned.txt && git add src/owned.txt && "
                           "git -c user.name=a -c user.email=b commit -qm one && git status --short")
         self.assertEqual(done.returncode, 0, done.stderr)
         log = subprocess.run(["git", "-C", str(self.repo), "log", "--format=%s", "jbi/t1"],
@@ -296,12 +299,133 @@ class GitFence(Base):
         other = Path(tempfile.mkdtemp(prefix="other-task-", dir="/tmp"))
         self.addCleanup(lambda: shutil.rmtree(other, ignore_errors=True))
         (other / "secret").write_text("host-secret")
-        done = self.shell(f"cat {other}/secret; ls {other}; "
+        done = self.shell(f"cat \"$TMPDIR/{other.name}/secret\"; "
                           "printf mine > \"$TMPDIR/own\" && cat \"$TMPDIR/own\"")
         self.assertNotIn("host-secret", done.stdout)
-        self.assertIn("mine", done.stdout)
+        own = self.shell("printf mine > \"$TMPDIR/own\" && cat \"$TMPDIR/own\"")
+        self.assertIn("mine", own.stdout)
         listing = self.shell("ls /tmp")
         self.assertNotIn(other.name, listing.stdout)
+
+class NeonFenceRegressions(GitFence):
+    """The Neon review proves these writes and commands must refuse or reconcile."""
+
+    def shell_owned(self, command):
+        return leased_shell(BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True), command)
+
+    def test_allowed_commit_and_ownership_publish_only_owned_paths(self):
+        harness = LiteHarness(workdir=self.work, model="m", task_id="t1", tracking=self.tr,
+                              owns=("src",), allowed_commits=True,
+                              transport=Script(reply(use("b", "bash", command="printf work > src/new.txt")),
+                                               reply(text("done"))))
+        before = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/t1"],
+                                capture_output=True, text=True).stdout
+        result = harness.run("change source")
+        self.assertEqual(result.exit_code, 0, result.final_text)
+        self.assertEqual((self.work / "src" / "new.txt").read_text(), "work")
+        after = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/t1"],
+                               capture_output=True, text=True).stdout
+        self.assertEqual(before, after)
+
+    def test_allowed_git_commit_publishes_only_the_leased_ref(self):
+        store = self.tr
+        harness = LiteHarness(workdir=self.work, model="m", task_id="t1", tracking=store,
+                              owns=("src",), allowed_commits=True,
+                              transport=Script(reply(use("add", "bash", command="printf x > src/f && git add src/f")),
+                                               reply(text("staged")),
+                                               reply(use("commit", "bash", command="git -c user.name=t -c user.email=t@t commit -qm owned")),
+                                               reply(text("committed"))))
+        base = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/other"],
+                              capture_output=True, text=True).stdout
+        deadline = harness.clock() + 5
+        first = harness._t_bash({"command": "printf x > src/f && git add src/f"}, deadline)
+        second = harness._t_bash({"command": "git -c user.name=t -c user.email=t@t commit -qm owned"}, deadline)
+        result = harness._finish(H.HarnessResult())
+        self.assertFalse(result.exit_code, first + second + result.final_text)
+        self.assertEqual(subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/other"],
+                                       capture_output=True, text=True).stdout, base)
+        self.assertIn("owned", subprocess.run(["git", "-C", str(self.repo), "log", "-1", "--format=%s", "jbi/t1"],
+                                             capture_output=True, text=True).stdout)
+        self.assertEqual(subprocess.run(["git", "-C", str(self.work), "status", "--porcelain"],
+                                       capture_output=True, text=True).stdout, "")
+
+    def guarded(self):
+        return BashGuard(self.work, ("src",), lambda p: H.path_matches(p, ["src"]), allow_commits=True)
+
+    def test_unowned_ignored_write_reconciles_and_does_not_escape(self):
+        (self.work / ".gitignore").write_text("secret.env\n")
+        guard = self.guarded()
+        command = "printf leaked > secret.env"
+        from claude_mux_lite.sandbox import LinuxSandbox
+        with LinuxSandbox(self.work) as fence:
+            subprocess.run(fence.argv(command), capture_output=True, check=False)
+        reverted, errors = guard.reconcile()
+        self.assertFalse((self.work / "secret.env").exists())
+        self.assertIn("secret.env", reverted)
+
+    def test_dynamic_git_verbs_cannot_bypass_the_precheck(self):
+        guard = self.guarded()
+        for command in ("a=stash; git $a", "x=update-ref; git \"$x\" refs/heads/other HEAD",
+                        "git update$IGNORE-ref refs/heads/other HEAD",
+                        "git -c core.fsmonitor='touch /tmp/no' status",
+                        "git -c alias.x='!touch /tmp/no' x"):
+            self.assertIsNotNone(guard.check(command), command)
+
+    def test_packed_base_and_stash_and_new_sibling_refs_are_refused(self):
+        base = subprocess.run(["git", "-C", str(self.repo), "pack-refs", "--all", "--prune"], check=False)
+        self.assertEqual(base.returncode, 0, base.stderr)
+        old = (self.repo / ".git/packed-refs").read_bytes()
+        for command in ("printf '0000000000000000000000000000000000000000 refs/heads/main\\n' >> "
+                        "\"$(git rev-parse --git-common-dir)/packed-refs\"",
+                        "git stash", "git update-ref refs/stash HEAD",
+                        "git update-ref refs/heads/jbi/another HEAD"):
+            done = self.shell_owned(command)
+            self.assertNotEqual(done.returncode, 0, command)
+        self.assertEqual((self.repo / ".git/packed-refs").read_bytes(), old)
+        self.assertFalse((self.repo / ".git/refs/stash").exists())
+        self.assertFalse(subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "-q",
+                                        "jbi/another"], capture_output=True).stdout)
+        done = self.shell_owned("printf one > src/new.txt && git add src/new.txt && "
+                                "git -c user.name=a -c user.email=b commit -qm correct")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class NeonHostAndSandboxRegression(Base):
+    def test_a_rewritten_worktree_pointer_cannot_run_a_host_filter(self):
+        from jbi import worktrees as wt
+        path = linked_worktree(self.tmp, self.repo)
+        git_dir, common = wt.trusted_git_metadata(path)
+        marker = self.tmp / "host-filter-ran"
+        hostile = path / "fakegit"
+        hostile.mkdir()
+        (hostile / "config").write_text("[filter \"pwn\"]\n clean = touch " + str(marker) + "\n")
+        original_config = Path(common, "config").read_text()
+        with Path(common, "config").open("a") as source:
+            source.write("[filter \"pwn\"]\n clean = touch " + str(marker) + "\n")
+        (Path(git_dir) / "commondir").unlink()
+        (Path(git_dir) / "config").write_text("[filter \"pwn\"]\n clean = touch " + str(marker) + "\n")
+        (path / ".git").write_text("gitdir: fakegit\n")
+        (path / ".gitattributes").write_text("other/b.txt filter=pwn\n")
+        wt.trusted_git(git_dir, common, path, "add", "-A")
+        self.assertFalse(marker.exists())
+
+    def test_a_gitignored_shell_write_requires_a_lease(self):
+        from jbi import tracking
+        store = tracking.Tracking(self.tmp / "fleet.db")
+        self.addCleanup(store.close)
+        store.create_task(title="x", owns=["src"], branch="jbi/t1", worktree=self.repo,
+                          base_commit="0" * 40, task_id="t1")
+        (self.repo / ".gitignore").write_text("ignored\n")
+        harness = LiteHarness(workdir=self.repo, model="m", task_id="t1", tracking=store, owns=("src",),
+                              transport=Script(reply(use("b", "bash", command="printf x > ignored"),
+                                                     reply(text("end")))))
+        result = harness.run("write")
+        self.assertNotEqual(result.exit_code, 0)
+        # A missing lease makes the tool refusal error rather than exposing a new file to the real caller.
+        tool = harness._tool_result({"name": "bash", "id": "x", "input": {"command": "printf x > ignored"}},
+                                     harness.clock() + 5)
+        self.assertIn("no live lease", tool["content"])
+        self.assertFalse((self.repo / "ignored").exists())
 
 
 class Tools(Base):

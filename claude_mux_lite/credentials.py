@@ -186,7 +186,29 @@ def start_broker(session_dir: Path, environ: Mapping[str, str]) -> dict[str, str
     key, headers, upstream = take_from_environment(environ)
     session_dir = Path(session_dir)
     session_dir.mkdir(parents=True, exist_ok=True)
-    folder = Path(tempfile.mkdtemp(prefix="b-", dir=session_dir))
+    socket_parent = None
+    for candidate in (session_dir.parent, session_dir.parent.parent, Path(tempfile.gettempdir())):
+        while True:
+            try:
+                stat = candidate.stat()
+            except OSError:
+                break
+            if stat.st_uid != os.getuid() or stat.st_mode & 0o002:
+                break
+            try:
+                if len(str(candidate / ".jbi-b-12345678/s.sock")) <= MAX_SOCKET_PATH:
+                    socket_parent = candidate
+                    break
+            except OSError:
+                break
+            if candidate == Path(candidate.anchor):
+                break
+            candidate = candidate.parent
+        if socket_parent is not None:
+            break
+    if socket_parent is None:
+        raise BrokerError("no bounded private broker socket path is available")
+    folder = Path(tempfile.mkdtemp(prefix=".jbi-b-", dir=socket_parent))
     os.chmod(folder, 0o700)
     path = folder / "s.sock"
     if len(str(path)) > MAX_SOCKET_PATH:

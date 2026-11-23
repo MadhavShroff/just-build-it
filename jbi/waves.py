@@ -313,7 +313,13 @@ def prioritize_ready(plan: dict[str, Any], ready_ids: Iterable[str] | None = Non
         on_cp = 0 if tid in cp else 1
         return (finish_boost, on_cp, -fanout.get(tid, 0), index_map.get(tid, 0))
 
-    return sorted(candidates, key=sort_key)
+    ranked = sorted(candidates, key=sort_key)
+    grouped: dict[str, list[str]] = {}
+    for tid in ranked:
+        node = str((tasks.get(tid) or {}).get("node") or tid)
+        grouped.setdefault(node, []).append(tid)
+    # A task that is ready later joins its node without displacing an earlier, independent node.
+    return [tid for group in grouped.values() for tid in group]
 
 
 def wave_preflight(plan: dict[str, Any], wave_number: int, *,

@@ -288,6 +288,16 @@ class BrokerBootstrap(ProcessBase):
         self.assertEqual(oct(os.stat(extra["CLAUDE_MUX_BROKER"]).st_mode & 0o777), "0o600")
         self.assertEqual(tracking_rows(self.db), 0)
 
+    def test_a_long_session_path_still_starts_a_short_private_broker(self):
+        did = self.dispatch()
+        headed_next = self.tmp / ("sessions/" + "s-bootstrap-bootstrap-" + "s" * 100)
+        headed_next.mkdir(parents=True)
+        self.tmp = headed_next
+        with FakeEndpoint([final(RECEIPT_TEXT)]) as ep:
+            proc, _ = self.run_bootstrap(self.spec(did), ep.url)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(list(self.tmp.parent.parent.glob(".jbi-b-*")), [])
+
     def test_the_socket_refuses_a_wrong_token(self):
         from claude_mux_lite import credentials
         with FakeEndpoint([final("x")]) as ep:

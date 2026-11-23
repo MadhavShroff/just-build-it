@@ -186,7 +186,10 @@ def render(*, task: dict, role: str, stage: str, attempt: int, receipt: Path,
         owns = _flatten(["## Owns", *owns_items[:16], f"- ... ({len(owns_items) - 16} more)", ""])
         footer = [*owns, *tail]
     essential = [*header, *footer]
-    stable = [*stable[:max(0, MAX_LINES - len(essential) - 2)], "... (truncated)", ""]
+    stable_budget = max(0, MAX_LINES - len(essential) - 2)
+    if len(stable) > stable_budget:
+        stable = [*stable[:stable_budget], "... (truncated)", ""]
+        middle = []
 
     budget = max(0, MAX_LINES - len(stable) - len(header) - len(footer))
     if budget >= 2:
