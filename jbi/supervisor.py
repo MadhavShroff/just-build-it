@@ -665,7 +665,7 @@ class Supervisor:
             base = existing["base_commit"]
         worktree = wt.restore_worktree(self.repo, tid, base, self.run_dir / "worktrees",
                                        expected_head=(existing or {}).get("head_commit"))
-        wt.pin_git_metadata(worktree)
+        wt.pin_git_metadata(worktree, self.repo)
         setup_cmds = self.store.read("/config/worktree_setup_commands") or ()
         wt.prepare_worktree(worktree, setup_commands=setup_cmds, cache_key=base)
         self._task_lease(tid, worktree)

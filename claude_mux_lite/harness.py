@@ -580,6 +580,8 @@ class BashGuard:
         return None
 
     def _segment(self, words: list[str]) -> str | None:
+        if words and any(ch in words[0] for ch in "$`~"):
+            return "expanded command names and paths are refused"
         i = 0
         while i < len(words) and (("=" in words[i] and not words[i].startswith("-")) or words[i] in WRAPPERS
                                   or words[i].startswith("-") or words[i].isdigit()):
@@ -627,6 +629,12 @@ class BashGuard:
             read_commands = {"add", "commit", "diff", "log", "show", "status", "ls-files", "rev-list",
                              "rev-parse", "cat-file", "checkout", "grep", "rm", "blame",
                              "describe", "shortlog", "show-ref", "for-each-ref", "branch", "reset", "clean"}
+            if subcommand == "clean":
+                if "--" not in args or any(arg in ("-x", "-X", "-a", "-A") for arg in args):
+                    return "a shell may clean only explicit leased paths"
+                for path in args[args.index("--") + 1:]:
+                    if not self.owned(path):
+                        return f"clean target is outside the task lease: {path}"
             if subcommand not in read_commands:
                 return f"git {subcommand or '<unspecified>'} is confined to the private task index"
             if subcommand == "branch" and (not gargs or len(gargs) > 1 or any(a.startswith("-") for a in args)):
@@ -771,7 +779,16 @@ class BashGuard:
                     full.unlink()
                     return True
                 if rel.endswith("/") and full.is_dir():
-                    # This directory did not exist in the baseline. Do not follow symlinks below it.
+                    # Directory mtimes are not file identities. Inspect new leaves only.
+                    if self.baseline and any(name.startswith(rel) for name in self.baseline):
+                        for child in sorted(full.iterdir(), key=lambda p: p.name, reverse=True):
+                            rel_child = child.relative_to(self.root).as_posix()
+                            if not self.owned(rel_child) and rel_child not in self.baseline:
+                                if child.is_dir() and not child.is_symlink():
+                                    shutil.rmtree(child)
+                                else:
+                                    child.unlink()
+                        return True
                     shutil.rmtree(full)
                     return True
             except OSError:

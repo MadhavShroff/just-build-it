@@ -390,7 +390,7 @@ class NeutralDispatch(unittest.TestCase):
         self.sup.tracking.release("t1", reason="abandon", abandon=True)
         self.worktree = wt.restore_worktree(self.repo, "t1", self.base, self.run_dir / "worktrees", expected_head=head)
         self.sup._task_lease("t1", self.worktree)
-        wt.pin_git_metadata(self.worktree)
+        wt._RUNTIME_GIT.clear()
         (self.worktree / "src").mkdir(exist_ok=True)
         (self.worktree / ".git").write_text("gitdir: fakegit\n")
         (self.worktree / "unowned.txt").write_text("preserve\n")

@@ -31,7 +31,7 @@ _RUNTIME_GIT: dict[Path, tuple[Path, Path]] = {}
 def pin_git_metadata(worktree: Path, repository: Path | None = None) -> tuple[Path, Path]:
     """Bind the registered identity of a task worktree before trust-dependent Git calls."""
     key = Path(worktree).resolve()
-    if key not in _RUNTIME_GIT or repository is not None:
+    if key not in _RUNTIME_GIT:
         _RUNTIME_GIT[key] = trusted_git_metadata(worktree, repository)
     return _RUNTIME_GIT[key]
 
@@ -80,10 +80,21 @@ def trusted_git_metadata(workdir: Path, repository: Path | None = None) -> tuple
         if current_common != common:
             raise GitError(f"worktree {workdir} resolves outside repository {repository}")
         return git_dir, current_common
+    entry = path / ".git"
+    if entry.is_dir():
+        try:
+            return discover_git(path)
+        except (OSError, RuntimeError) as exc:
+            raise GitError(f"cannot pin trusted Git storage for {workdir}: {exc}") from exc
+    if path.parent.name != "worktrees":
+        raise GitError(f"cannot validate linked Git metadata for {workdir}")
+    root = path.parent.parent.parent.resolve() / "repo"
+    if not (root / ".git").is_dir():
+        raise GitError(f"cannot locate trusted shared metadata for {workdir}")
     try:
-        return discover_git(path)
+        return trusted_git_metadata(path, root)
     except (OSError, RuntimeError) as exc:
-        raise GitError(f"cannot pin trusted Git storage for {workdir}: {exc}") from exc
+        raise GitError(f"cannot validate registered Git storage for {workdir}: {exc}") from exc
 
 
 def trusted_git(git_dir: Path, common_dir: Path, workdir: Path, *args: str,
@@ -105,8 +116,6 @@ def trusted_git(git_dir: Path, common_dir: Path, workdir: Path, *args: str,
     env["GIT_DIR"] = str(Path(git_dir).resolve())
     env["GIT_WORK_TREE"] = str(Path(workdir).resolve())
     proc = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
-    if result:
-        return proc
     if result:
         return proc
     if check and proc.returncode != 0:
@@ -231,7 +240,7 @@ def create_worktree(repo: Path, task: str, base: str, root: Path) -> Path:
     """A worktree for `task` on branch jbi/<task>. An existing worktree is reused."""
     path = root / task
     if (path / ".git").exists():
-        pin_git_metadata(path)
+        pin_git_metadata(path, repo)
         return path
     root.mkdir(parents=True, exist_ok=True)
     branch = f"jbi/{task}"
@@ -244,7 +253,7 @@ def create_worktree(repo: Path, task: str, base: str, root: Path) -> Path:
         git(path, "checkout", "-q", "-b", branch, base)
     else:
         git(repo, "worktree", "add", "-q", "-b", branch, str(path), base)
-    pin_git_metadata(path)
+    pin_git_metadata(path, Path(repo))
     return path
 
 

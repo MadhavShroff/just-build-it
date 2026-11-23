@@ -363,6 +363,23 @@ class NeonFenceRegressions(GitFence):
         self.assertFalse((self.work / "secret.env").exists())
         self.assertIn("secret.env", reverted)
 
+    def test_generalized_git_clean_and_alias_drivers_are_refused(self):
+        guard = self.guarded()
+        for command in ("git clean -fdx", "g=git; $g checkout jbi/other", "git clean -df -- other/file"):
+            self.assertIsNotNone(guard.check(command), command)
+
+    def test_a_preexisting_ignored_directory_survives_an_owned_write(self):
+        build = self.work / "build"
+        build.mkdir()
+        (build / "large.bin").write_bytes(b"contents" * 600000)
+        (build / "allowed.txt").write_text("old\n")
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("build/allowed.txt",), lambda p: p == "build/allowed.txt", allow_commits=True)
+        (build / "allowed.txt").write_text("new\n")
+        guard.reconcile()
+        self.assertTrue((build / "large.bin").exists())
+        self.assertEqual((build / "allowed.txt").read_text(), "new\n")
+
     def test_writes_in_a_preexisting_ignored_directory_are_reconciled(self):
         ignored = self.work / "build" / "sub"
         ignored.mkdir(parents=True)
@@ -457,10 +474,60 @@ class NeonHostAndSandboxRegression(GitFence):
         self.assertEqual(result.exit_code, 0, result.final_text)
         self.assertEqual((self.work / "src" / "b.py").read_text(), "uncommitted\n")
 
+    def test_a_valid_delete_commit_leaves_real_index_and_tree_in_sync(self):
+        from claude_mux_lite.private_git import PrivateGit
+        command = "git rm src/a.py && git -c user.name=a -c user.email=b commit -qm delete"
+        done = self.shell(command)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(subprocess.run(["git", "-C", str(self.work), "status", "--porcelain"],
+                                       capture_output=True, text=True).stdout, "")
+        self.assertFalse((self.work / "src" / "a.py").exists())
+
+    def test_a_valid_in_worktree_symlink_commit_leaves_no_staged_change(self):
+        done = self.shell("ln -s a.py src/link.py && ln -s src/a.py src/other.py && "
+                          "git add src/link.py src/other.py && git -c user.name=a -c user.email=b commit -qm symlinks")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(subprocess.run(["git", "-C", str(self.work), "status", "--porcelain"],
+                                       capture_output=True, text=True).stdout, "")
+
+    def test_merge_commit_change_lists_include_every_parent(self):
+        from claude_mux_lite.private_git import PrivateGit
+        from claude_mux_lite.sandbox import LinuxSandbox
+        guard = BashGuard(self.repo, ("src",), lambda p: p.startswith("src"), allow_commits=True)
+        guard = BashGuard(self.repo, ("src",), lambda p: p.startswith("src"), allow_commits=True)
+        base_other = (self.repo / "other" / "b.txt").read_text()
+        private = PrivateGit(guard, self.tmp)
+        self.addCleanup(private.__exit__)
+        env = {"GIT_DIR": str(private.git_dir), "GIT_WORK_TREE": str(self.repo), "GIT_COMMON_DIR": str(private.common_dir)}
+        with LinuxSandbox(self.repo, git_dir=private.git_dir, common_dir=private.common_dir,
+                          scratch=self.tmp / "command", private_git=True, real_common_dir=private.real_common) as fence:
+            command = "printf hidden > other/b.txt && git add other/b.txt && git -c user.name=t -c user.email=t@t commit -qm hidden"
+            subprocess.run(fence.argv(command), env=env, capture_output=True, check=True)
+        tree = subprocess.check_output(["git", "--git-dir", str(private.git_dir), "rev-parse",
+                                        private.before + "^{tree}"]).strip().decode()
+        right = private.guard._rev()
+        merge = subprocess.check_output(["git", "--git-dir", str(private.git_dir), "-c", "user.name=t",
+                                        "-c", "user.email=t@t", "commit-tree", tree,
+                                        "-p", private.before, "-p", right, "-m", "merge"]).strip().decode()
+        subprocess.run(["git", "--git-dir", str(private.git_dir), "update-ref", "refs/heads/main", merge], check=True)
+        with self.assertRaisesRegex(RuntimeError, "one private commit"):
+            private.publish()
+        self.assertEqual(subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "main"]).strip().decode(),
+                         private.before)
+
+    def test_a_no_commit_private_transaction_preserves_initial_dirt(self):
+        (self.work / "src" / "old.txt").write_text("preserve\n")
+        from claude_mux_lite.private_git import PrivateGit
+        guard = BashGuard(self.work, ("src",), lambda p: H.path_matches(p, ("src",)), allow_commits=True)
+        private = PrivateGit(guard, self.tmp)
+        self.addCleanup(private.__exit__)
+        self.assertEqual(private.publish(), ("", []))
+        self.assertEqual((self.work / "src" / "old.txt").read_text(), "preserve\n")
+
     def test_a_rewritten_worktree_pointer_cannot_run_a_host_filter(self):
         from jbi import worktrees as wt
         path = self.work
-        git_dir, common = wt.trusted_git_metadata(path)
+        git_dir, common = wt.trusted_git_metadata(path, self.repo)
         marker = self.tmp / "host-filter-ran"
         hostile = path / "fakegit"
         hostile.mkdir()

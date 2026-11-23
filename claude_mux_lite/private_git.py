@@ -120,6 +120,8 @@ class PrivateGit:
         if not OID.fullmatch(self.before):
             raise RuntimeError("the pinned base is not a full commit id")
         head = self.guard._rev()
+        if head == self.before:
+            return "", []
         for xy, rel, original in self.guard._status():
             if (xy[1] in "ADMU" or xy[:1] in "ADMU") and rel in self.guard.baseline:
                 raise RuntimeError("changes to initially dirty tracked files do not publish a branch")
@@ -147,7 +149,7 @@ class PrivateGit:
             names = set()
             for sha in commits:
                 changed = subprocess.run(host_git_argv("diff-tree", "--no-commit-id", "--name-only", "-r",
-                                                       "-z", "--root", sha, git_dir=self.git_dir,
+                                                       "-z", "--root", "-m", sha, git_dir=self.git_dir,
                                                        work_tree=self.guard.root),
                                          env=host_git_env(), capture_output=True, timeout=60, check=True)
                 names.update(raw.decode("utf-8", "surrogateescape") for raw in changed.stdout.split(b"\0") if raw)
@@ -181,50 +183,48 @@ class PrivateGit:
                                      capture_output=True, timeout=120)
             if fetched.returncode != 0 or not self._objects(head):
                 raise RuntimeError("the real Git store rejected private commit objects")
-            for xy, path, original in self.guard._status():
-                if xy[1] in "ADMU" or xy[:1] in "ADMU":
-                    raise RuntimeError("uncommitted tracked edits must be preserved before ref publication")
+            present: set[str] = set()
+            for name in names:
+                mode = subprocess.run(host_git_argv("ls-tree", head, "--", name,
+                                                   git_dir=self.real_git, work_tree=self.guard.root),
+                                      env=host_git_env(), stdin=subprocess.DEVNULL,
+                                      capture_output=True, timeout=60, check=True)
+                if not mode.stdout:
+                    continue
+                current = self.guard.root / name
+                metadata = mode.stdout.split(None, 3)
+                kind = metadata[1]
+                stored = subprocess.run(host_git_argv("cat-file", kind.decode(), head + ":" + name,
+                                                    git_dir=self.real_git, work_tree=self.guard.root),
+                                       env=host_git_env(), stdin=subprocess.DEVNULL,
+                                       capture_output=True, timeout=60, check=True).stdout
+                if kind == b"blob":
+                    text = stored.decode("utf-8", "surrogateescape")
+                    if mode.stdout.startswith(b"120000 "):
+                        target = Path(os.path.normpath(current.parent / text))
+                        if Path(self.guard.root) not in target.parents and target != self.guard.root:
+                            raise RuntimeError("an escaping symlink is outside the task worktree")
+                        if not current.is_symlink() or os.readlink(current) != text:
+                            raise RuntimeError("in-worktree symlink source does not match its commit")
+                    else:
+                        if not current.is_file() or current.is_symlink() or current.read_bytes() != stored:
+                            raise RuntimeError("source does not match the validated commit: " + name)
+                    present.add(name)
+                else:
+                    raise RuntimeError("only file and symlink entries may be published")
             for name in names:
                 current = self.guard.root / name
-                if current.is_dir() and not current.is_symlink():
-                    raise RuntimeError("a published path is unexpectedly a directory: " + name)
-            # Update only the index. Commit-created paths below get checked individually.
+                if name not in present and os.path.lexists(current):
+                    raise RuntimeError("deleted file remains in the worktree: " + name)
+                if os.path.islink(current.parent):
+                    raise RuntimeError("a published path crosses a source symlink")
+            # No index mutation occurs before all source paths and entries validate.
             index = subprocess.run(host_git_argv("read-tree", head,
                                                 git_dir=self.real_git, work_tree=self.guard.root),
                                    env=host_git_env(), stdin=subprocess.DEVNULL,
                                    capture_output=True, timeout=120)
             if index.returncode != 0:
-                raise RuntimeError("the live worktree did not accept the validated commit")
-            for name in names:
-                current = self.guard.root / name
-                if os.path.lexists(current) and os.path.islink(current.parent) is False:
-                    committed = subprocess.run(host_git_argv("show", head + ":" + name,
-                                                            git_dir=self.real_git, work_tree=self.guard.root),
-                                               env=host_git_env(), stdin=subprocess.DEVNULL,
-                                               capture_output=True, timeout=60)
-                    if committed.returncode == 0 and current.is_file() and current.read_bytes() != committed.stdout:
-                        raise RuntimeError("publication would overwrite another uncommitted path: " + name)
-                if not current.is_file():
-                    # Symlinks are accepted only if their stored target stays in this worktree.
-                    mode = subprocess.run(host_git_argv("ls-tree", head, "--", name,
-                                                       git_dir=self.real_git, work_tree=self.guard.root),
-                                          env=host_git_env(), stdin=subprocess.DEVNULL,
-                                          capture_output=True, timeout=60, check=True)
-                    if b"120000 blob" in mode.stdout:
-                        target = subprocess.run(host_git_argv("show", head + ":" + name,
-                                                             git_dir=self.real_git, work_tree=self.guard.root),
-                                               env=host_git_env(), stdin=subprocess.DEVNULL,
-                                               capture_output=True, timeout=60, check=True).stdout.decode("utf-8")
-                        if Path(os.path.normpath(current.parent / target)) != Path(os.path.normpath(current)):
-                            raise RuntimeError("an escaping symlink is outside the task worktree")
-                    elif not current.exists() and any(os.path.islink(p) for p in current.parents):
-                        raise RuntimeError("a published path crosses a source symlink")
-                checkout = subprocess.run(host_git_argv("checkout-index", "-f", "--", name,
-                                                       git_dir=self.real_git, work_tree=self.guard.root),
-                                          env=host_git_env(), stdin=subprocess.DEVNULL,
-                                          capture_output=True, timeout=60)
-                if checkout.returncode:
-                    raise RuntimeError("committed path could not be restored after index publication")
+                raise RuntimeError("the validated index could not be installed")
             update = subprocess.run(host_git_argv("update-ref", self.guard.branch, head, self.before,
                                                  git_dir=self.real_git, work_tree=self.guard.root),
                                     env=host_git_env(), stdin=subprocess.DEVNULL,
