@@ -894,7 +894,7 @@ class ServerTest(unittest.TestCase):
             with mock.patch.object(tracking, "_now", side_effect=[f"{day}T10:00:00Z", f"{day}T10:0{seconds // 60}:00Z"]):
                 tr.mark_task_state(tid, "merging")
                 tr.record_merge(tid, number, head, base, f"job-{number}")
-            tr.release(tid, reason="merged")
+            tr.release(tid, reason="merged", repository=root)
         tr.close()
         status, body = self.call("GET", "/api/v1/metrics")
         self.assertEqual(status, 200)

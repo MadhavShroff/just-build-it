@@ -360,7 +360,7 @@ class Tracking:
 
     # ---- release -----------------------------------------------------------------------
 
-    def release(self, task_id: str, *, reason: str, abandon: bool = False) -> dict:
+    def release(self, task_id: str, *, reason: str, abandon: bool = False, repository: Path | None = None) -> dict:
         """Park the branch, detach the worktree at the base, then revoke the lease."""
         task = self._task(task_id)
         if self._live_lease(task_id) is None:
@@ -371,8 +371,13 @@ class Tracking:
         elif not abandon:
             raise LeaseError(f"release of task {task_id} needs reason 'merged' or abandon")
         wt, branch, base = Path(task["worktree"]), task["branch"], task["base_commit"]
+        if repository is None:
+            raise LeaseError("release requires the repository path for trusted metadata")
         expected = task["head_commit"] or base
-        git_dir, common_dir = pin_git_metadata(wt)
+        try:
+            git_dir, common_dir = pin_git_metadata(wt, repository)
+        except GitError as exc:
+            raise LeaseError(f"metadata refused release of task {task_id}: {exc}") from exc
         if not wt.is_dir():
             raise LeaseError(f"worktree {wt} is missing for task {task_id}")
         try:

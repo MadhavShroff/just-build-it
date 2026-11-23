@@ -65,7 +65,7 @@ class PrivateGit:
             os.path.realpath(self.real_common / "objects") + "\n", encoding="utf-8")
         (self.git_dir / "config").write_text(
             "[core]\n repositoryformatversion = 0\n bare = false\n worktree = "
-            + str(self.guard.root) + "\n", encoding="ascii")
+            + str(self.guard.root) + "\n[user]\n name = jbi task\n email = task@local.invalid\n", encoding="ascii")
         from .harness import host_git_argv, host_git_env
         result = subprocess.run(host_git_argv("status", "--porcelain=v1", "-z",
                                              work_tree=self.guard.root, git_dir=self.git_dir),

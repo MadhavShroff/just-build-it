@@ -215,7 +215,7 @@ class WorktreeReclaim(unittest.TestCase):
     def test_released_parked_worktree_is_kept(self):
         tracking, wt_path, base = self._lease("l2", commit=False)
         # Nothing committed: the branch stays at base, so release parks cleanly.
-        tracking.release("l2", reason="abandoned", abandon=True)
+        tracking.release("l2", reason="abandoned", abandon=True, repository=self.repo)
         self.assertEqual(wt.head(wt_path, "HEAD"), base)
         report = resume.orphaned("t-resume-wt5", self.run_dir, target_repo=self.repo)
         self.assertEqual(report.worktrees_removed, [], report.as_dict())

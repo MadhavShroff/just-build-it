@@ -580,8 +580,12 @@ class BashGuard:
         return None
 
     def _segment(self, words: list[str]) -> str | None:
-        if words and any(ch in words[0] for ch in "$`~"):
-            return "expanded command names and paths are refused"
+        for word in words:
+            if any(ch in word for ch in "`~"):
+                return "expanded shell commands and command options are refused"
+            safe = re.sub(r'(?<!\\)\$TMPDIR(?:/[\w.-]+)*', "", word)
+            if "$" in safe:
+                return "expanded shell commands and command options are refused"
         i = 0
         while i < len(words) and (("=" in words[i] and not words[i].startswith("-")) or words[i] in WRAPPERS
                                   or words[i].startswith("-") or words[i].isdigit()):
@@ -589,7 +593,7 @@ class BashGuard:
         if i >= len(words):
             return None
         cmd, args = os.path.basename(words[i]), words[i + 1:]
-        if cmd in ("sudo", "su", "doas"):
+        if cmd in ("sudo", "su", "doas", "eval"):
             return "privilege escalation is refused"
         if cmd in ("mkdir", "rmdir"):
             for arg in (a for a in args if not a.startswith("-")):
@@ -605,21 +609,9 @@ class BashGuard:
         if cmd == "git":
             if any(any(ch in a for ch in "$`~") for a in args):
                 return "expanded Git options and verbs are refused"
-            if any(a in ("-c", "--config-env") or a.startswith(("-c", "--config-env=")) for a in args):
-                i = 0
-                configs: list[str] = []
-                while i < len(args) and (args[i] == "-c" or args[i].startswith("-c")):
-                    if args[i] == "-c" and i + 1 < len(args):
-                        configs.append(args[i + 1])
-                        i += 2
-                    elif args[i].startswith("-c") and len(args[i]) > 2:
-                        configs.append(args[i][2:])
-                        i += 1
-                    else:
-                        return "Git configuration is reserved for the runtime"
-                if any(not re.fullmatch(r"(?:user\.name|user\.email)=[^\x00\r\n]{1,256}", item)
-                       for item in configs):
-                    return "Git configuration is reserved for the runtime"
+            if any(argument in ("-c", "--config-env") or argument.startswith(("-c", "--config-env="))
+                   for argument in args):
+                return "Git configuration is reserved for the runtime"
             gargs = [a for a in args if not a.startswith("-")]
             verb = next((i for i, a in enumerate(args) if not a.startswith("-")
                          and (i == 0 or args[i - 1] not in ("-C", "--git-dir", "--work-tree", "--exec-path", "-c"))), None)
@@ -630,11 +622,7 @@ class BashGuard:
                              "rev-parse", "cat-file", "checkout", "grep", "rm", "blame",
                              "describe", "shortlog", "show-ref", "for-each-ref", "branch", "reset", "clean"}
             if subcommand == "clean":
-                if "--" not in args or any(arg in ("-x", "-X", "-a", "-A") for arg in args):
-                    return "a shell may clean only explicit leased paths"
-                for path in args[args.index("--") + 1:]:
-                    if not self.owned(path):
-                        return f"clean target is outside the task lease: {path}"
+                return "git clean is refused because deletion is not recoverable by the task transaction"
             if subcommand not in read_commands:
                 return f"git {subcommand or '<unspecified>'} is confined to the private task index"
             if subcommand == "branch" and (not gargs or len(gargs) > 1 or any(a.startswith("-") for a in args)):
@@ -783,7 +771,9 @@ class BashGuard:
                     if self.baseline and any(name.startswith(rel) for name in self.baseline):
                         for child in sorted(full.iterdir(), key=lambda p: p.name, reverse=True):
                             rel_child = child.relative_to(self.root).as_posix()
-                            if not self.owned(rel_child) and rel_child not in self.baseline:
+                            reserved = any(name == rel_child or name.startswith(rel_child + "/") or self.owned(name)
+                                           for name in self.baseline)
+                            if not self.owned(rel_child) and not reserved:
                                 if child.is_dir() and not child.is_symlink():
                                     shutil.rmtree(child)
                                 else:

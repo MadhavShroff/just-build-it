@@ -80,21 +80,7 @@ def trusted_git_metadata(workdir: Path, repository: Path | None = None) -> tuple
         if current_common != common:
             raise GitError(f"worktree {workdir} resolves outside repository {repository}")
         return git_dir, current_common
-    entry = path / ".git"
-    if entry.is_dir():
-        try:
-            return discover_git(path)
-        except (OSError, RuntimeError) as exc:
-            raise GitError(f"cannot pin trusted Git storage for {workdir}: {exc}") from exc
-    if path.parent.name != "worktrees":
-        raise GitError(f"cannot validate linked Git metadata for {workdir}")
-    root = path.parent.parent.parent.resolve() / "repo"
-    if not (root / ".git").is_dir():
-        raise GitError(f"cannot locate trusted shared metadata for {workdir}")
-    try:
-        return trusted_git_metadata(path, root)
-    except (OSError, RuntimeError) as exc:
-        raise GitError(f"cannot validate registered Git storage for {workdir}: {exc}") from exc
+    raise GitError("trusted Git storage requires the repository path")
 
 
 def trusted_git(git_dir: Path, common_dir: Path, workdir: Path, *args: str,

@@ -96,7 +96,7 @@ class NeutralDispatch(unittest.TestCase):
                                      worktree=other, base_commit=self.base, task_id="t2")
         self.sup.tracking.dispatch("t2", session_id="s-other-t2", owns=["src/other.txt"], branch="jbi/t2",
                                    worktree=other)
-        self.sup.tracking.release("t2", reason="abandon", abandon=True)
+        self.sup.tracking.release("t2", reason="abandon", abandon=True, repository=self.repo)
         self.sup.tracking.record_session_history("s-other-t2", [{"role": "user", "content": "other task"}])
         brief, receipt = briefs.write(self.run_dir, task=self.store.read("/plan/tasks/t1"),
                                      role="implement", stage="implement", attempt=0)
@@ -369,7 +369,7 @@ class NeutralDispatch(unittest.TestCase):
         head = wt.commit_all(self.worktree, "t1: stand-down WIP")
         self.sup.tracking.mark_task_state("t1", "paused")
         self.sup.tracking.record_commit("t1", head)
-        result = self.sup.tracking.release("t1", reason="abandon", abandon=True)
+        result = self.sup.tracking.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.assertFalse(wt.head(self.repo, "jbi/t1"))
         self.assertFalse(wt.git(self.worktree, "symbolic-ref", "-q", "--short", "HEAD", check=False))
         restored = wt.restore_worktree(self.repo, "t1", self.base, self.run_dir / "worktrees",
@@ -381,13 +381,24 @@ class NeutralDispatch(unittest.TestCase):
         self.assertIsNone(self._task_lease["released_at"])
 
     def test_release_uses_runtime_pinned_metadata_not_an_agent_pointer(self):
+        new_repo = Path(self.tmp.name) / "my_real_project"
+        self.repo.rename(new_repo)
+        self.repo = new_repo
+        for record in (self.repo / ".git" / "worktrees").iterdir():
+            if record.is_dir() and not record.is_symlink():
+                pointer = record / "gitdir"
+                pointer.write_text(pointer.read_text().replace(str(Path(self.tmp.name) / "repo") + "/",
+                                                                str(new_repo) + "/"))
+        self.sup._repo = self.repo
+        wt._RUNTIME_GIT.clear()
+        wt.pin_git_metadata(self.worktree, self.repo)
         (self.worktree / "src").mkdir()
         (self.worktree / "src" / "t1.txt").write_text("owned\n")
         head = wt.commit_all(self.worktree, "owned")
         self.sup._task_lease("t1", self.worktree)
         self.sup.tracking.mark_task_state("t1", "paused")
         self.sup.tracking.record_commit("t1", head)
-        self.sup.tracking.release("t1", reason="abandon", abandon=True)
+        self.sup.tracking.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.worktree = wt.restore_worktree(self.repo, "t1", self.base, self.run_dir / "worktrees", expected_head=head)
         self.sup._task_lease("t1", self.worktree)
         wt._RUNTIME_GIT.clear()
@@ -407,12 +418,25 @@ class NeutralDispatch(unittest.TestCase):
         self.addCleanup(lambda: setattr(tracking, "trusted_git", real))
         from jbi.tracking import LeaseError
         with self.assertRaises(LeaseError):
-            self.sup.tracking.release("t1", reason="abandon", abandon=True)
+            self.sup.tracking.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.assertTrue(seen)
         self.assertTrue(all(entry[0] != hostile for entry in seen))
         self.assertFalse(Path("runtime-marker").exists())
         self.assertTrue(any(lease["released_at"] is None for lease in self.sup.tracking.fleet()["leases"]
                             if lease["task_id"] == "t1"))
+
+    def test_restart_release_refuses_a_fake_git_directory_and_keeps_the_lease(self):
+        from jbi.tracking import LeaseError
+        self.sup._task_lease("t1", self.worktree)
+        self.sup.tracking.mark_task_state("t1", "paused")
+        self.sup.tracking.record_commit("t1", self.base)
+        wt.unpin_git_metadata(self.worktree)
+        self.worktree.joinpath(".git").unlink()
+        self.worktree.joinpath(".git").mkdir()
+        with self.assertRaises(LeaseError):
+            self.sup.tracking.release("t1", reason="abandon", abandon=True, repository=self.repo)
+        self.assertIsNone(self.sup.tracking.fleet()["leases"][0]["released_at"])
+        self.assertEqual(wt.head(self.repo, "jbi/t1"), self.base)
 
     def test_dirty_green_ci_preserves_base_live_lease_and_file(self):
         from tests.test_runtime import FakeCI
@@ -459,7 +483,7 @@ class NeutralDispatch(unittest.TestCase):
     def test_parked_ref_of_a_dependency_does_not_interfere_with_new_task(self):
         self.sup._task_lease("t1", self.worktree)
         self.sup.tracking.mark_task_state("t1", "paused")
-        self.sup.tracking.release("t1", reason="abandon", abandon=True)
+        self.sup.tracking.release("t1", reason="abandon", abandon=True, repository=self.repo)
         other = wt.restore_worktree(self.repo, "other", self.base, self.run_dir / "worktrees")
         self.assertEqual(wt.head(other, "HEAD"), self.base)
         self.assertEqual(wt.git(other, "symbolic-ref", "-q", "--short", "HEAD"), "jbi/other")

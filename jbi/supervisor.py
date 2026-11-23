@@ -553,7 +553,7 @@ class Supervisor:
                 head = wt.head(self.repo, "jbi/bootstrap")
                 if head:
                     self.tracking.record_commit("bootstrap", head)
-                self.tracking.release("bootstrap", reason="abandon", abandon=True)
+                self.tracking.release("bootstrap", reason="abandon", abandon=True, repository=self.repo)
         self.hooks.bootstrap_finished(ok, detail, sha)
 
     # ---- the scheduler ---------------------------------------------------------------
@@ -749,7 +749,7 @@ class Supervisor:
                    for row in self.tracking.fleet()["leases"]):
             return
         try:
-            self.tracking.release(tid, reason="merged" if merged else "abandon", abandon=not merged)
+            self.tracking.release(tid, reason="merged" if merged else "abandon", abandon=not merged, repository=self.repo)
         except Exception as error:
             self.store.log("lease", f"{tid}: cannot release lease: {error}", task=tid)
             self._task_update(tid, status="paused" if not merged else "merged",
@@ -1013,7 +1013,7 @@ class Supervisor:
                    for row in self.tracking.fleet()["leases"])
         if live:
             try:
-                self.tracking.release(tid, reason="merged")
+                self.tracking.release(tid, reason="merged", repository=self.repo)
             except Exception as error:
                 self._handovers[tid] = handover
                 self.store.log("lease", f"{tid}: verified CI cannot release its worktree: {error}", task=tid)
@@ -1227,7 +1227,7 @@ class Supervisor:
                 if head:
                     self.tracking.record_commit(tid, head)
                 try:
-                    self.tracking.release(tid, reason="abandon", abandon=True)
+                    self.tracking.release(tid, reason="abandon", abandon=True, repository=self.repo)
                 except Exception as error:
                     self.store.log("lease", f"{tid}: uncommitted work and lease preserved: {error}", task=tid)
                 self._task_update(tid, status="paused")

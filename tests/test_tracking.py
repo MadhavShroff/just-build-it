@@ -71,7 +71,7 @@ class Lifecycle(Base):
         self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base,
                           service_reply={"ok": True}, green_run="run-1", squash_sha=head, state="green")
         self.tr.record_merge("t1", 7, head, head, "run-1")
-        out = self.tr.release("t1", reason="merged")
+        out = self.tr.release("t1", reason="merged", repository=self.repo)
         self.assertTrue(out["parked_ref"].startswith("jbi-parked/t1-"))
         self.assertEqual(wt.git(path, "rev-parse", "HEAD"), self.base)
         self.assertEqual(wt.git(path, "symbolic-ref", "-q", "HEAD", check=False), "")
@@ -90,7 +90,7 @@ class Lifecycle(Base):
             self.dispatch()
         self.assertIn("live lease", str(cm.exception))
         self.commit_in(path)
-        self.tr.release("t1", reason="abandon", abandon=True)
+        self.tr.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.assertEqual(self.tr.fleet()["tasks"][0]["state"], "abandoned")
 
     def test_restart_keeps_state(self):
@@ -186,7 +186,7 @@ class Guards(Base):
         self.commit_in(path)
         (path / "f.txt").write_text("edited\n")
         with self.assertRaises(LeaseError) as cm:
-            self.tr.release("t1", reason="abandon", abandon=True)
+            self.tr.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.assertIn("dirty", str(cm.exception))
         self.assertEqual(self.tr.authorize_write("t1", "src/a/x"), "src/a/x")
         self.assertEqual((path / "f.txt").read_text(), "edited\n")
@@ -198,7 +198,7 @@ class Guards(Base):
         self.commit_in(path)
         (path / "new.txt").write_text("x\n")
         with self.assertRaises(LeaseError):
-            self.tr.release("t1", reason="abandon", abandon=True)
+            self.tr.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.assertTrue((path / "new.txt").exists())
         self.assertIsNone(self.tr.fleet()["leases"][0]["released_at"])
 
@@ -208,7 +208,7 @@ class Guards(Base):
         sha = self.commit_in(path)
         wt.git(path, "checkout", "-q", "--detach", sha)
         with self.assertRaises(LeaseError):
-            self.tr.release("t1", reason="abandon", abandon=True)
+            self.tr.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.assertIsNone(self.tr.fleet()["leases"][0]["released_at"])
 
     def test_moved_branch_release_refused(self):
@@ -218,7 +218,7 @@ class Guards(Base):
         (path / "g.txt").write_text("more\n")
         wt.commit_all(path, "unrecorded")
         with self.assertRaises(LeaseError):
-            self.tr.release("t1", reason="abandon", abandon=True)
+            self.tr.release("t1", reason="abandon", abandon=True, repository=self.repo)
         self.assertEqual(wt.current_branch(path), "jbi/t1")
 
     def test_release_needs_reason(self):
@@ -227,7 +227,7 @@ class Guards(Base):
         with self.assertRaises(LeaseError):
             self.tr.release("t1", reason="because")
         with self.assertRaises(LeaseError):
-            self.tr.release("t1", reason="merged")
+            self.tr.release("t1", reason="merged", repository=self.repo)
 
     def test_release_without_lease_refused(self):
         self.make_task()
@@ -315,7 +315,7 @@ class Merge(Base):
             with self.assertRaises(LeaseError, msg=str(args)):
                 self.tr.record_merge("t1", *args)
         with self.assertRaises(LeaseError):
-            self.tr.release("t1", reason="merged")
+            self.tr.release("t1", reason="merged", repository=self.repo)
         self.assertEqual(self.tr.fleet()["merges"], [])
         self.assertNotEqual(self.tr.fleet()["tasks"][0]["state"], "merged")
         self.tr.record_merge("t1", 7, head, head, "run-1")
@@ -435,7 +435,7 @@ class Stages(Base):
         path = self.make_task()
         self.dispatch()
         self.commit_in(path)
-        self.tr.release("t1", reason="abandon", abandon=True)
+        self.tr.release("t1", reason="abandon", abandon=True, repository=self.repo)
         with self.assertRaises(LeaseError):
             self.tr.renew_dispatch("t1")
         wt.git(path, "checkout", "-q", "-b", "jbi/t1")
@@ -532,7 +532,7 @@ class Stages(Base):
         self.tr.record_ci("t1", pr_number=7, head_sha=head, base_commit=self.base,
                           service_reply={"ok": 1}, green_run="run-1", state="green")
         self.tr.record_merge("t1", 7, head, "c" * 40, "run-1")
-        self.tr.release("t1", reason="merged")
+        self.tr.release("t1", reason="merged", repository=self.repo)
         self.assertEqual(self.tr.fleet()["tasks"][0]["state"], "merged")
 
 

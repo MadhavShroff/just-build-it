@@ -250,14 +250,13 @@ class GitFence(Base):
 
     def test_owned_git_writes_succeed_in_a_linked_worktree(self):
         done = self.shell("printf one > src/owned.txt && git add src/owned.txt && "
-                          "git -c user.name=a -c user.email=b commit -qm one && git status --short")
+                          "git commit -qm one && git status --short")
         self.assertEqual(done.returncode, 0, done.stderr)
         log = subprocess.run(["git", "-C", str(self.repo), "log", "--format=%s", "jbi/t1"],
                              capture_output=True, text=True).stdout.split()
         self.assertEqual(log[0], "one")
 
     def test_second_task_branch_and_hooks_and_config_are_read_only(self):
-        self.assertEqual(self.shell("git -c user.name=a -c user.email=b commit -q --allow-empty -m next").returncode, 0)
         before = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/other"],
                                 capture_output=True, text=True).stdout
         for command in ("git update-ref refs/heads/jbi/other HEAD",
@@ -273,7 +272,7 @@ class GitFence(Base):
 
     def test_plain_repository_still_commits(self):
         done = self.shell("printf one > src/z.txt && git add src/z.txt && "
-                          "git -c user.name=a -c user.email=b commit -qm z", work=self.repo)
+                          "git commit -qm z", work=self.repo)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(subprocess.run(["git", "-C", str(self.repo), "log", "-1", "--format=%s"],
                                         capture_output=True, text=True).stdout.strip(), "z")
@@ -333,13 +332,13 @@ class NeonFenceRegressions(GitFence):
                               owns=("src",), allowed_commits=True,
                               transport=Script(reply(use("add", "bash", command="printf x > src/f && git add src/f")),
                                                reply(text("staged")),
-                                               reply(use("commit", "bash", command="git -c user.name=t -c user.email=t@t commit -qm owned")),
+                                               reply(use("commit", "bash", command="git commit -qm owned")),
                                                reply(text("committed"))))
         base = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/other"],
                               capture_output=True, text=True).stdout
         deadline = harness.clock() + 5
         first = harness._t_bash({"command": "printf x > src/f && git add src/f"}, deadline)
-        second = harness._t_bash({"command": "git -c user.name=t -c user.email=t@t commit -qm owned"}, deadline)
+        second = harness._t_bash({"command": "git commit -qm owned"}, deadline)
         result = harness._finish(H.HarnessResult())
         self.assertFalse(result.exit_code, first + second + result.final_text)
         self.assertEqual(subprocess.run(["git", "-C", str(self.repo), "rev-parse", "jbi/other"],
@@ -379,6 +378,30 @@ class NeonFenceRegressions(GitFence):
         guard.reconcile()
         self.assertTrue((build / "large.bin").exists())
         self.assertEqual((build / "allowed.txt").read_text(), "new\n")
+
+    def test_fourth_review_drivers_and_settings_are_refused(self):
+        guard = self.guarded()
+        commands = (
+            "git clean -fdx --", "git clean -fd --", "git clean -fdx -- src/a.py",
+            "g=git; env $g checkout jbi/other", "g=git; X=1 $g stash",
+            "eval 'git st''ash'", "git --no-pager -c core.hooksPath=./hooks commit -m x",
+            "git --config-env=core.hooksPath=VAR commit -m x",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.check(command))
+
+    def test_nested_preexisting_ignored_directories_survive_owned_writes(self):
+        build = self.work / "build"
+        (build / "sub").mkdir(parents=True)
+        (build / "sub" / "big.bin").write_bytes(b"content" * 700000)
+        (build / "allowed.txt").write_text("before\n")
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("build/allowed.txt",), lambda p: p == "build/allowed.txt", allow_commits=True)
+        (build / "allowed.txt").write_text("after\n")
+        guard.reconcile()
+        self.assertTrue((build / "sub" / "big.bin").is_file())
+        self.assertEqual((build / "allowed.txt").read_text(), "after\n")
 
     def test_writes_in_a_preexisting_ignored_directory_are_reconciled(self):
         ignored = self.work / "build" / "sub"
@@ -422,7 +445,7 @@ class NeonFenceRegressions(GitFence):
         self.assertFalse(subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "-q",
                                         "jbi/another"], capture_output=True).stdout)
         done = self.shell_owned("printf one > src/new.txt && git add src/new.txt && "
-                                "git -c user.name=a -c user.email=b commit -qm correct")
+                                "git commit -qm correct")
         self.assertEqual(done.returncode, 0, done.stderr)
 
 
@@ -445,11 +468,12 @@ class NeonHostAndSandboxRegression(GitFence):
         from claude_mux_lite.private_git import PrivateGit
         guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)
         private = PrivateGit(guard, self.tmp)
+
         self.addCleanup(private.__exit__)
         with LinuxSandbox(self.work, git_dir=guard.git_dir, common_dir=guard.common_dir,
                           private_git=True, real_common_dir=private.real_common) as fence:
-            for cmd in ("cp src/a.py src/b.py; printf bad > other/b.txt; git add -A; git -c user.name=t -c user.email=t@t commit -qm bad",
-                        "git checkout HEAD^ -- other/b.txt; git -c user.name=t -c user.email=t@t commit -qm good"):
+            for cmd in ("cp src/a.py src/b.py; printf bad > other/b.txt; git add -A; git commit -qm bad",
+                        "git checkout HEAD^ -- other/b.txt; git commit -qm good"):
                 done = subprocess.run(fence.argv(cmd), env=H.fence_env(), capture_output=True, text=True)
                 self.assertEqual(done.returncode, 0, done.stderr)
         with self.assertRaisesRegex(RuntimeError, "one private commit"):
@@ -458,7 +482,7 @@ class NeonHostAndSandboxRegression(GitFence):
     def test_a_failed_test_does_not_invalidate_later_valid_private_commits(self):
         guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)
         result = leased_shell(guard, "false; printf next > src/new.txt && git add src/new.txt && "
-                             "git -c user.name=a -c user.email=b commit -qm correct")
+                             "git commit -qm correct")
         self.assertIn("correct", subprocess.run(["git", "-C", str(self.repo), "log", "-1", "--format=%s", "jbi/t1"],
                                                capture_output=True, text=True).stdout)
         self.assertEqual(result.returncode, 0)
@@ -468,7 +492,7 @@ class NeonHostAndSandboxRegression(GitFence):
                               owns=("src",), allowed_commits=True, transport=Script(reply(use("b", "bash", command="true"))))
         (self.work / "src" / "b.py").write_text("uncommitted\n")
         deadline = harness.clock() + 5
-        command = "printf good > src/a.py && git add src/a.py && git -c user.name=a -c user.email=b commit -qm owned"
+        command = "printf good > src/a.py && git add src/a.py && git commit -qm owned"
         harness._t_bash({"command": command}, deadline)
         result = harness._finish(H.HarnessResult())
         self.assertEqual(result.exit_code, 0, result.final_text)
@@ -476,7 +500,7 @@ class NeonHostAndSandboxRegression(GitFence):
 
     def test_a_valid_delete_commit_leaves_real_index_and_tree_in_sync(self):
         from claude_mux_lite.private_git import PrivateGit
-        command = "git rm src/a.py && git -c user.name=a -c user.email=b commit -qm delete"
+        command = "git rm src/a.py && git commit -qm delete"
         done = self.shell(command)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(subprocess.run(["git", "-C", str(self.work), "status", "--porcelain"],
@@ -485,7 +509,7 @@ class NeonHostAndSandboxRegression(GitFence):
 
     def test_a_valid_in_worktree_symlink_commit_leaves_no_staged_change(self):
         done = self.shell("ln -s a.py src/link.py && ln -s src/a.py src/other.py && "
-                          "git add src/link.py src/other.py && git -c user.name=a -c user.email=b commit -qm symlinks")
+                          "git add src/link.py src/other.py && git commit -qm symlinks")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(subprocess.run(["git", "-C", str(self.work), "status", "--porcelain"],
                                        capture_output=True, text=True).stdout, "")
@@ -495,13 +519,12 @@ class NeonHostAndSandboxRegression(GitFence):
         from claude_mux_lite.sandbox import LinuxSandbox
         guard = BashGuard(self.repo, ("src",), lambda p: p.startswith("src"), allow_commits=True)
         guard = BashGuard(self.repo, ("src",), lambda p: p.startswith("src"), allow_commits=True)
-        base_other = (self.repo / "other" / "b.txt").read_text()
         private = PrivateGit(guard, self.tmp)
         self.addCleanup(private.__exit__)
         env = {"GIT_DIR": str(private.git_dir), "GIT_WORK_TREE": str(self.repo), "GIT_COMMON_DIR": str(private.common_dir)}
         with LinuxSandbox(self.repo, git_dir=private.git_dir, common_dir=private.common_dir,
                           scratch=self.tmp / "command", private_git=True, real_common_dir=private.real_common) as fence:
-            command = "printf hidden > other/b.txt && git add other/b.txt && git -c user.name=t -c user.email=t@t commit -qm hidden"
+            command = "printf hidden > other/b.txt && git add other/b.txt && git commit -qm hidden"
             subprocess.run(fence.argv(command), env=env, capture_output=True, check=True)
         tree = subprocess.check_output(["git", "--git-dir", str(private.git_dir), "rev-parse",
                                         private.before + "^{tree}"]).strip().decode()

@@ -472,7 +472,7 @@ def _run_task(task: dict[str, Any], *, pool: WindowPool, repo: Path, run_dir: Pa
     def abort(failed_attempts: int, findings: list[str], *, reason: str = "") -> None:
         note = ""
         try:
-            tracking.release(tid, reason="abandon", abandon=True)
+            tracking.release(tid, reason="abandon", abandon=True, repository=repo)
             pool.mark_free(window)
         except LeaseError as error:
             note = f" Release refused, the lease stays live: {error}"
@@ -604,7 +604,7 @@ def _run_task(task: dict[str, Any], *, pool: WindowPool, repo: Path, run_dir: Pa
 
         merge_sha = evidence["squash_sha"]
         try:
-            tracking.release(tid, reason="merged")
+            tracking.release(tid, reason="merged", repository=repo)
         except LeaseError as error:
             raise CeremonyError(
                 f"Task {tid} merged at {merge_sha[:12]} but release refused, the lease stays live: {error}"
