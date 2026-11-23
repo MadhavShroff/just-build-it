@@ -546,7 +546,9 @@ class Supervisor:
         self._task_lease("bootstrap", self.repo)
         if wt.git(self.repo, "symbolic-ref", "-q", "--short", "HEAD", check=False) != "jbi/bootstrap":
             if wt.head(self.repo, "jbi/bootstrap") is None:
-                wt.git(self.repo, "checkout", "-q", "-b", "jbi/bootstrap")
+                # Cut jbi/bootstrap at the named base, never at HEAD: the lease
+                # records base_branch as the base the bootstrap work sits on.
+                wt.git(self.repo, "checkout", "-q", "-b", "jbi/bootstrap", self.base_branch)
             else:
                 wt.git(self.repo, "checkout", "-q", "jbi/bootstrap")
         brief, receipt = briefs.write(self.run_dir, task=task, role="bootstrap", stage="bootstrap", attempt=0)

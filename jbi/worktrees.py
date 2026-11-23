@@ -149,8 +149,11 @@ def head(repo: Path, ref: str = MAIN) -> str | None:
 
 
 def missing_branch(repo: Path, name: str) -> bool:
-    """True when `name` names no branch: no ref points at it and it is not the unborn checkout."""
-    if head(repo, name) is not None:
+    """True when `name` names no branch under `refs/heads`.
+
+    A tag, a short SHA, or HEAD is not a branch: `fast_forward_main` advances
+    `refs/heads/<name>`, so only a real branch counts."""
+    if git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{name}", check=False):
         return False
     return name != git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False)
 

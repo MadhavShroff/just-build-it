@@ -83,6 +83,17 @@ class BranchFlagCli(unittest.TestCase):
             self.assertIn("fast_forward_main needs a branch to advance", str(caught.exception))
             self.assertIn("branch_refused", str(caught.exception))
 
+    def test_a_commit_sha_as_base_refuses_and_names_the_flag(self):
+        """A SHA in --base with --branch omitted is the landing branch and must refuse too."""
+        sha = wt.head(self.repo, "main")
+        for name in (sha, sha + sha[:24]):          # 40-hex and 64-hex
+            with self.assertRaises(SystemExit) as caught:
+                cli.apply_branch_flags(self.store, self.repo, name, None)
+            self.assertIn("branch_refused", str(caught.exception))
+            self.assertIn("--base must name a branch", str(caught.exception))
+        self.assertIsNone(self.store.read("/bootstrap/base_branch"),
+                          "a refused --base was stored anyway")
+
     def test_a_missing_branch_is_created_from_the_base_and_logged(self):
         cli.apply_branch_flags(self.store, self.repo, "main", "new-landing")
         self.assertEqual(wt.head(self.repo, "new-landing"), wt.head(self.repo, "main"))
@@ -95,6 +106,30 @@ class BranchFlagCli(unittest.TestCase):
         cli.apply_branch_flags(self.store, self.repo, "develop", "")
         self.assertEqual(self.store.read("/bootstrap/base_branch"), "develop")
         self.assertEqual(self.store.read("/bootstrap/branch"), "develop")
+
+    def test_a_branch_that_resolves_only_to_a_non_branch_ref_refuses(self):
+        """A tag, a short SHA, or HEAD is not a branch: fast_forward_main cannot advance it."""
+        sha = wt.head(self.repo, "main")
+        wt.git(self.repo, "tag", "v1.0")
+        for name in ("v1.0", sha[:8], "HEAD"):
+            with self.assertRaises(SystemExit) as caught:
+                cli.apply_branch_flags(self.store, self.repo, "main", name)
+            self.assertIn("branch_refused", str(caught.exception), name)
+            self.assertIn("--branch", str(caught.exception), name)
+            self.assertIn("fast_forward_main needs a branch", str(caught.exception), name)
+            self.assertIsNone(wt.head(self.repo, f"refs/heads/{name}"),
+                              f"{name} silently became a branch")
+
+    def test_a_dry_run_refuses_a_missing_branch_and_creates_nothing(self):
+        """--dry-run never touches the repository: a missing --branch refuses instead."""
+        with self.assertRaises(SystemExit) as caught:
+            cli.apply_branch_flags(self.store, self.repo, "main", "dry-landing", dry_run=True)
+        self.assertIn("branch_missing", str(caught.exception))
+        self.assertIsNone(wt.head(self.repo, "dry-landing"), "the dry run created the branch")
+        self.assertIsNone(self.store.read("/bootstrap/branch"), "the refused branch was stored anyway")
+        # An existing landing branch still validates and stores under --dry-run.
+        cli.apply_branch_flags(self.store, self.repo, "main", "", dry_run=True)
+        self.assertEqual(self.store.read("/bootstrap/branch"), "main")
 
     def test_the_stored_choice_survives_bootstrap_on_another_branch(self):
         """HAZARD 1: bootstrap runs on the repo's own branch but must not overwrite the flag."""
@@ -121,6 +156,46 @@ class BranchFlagCli(unittest.TestCase):
                          "bootstrap replaced the named base with the repository's own branch")
         self.assertEqual(store.read("/bootstrap/branch"), "develop")
         self.assertEqual((sup.base_branch, sup.branch), ("develop", "develop"))
+
+    def test_bootstrap_cuts_jbi_bootstrap_from_the_named_base(self):
+        """HAZARD: `checkout -b jbi/bootstrap` with no start point cuts from HEAD.
+
+        The lease records base_branch as the base, so jbi/bootstrap must start at
+        base_branch, not at the branch the repository happens to sit on. The release
+        parks the finished work under refs/heads/jbi-parked/bootstrap-*, and that
+        parked ref keeps the proof ancestry."""
+        wt.git(self.repo, "branch", "develop")
+        wt.git(self.repo, "checkout", "-q", "develop")
+        (self.repo / "DEVELOP").write_text("develop\n")
+        wt.commit_all(self.repo, "give develop its own commit")
+        wt.git(self.repo, "checkout", "-q", "main")
+        develop_head = wt.head(self.repo, "develop")
+        self.assertNotEqual(develop_head, wt.head(self.repo, "main"),
+                            "the fixture must give develop its own commit")
+        run_dir = self.tmp / f"run-{uuid.uuid4().hex[:6]}"
+        run_dir.mkdir()
+        state = protocol.initial_state("t-x", "now", name="t", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["accounts"] = {"simulator": {"label": "Simulator", "enabled": True, "status": "ok"}}
+        store = Store(run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        cli.apply_branch_flags(store, self.repo, "develop", "")
+        from tests.test_runtime import Hooks
+        hooks = Hooks()
+        sup = Supervisor(store, hooks, run_dir, self.repo, use_tmux=False)
+        self.addCleanup(lambda: (sup.stop("kill"), hooks.stopped_event.wait(20)))
+        self.addCleanup(sup.tracking.close)
+        sup._bootstrap_safe()
+        self.assertEqual(store.read("/bootstrap/base_branch"), "develop")
+        parked = [ref for ref
+                  in wt.git(self.repo, "for-each-ref", "--format=%(refname)",
+                            "refs/heads/jbi-parked/").splitlines()
+                  if ref.removeprefix("refs/heads/jbi-parked/").startswith("bootstrap-")]
+        self.assertEqual(len(parked), 1, f"expected one parked bootstrap ref, got {parked}")
+        self.assertEqual(wt.git(self.repo, "rev-parse", f"{parked[0]}^"), develop_head,
+                         "bootstrap cut jbi/bootstrap from the repository's own branch, not develop")
+        self.assertEqual(sup.tracking.get_task("bootstrap")["base_commit"], develop_head,
+                         "the lease base is not develop's head")
 
     def test_bootstrap_refuses_a_missing_named_base_before_any_agent(self):
         from tests.test_runtime import Hooks
@@ -179,24 +254,8 @@ class BranchFlagRun(unittest.TestCase):
         self.assertIn("fast_forward_main needs a branch to advance", done.stderr)
 
     def test_the_run_creates_a_missing_branch_and_logs_it(self):
-        registry = self.tmp / "reg.json"
-        proc = subprocess.Popen(self.base_argv() + ["--base", "main", "--branch", "new-landing"],
-                                env=self.env, cwd=ROOT, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, text=True)
-        self.addCleanup(proc.kill)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not registry.exists():
-            time.sleep(0.1)
-        self.assertTrue(registry.exists(), "the run did not come up")
-        proc.terminate()
-        try:
-            proc.wait(20)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        store = self.start_run(["--base", "main", "--branch", "new-landing"])
         self.assertEqual(wt.head(self.repo, "new-landing"), wt.head(self.repo, "main"))
-        run_db = sorted(self.home.glob("runs/*/run.db"))[-1]
-        store = Store(run_db)
-        self.addCleanup(store.close)
         self.assertIn("created branch new-landing from base main", timeline_text(store))
         self.assertEqual(store.read("/bootstrap/base_branch"), "main")
         self.assertEqual(store.read("/bootstrap/branch"), "new-landing")
@@ -208,6 +267,69 @@ class BranchFlagRun(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, cwd=ROOT, timeout=60)
         self.assertNotEqual(done.returncode, 0, "a morph cascade model must exit non-zero")
         self.assertIn("morph_refused", done.stderr)
+
+    def test_a_dag_named_repo_still_refuses_a_missing_base(self):
+        """A DAG that sets "repo" is the effective repo: --base validates against it."""
+        dag = self.tmp / "dag-repo.json"
+        dag.write_text(json.dumps({"repo": str(self.repo), "tasks": [
+            {"id": "a", "title": "A", "goal": "build a", "owns": ["src/a.txt"],
+             "acceptance": "true"}]}))
+        argv = [sys.executable, "-m", "jbi", "--dag", str(dag), "--offline", "--no-tailscale",
+                "--no-menu", "--base", "ghost", "--start", "--registry", str(self.tmp / "reg.json")]
+        done = subprocess.run(argv, env=self.env, capture_output=True, text=True,
+                              cwd=ROOT, timeout=60)
+        self.assertNotEqual(done.returncode, 0, "a missing base must exit non-zero")
+        self.assertIn("base_missing", done.stderr)
+        self.assertEqual(list(self.home.glob("runs/*/worktrees")), [],
+                         "the refusal left task worktrees behind")
+
+    def test_a_dry_run_refuses_a_missing_branch_at_the_cli(self):
+        done = subprocess.run(self.base_argv() + ["--dry-run", "--base", "main",
+                                                  "--branch", "dry-landing", "--start"],
+                              env=self.env, capture_output=True, text=True, cwd=ROOT, timeout=60)
+        self.assertNotEqual(done.returncode, 0, "a dry run must not create a landing branch")
+        self.assertIn("branch_missing", done.stderr)
+        self.assertIsNone(wt.head(self.repo, "dry-landing"),
+                          "the dry run created the branch in the repository")
+
+    def start_run(self, extra: list[str], offline: bool = True) -> Store:
+        """Start one run, wait for its registry, stop it, and return its store."""
+        argv = [sys.executable, "-m", "jbi", "--repo", str(self.repo), "--dag", str(self.dag),
+                "--no-tailscale", "--no-menu", "--registry", str(self.tmp / "reg.json")]
+        if offline:
+            argv.append("--offline")
+        registry = self.tmp / "reg.json"
+        proc = subprocess.Popen(argv + extra, env=self.env, cwd=ROOT,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not registry.exists():
+            time.sleep(0.1)
+        self.assertTrue(registry.exists(), "the run did not come up")
+        proc.terminate()
+        try:
+            proc.wait(20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        run_db = sorted(self.home.glob("runs/*/run.db"))[-1]
+        store = Store(run_db)
+        self.addCleanup(store.close)
+        return store
+
+    def test_a_json_cascade_enables_its_named_providers(self):
+        """A JSON cascade seeds every provider it names, or select silently falls back."""
+        store = self.start_run(["--cascade", '[{"provider": "claude", "model": "claude-opus-5-5"}]'],
+                               offline=False)
+        self.assertTrue(store.read("/accounts/claude/enabled"),
+                        "the JSON cascade left its provider disabled")
+        self.assertTrue(store.read("/accounts/agy/enabled"), "the default provider stayed disabled")
+        self.assertFalse(store.read("/accounts/codex/enabled"),
+                         "an unrelated provider got enabled")
+
+    def test_the_founder_cascade_enables_claude_and_agy(self):
+        store = self.start_run(["--cascade", "founder"], offline=False)
+        self.assertTrue(store.read("/accounts/claude/enabled"))
+        self.assertTrue(store.read("/accounts/agy/enabled"))
 
 
 class BranchSplitRun(RunFixture):
@@ -333,6 +455,34 @@ class CascadeFlag(unittest.TestCase):
         self.assertIn("401", str(caught.exception))
         self.assertIsNone(self.store.read("/config/provider_cascade"),
                           "a refused cascade was stored anyway")
+
+    def test_a_morph_refuses_in_any_case_and_on_the_provider(self):
+        """The guard casefolds: Morph in a model or in a provider name refuses too."""
+        for entry in ({"provider": "openai-compatible", "model": "Anthropic-Morph-dsv41"},
+                      {"provider": "MORPH", "model": "dsv41"},
+                      {"provider": "morph-labs", "model": "dsv41"}):
+            with self.assertRaises(SystemExit) as caught:
+                cli.install_cascade(self.store, json.dumps([entry]))
+            self.assertIn("morph_refused", str(caught.exception), entry)
+            self.assertIn("401", str(caught.exception), entry)
+        self.assertIsNone(self.store.read("/config/provider_cascade"),
+                          "a refused cascade was stored anyway")
+
+    def test_a_non_morph_mixed_case_entry_still_installs(self):
+        cli.install_cascade(self.store, '[{"provider": "Claude", "model": "Claude-Opus-5-5"}]')
+        self.assertEqual(self.store.read("/config/provider_cascade"),
+                         [{"provider": "Claude", "model": "Claude-Opus-5-5"}])
+
+    def test_cascade_providers_names_every_distinct_provider(self):
+        self.assertEqual(cli.cascade_providers("founder"), {"claude", "agy"})
+        self.assertEqual(cli.cascade_providers(
+            '[{"provider": "claude", "model": "a"}, {"provider": "claude", "model": "b"},'
+            ' {"provider": "agy", "model": "c"}]'), {"claude", "agy"})
+        self.assertEqual(cli.cascade_providers('[{"provider": "agy"}]'), {"agy"})
+        self.assertEqual(cli.cascade_providers(None), set())
+        self.assertEqual(cli.cascade_providers(""), set())
+        self.assertEqual(cli.cascade_providers("{oops"), set(),
+                         "invalid JSON names nothing; install_cascade refuses it")
 
     def test_bad_cascade_json_refuses_at_start(self):
         for bad in ("{oops", "[]", "not json", '[{"model": "m"}]'):
