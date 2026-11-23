@@ -8,17 +8,20 @@ call `select`, so they always agree on which model a stage uses.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterable
 
-from . import cascade, rigor
+from . import rigor
 
 CATALOG_PATH = Path(__file__).parent / "data" / "models.json"
 # The providers a stage can actually dispatch on: agents.command builds an argument
 # list only for these. A provider that can name a model but start no agent is never a
 # routing target, however healthy its account probe reads.
-AGENT_PROVIDERS = ("agy", "claude", "codex", "simulator")
+AGENT_PROVIDERS = ("agy", "claude", "codex", "openai-compatible")
 # The order in which enabled providers are tried. The simulator is always last.
 # agy is FIRST: founder order 2026-11-17 puts the DAG execution nodes on agy, and
 # founder order 2026-11-13 puts no Claude model in any subagent. Claude is kept on
@@ -31,6 +34,78 @@ class Choice:
     provider: str
     model: str
     tier: str
+
+
+class ProviderCooldowns:
+    """Thread-safe per-provider rate-limit cooldown tracker (provider retry helper)."""
+
+    def __init__(self, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._until: dict[str, float] = {}
+
+    def mark(self, provider: str, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._until[provider] = max(self._until.get(provider, 0.0), self._clock() + seconds)
+
+    def cooling(self, provider: str) -> bool:
+        with self._lock:
+            until = self._until.get(provider, 0.0)
+            if until <= self._clock():
+                self._until.pop(provider, None)
+                return False
+            return True
+
+    def remaining(self, provider: str) -> float:
+        with self._lock:
+            return max(0.0, self._until.get(provider, 0.0) - self._clock())
+
+
+class ProviderPool:
+    """Weighted multi-provider round-robin pool (provider retry helper).
+
+    Entries are `(provider, model_or_none)` tuples. Repeating an entry creates a weighted
+    ratio (for example, 2:1 agy:claude). Rate-limited providers are skipped while cooling.
+    """
+
+    def __init__(self, entries: Iterable[tuple[str, str | None]] = ()) -> None:
+        self._entries = [(str(p), str(m) if m else None) for p, m in entries if p]
+        self._lock = threading.Lock()
+        self._cursor = 0
+
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
+    def next(self, usable_providers: Iterable[str], tier: str, *,
+             cooldowns: ProviderCooldowns | None = None) -> Choice | None:
+        allowed = set(usable_providers)
+        if not self._entries or not allowed:
+            return None
+        with self._lock:
+            n = len(self._entries)
+            for offset in range(n):
+                idx = (self._cursor + offset) % n
+                provider, model = self._entries[idx]
+                if provider not in allowed:
+                    continue
+                if cooldowns is not None and cooldowns.cooling(provider):
+                    continue
+                self._cursor = (idx + 1) % n
+                resolved = model or catalog()["providers"][provider]["models"][tier]
+                return _choice(provider, resolved, tier)
+            # Every pooled provider is cooling: fall back to the least-cooled usable one.
+            usable_entries = [(i, p, m) for i, (p, m) in enumerate(self._entries) if p in allowed]
+            if not usable_entries:
+                return None
+            idx, provider, model = min(
+                usable_entries,
+                key=lambda item: cooldowns.remaining(item[1]) if cooldowns else 0.0,
+            )
+            self._cursor = (idx + 1) % n
+            resolved = model or catalog()["providers"][provider]["models"][tier]
+            return _choice(provider, resolved, tier)
 
 
 @lru_cache(maxsize=1)
@@ -50,37 +125,33 @@ def _choice(provider: str, model: str, tier: str) -> Choice:
     return Choice(provider, model, tier)
 
 
-def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 0) -> Choice:
+def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 0,
+           pool: ProviderPool | None = None, cooldowns: ProviderCooldowns | None = None) -> Choice:
     """The provider and model for one stage.
 
-    FOUNDER ORDERS, 2026-11-16 and 2026-11-17. The scheduler sets no model of its
-    own: the cascade decides. A task may then choose between three modes, in
-    order of strength:
+    The scheduler picks a model in this order: the task pin, the task preference
+    list, the provider pool, then the enabled account preference.
 
-    prefer   the task names providers in order. The first one the cascade can
-             serve is used; the cascade's own rung is used when none of them can.
-             This is the "top 2 first, else whatever the cascade says" rule.
     pin      the task names ONE provider and model and runs on nothing else. The
              stage does not start until that model is available. `blocked()`
              answers that question for the supervisor.
-    default  no task key: the cascade's rung, exactly as before.
+    prefer   the task names providers in order. The first usable one wins.
+    pool     the weighted provider pool, when one is supplied.
+    default  the first enabled provider in PREFERENCE order.
 
-    A `pin` is a hard rule. It is the founder's, never the scheduler's: a task
-    that pins a model waits rather than runs somewhere else.
+    A `pin` is a hard rule. A task that pins a model waits rather than runs
+    somewhere else.
     """
     profile = state["config"]["profile"]
     override = (task or {}).get("override") or {}
     profile = override.get("profile") or profile
     tier = rigor.tier_for(profile, role, attempts)
 
-    rung = cascade.read()
     up = usable(state)
 
-    # A provider the scheduler cannot dispatch on is not "usable" for this purpose,
-    # whatever the account probe says. The openai-compatible rung names a model that
-    # the local proxy serves; jbi has no agent command for it, so a run routed there
-    # dies on its first stage ("provider 'openai-compatible' has no agent command",
-    # 7 of 7 tasks, 2026-11-17). Filter to providers that agents.command can start.
+    # Only providers supported by the neutral subprocess may dispatch production work.
+    # Provider-configured credentials pass through the process environment, not the
+    # brief, store, or command arguments. A direct provider CLI is not a fallback.
     up = [name for name in up if name in AGENT_PROVIDERS]
 
     # A PIN runs on one model only, and waits for it.
@@ -88,9 +159,16 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     if isinstance(pinned, dict) and pinned.get("provider") and pinned.get("model"):
         return _choice(str(pinned["provider"]), str(pinned["model"]), tier)
 
-    # A PREFERENCE list is tried in order, then the cascade.
+    # A PREFERENCE list is tried in order, then the pool, then the account preference.
     prefer = override.get("prefer")
     if isinstance(prefer, list) and prefer:
+        for want in prefer:
+            if not isinstance(want, dict):
+                continue
+            provider = want.get("provider")
+            if provider and provider in up and (cooldowns is None or not cooldowns.cooling(provider)):
+                model = want.get("model") or catalog()["providers"][provider]["models"][tier]
+                return _choice(str(provider), str(model), tier)
         for want in prefer:
             if not isinstance(want, dict):
                 continue
@@ -98,16 +176,15 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
             if provider and provider in up:
                 model = want.get("model") or catalog()["providers"][provider]["models"][tier]
                 return _choice(str(provider), str(model), tier)
-        # None of the preferred providers is usable. Fall through to the cascade,
-        # which may name one of them and be rejected by the account probe later.
+        # None of the preferred providers is usable. Fall through to the pool or the account preference.
 
-    if rung is not None and rung.provider in AGENT_PROVIDERS:
-        # A stale rung is still the cascade's last word. Using it beats inventing
-        # one, and the staleness is visible in the run record.
-        model = rung.model or catalog()["providers"][rung.provider]["models"][tier]
-        return _choice(rung.provider, model, tier)
+    if pool:
+        pooled = pool.next(up, tier, cooldowns=cooldowns)
+        if pooled is not None:
+            return pooled
 
-    provider = up[0] if up else "simulator"
+    healthy = [p for p in up if cooldowns is None or not cooldowns.cooling(p)]
+    provider = (healthy or up or ["simulator"])[0]
     return _choice(provider, catalog()["providers"][provider]["models"][tier], tier)
 
 

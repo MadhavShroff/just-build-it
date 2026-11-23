@@ -181,12 +181,10 @@ def _worktree_contents_committed(repo: Path, path: Path) -> tuple[bool, str]:
     Returns (ok, why).
     """
     try:
-        out = subprocess.run(
-            ["git", "-C", str(path), "status", "--ignored", "--porcelain", "-uall"],
-            capture_output=True, text=True,
-        )
-    except OSError as error:
-        return False, f"git status unavailable: {error}"
+        git_dir, common = wt.pin_git_metadata(path, repo)
+        out = wt.trusted_git(git_dir, common, path, "status", "--ignored", "--porcelain", "-uall", result=True)
+    except (OSError, wt.GitError) as error:
+        return False, f"commit proof refused: {str(error)[:200]}"
     if out.returncode != 0:
         return False, f"git status failed: {(out.stderr or out.stdout).strip()[:200]}"
     if out.stdout.strip():
@@ -210,11 +208,48 @@ def _worktree_contents_committed(repo: Path, path: Path) -> tuple[bool, str]:
     return True, "clean and committed"
 
 
+def _leased_worktrees(run_dir: Path, root: Path) -> dict[str, tuple[str, str]] | None:
+    """Map real worktree path to (kind, task id) for every leased task.
+
+    Return an empty map when no lease store exists. Return None when the store
+    exists and cannot be read. A lease path counts only when it equals
+    `run_dir/worktrees/<task>`. Any other path is not trusted.
+    """
+    store = Path(run_dir) / "fleet.db"
+    if not store.exists():
+        return {}
+    from .tracking import Tracking  # local import: open the store only when it exists
+    try:
+        tracking = Tracking(store)
+    except Exception:
+        return None
+    try:
+        fleet = tracking.fleet()
+    except Exception:
+        return None
+    finally:
+        tracking.close()
+    leased: dict[str, tuple[str, str]] = {}
+    for lease in fleet.get("leases", []):
+        task_id = str(lease.get("task_id") or "")
+        if not task_id or "/" in task_id or task_id in (".", ".."):
+            continue
+        expected = os.path.realpath(root / task_id)
+        if os.path.realpath(str(lease.get("worktree") or "")) != expected:
+            continue
+        kind = "live" if lease.get("released_at") is None else "parked"
+        if kind == "parked" and leased.get(expected, ("", ""))[0] == "live":
+            continue
+        leased[expected] = (kind, task_id)
+    return leased
+
+
 def reclaim_worktrees(repo: Path | None, run_dir: Path, report: OrphanReport) -> None:
     """Remove task worktrees that are clean against their branch (2.3).
 
     Each orphan lives at `run_dir / "worktrees" / <task>`. Removal calls into
     `wt.remove_worktree`, which uses `git worktree remove` and never `rm -rf`.
+    A tree with a live or released lease is never removed, clean or dirty.
     """
     if repo is None or not (Path(repo) / ".git").exists():
         report.notes.append("no repository to verify against; no worktree removed")
@@ -222,8 +257,20 @@ def reclaim_worktrees(repo: Path | None, run_dir: Path, report: OrphanReport) ->
     root = Path(run_dir) / "worktrees"
     if not root.is_dir():
         return
+    leased = _leased_worktrees(Path(run_dir), root)
+    if leased is None:
+        report.notes.append("lease store unreadable; no worktree removed")
+        for child in sorted(root.iterdir()):
+            if child.is_dir():
+                report.worktrees_kept.append({"path": str(child), "reason": "lease store unreadable"})
+        return
     for child in sorted(root.iterdir()):
         if not child.is_dir():
+            continue
+        lease = leased.get(os.path.realpath(child))
+        if lease is not None:
+            kind, task_id = lease
+            report.worktrees_kept.append({"path": str(child), "reason": f"{kind} lease for task {task_id}"})
             continue
         if not (child / ".git").exists():
             report.worktrees_kept.append({"path": str(child), "reason": "not a git worktree"})

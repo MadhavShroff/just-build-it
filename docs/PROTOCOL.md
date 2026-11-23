@@ -38,6 +38,7 @@ This file is normative. `jbi/protocol.py` implements it. `GET /api/v1/schema` se
 | `GET` | `/api/v1/schema` | Command and event catalog. |
 | `GET` | `/api/v1/metrics` | Deterministic metrics snapshot (tokens, task ledger, merged PRs, CI train, board rows, window pool). No LLM call. |
 | `GET` | `/api/v1/preview` | Deterministic DAG preview (waves, parallel task groups, critical path, per-task and per-wave ETAs, live statuses). No LLM call. |
+| `GET` | `/api/v1/fleet` | Session or bearer token. Returns `{protocol, fleet}`. `fleet` holds `sessions`, `tasks`, `dispatches`, `leases`, `ci_submissions`, `merges`, `messages`, and `costs`, plus the cache totals and `cache_hit_rate`. |
 | `GET` | `/api/v1/health` | Readiness. No authentication. Returns `{protocol, ok, run_id, version}`. `version` is the server's release string. |
 
 ## State read
@@ -117,7 +118,7 @@ POST /api/v1/commands
 
 ### CLI client errors
 
-`just-build-it status`, `links` and `send` print an error object `{"error": {code, message}}` on stderr and exit 1. They use the server codes above, plus `unreachable` when the dashboard does not answer because the run has stopped.
+`just-build-it status`, `links`, `fleet` and `send` print an error object `{"error": {code, message}}` on stderr and exit 1. They use the server codes above, plus `unreachable` when the dashboard does not answer because the run has stopped.
 
 ## Command catalog
 
@@ -140,8 +141,9 @@ POST /api/v1/commands
 | `task.retry` | execute | `task`: id |
 | `task.pause` | execute | `task`: id |
 | `task.resume` | execute | `task`: id |
-| `ci.notice` | execute | optional `task`: id, `pr_number`: int, `head_sha`: string, `verdict`: string, `job_id`: string, `failed_gates`: list, `evidence_url`: string, `first_failure_excerpt`: string, `data`: object |
-| `decision.answer` | any | `decision`: id, `answer`: string |
+| `ci.notice` | execute | all optional: `task`: id, `schema`: string, `job_id`: string, `pr_number`: int, `head_sha`: string, `develop_sha`: string, `verdict`: `red` \| `void` \| `merge-blocked` \| `green` \| `merged`, `failed_gates`: list of strings, `evidence_url`: string, `first_failure_excerpt`: string, `owner_slot`: string, `retry_allowed`: bool, `merge_sha`: string, `data`: object |
+| `request.answer` | any | `request`: id (64 characters or fewer), `answer`: string (4000 characters or fewer) |
+| `message.send` | any | `target`: session id (64 characters or fewer), `text`: string, optional `all_sessions`: bool |
 | `account.set` | any | `provider`: id, `enabled`: bool, optional `api_key`: string |
 | `account.probe` | any | `provider`: id |
 | `architecture.refresh` | configure, execute, complete | — |
@@ -166,8 +168,8 @@ An `api_key` goes to the keychain. The server never echoes the key, never stores
 | `task.override` | A per-task override changed. |
 | `session.status` | An agent session started, changed, or ended. |
 | `lane.status` | A CI lane changed. |
-| `decision.opened` | The run needs an answer from the user. |
-| `decision.answered` | The user answered. |
+| `request.opened` | The run needs an answer from the user. |
+| `request.answered` | The user answered a request. |
 | `architecture.updated` | The architecture graph changed. |
 | `telemetry.sample` | A usage or timing sample was recorded. |
 | `account.status` | A provider account or probe result changed. |
@@ -191,7 +193,7 @@ An `api_key` goes to the keychain. The server never echoes the key, never stores
   "sessions": {"s-core-1": {"task": "core", "role": "implement", "model": "...",
                "window": "core:implement", "status": "running", "started": "..."}},
   "lanes": {"lane-1": {"status": "testing", "task": "core", "base": "abc123", "head": "def456"}},
-  "decisions": {"d-1": {"title": "...", "body": "...", "options": ["..."], "status": "open"}},
+  "requests": {"q-1": {"title": "...", "body": "...", "options": ["..."], "status": "open"}},
   "architecture": {"revision": 2, "nodes": {}, "edges": {}},
   "telemetry": {"tokens_in": 0, "tokens_out": 0, "cost_usd": null, "samples": 0},
   "timeline": [{"seq": 41, "ts": "...", "kind": "task", "text": "core passed acceptance"}]
@@ -202,7 +204,7 @@ An `api_key` goes to the keychain. The server never echoes the key, never stores
 
 `run.busy` is `null` when no model work runs. While the planner works on a model call, `run.busy` is `{label, since}`: `label` names the step for the user, and `since` is the start time. A `run.config` event sets and clears it. A second model command during this time gets `409 conflict`.
 
-A task `status` is one of `blocked`, `ready`, `running`, `verifying`, `queued`, `merging`, `merged`, `failed`, `paused`, `decision`, `skipped`, or `waiting-model`. `skipped` means the user chose to skip the task. A skipped task has no merge commit, and its dependents stay `blocked`. `waiting-model` means the task pins a model that is not available. A waiting task starts no agent and is not failed. The scheduler offers it again on a later pump, and it starts when the pinned provider becomes usable.
+A task `status` `request` means the task waits for an answer to an open request. A task `status` is one of `blocked`, `ready`, `running`, `verifying`, `queued`, `merging`, `merged`, `failed`, `paused`, `request`, `skipped`, or `waiting-model`. `skipped` means the user chose to skip the task. A skipped task has no merge commit, and its dependents stay `blocked`. `waiting-model` means the task pins a model that is not available. A waiting task starts no agent and is not failed. The scheduler offers it again on a later pump, and it starts when the pinned provider becomes usable.
 
 The runtime also writes these task fields:
 
@@ -218,3 +220,15 @@ The runtime also writes these task fields:
 `bootstrap.branch` names the repository branch that tasks merge into. A new repository uses `main`. An existing repository keeps its own current branch.
 
 A timeline line or an event never holds provider output. A failed model call names the provider, the exit code, and a fixed sentence. The run directory keeps the details in `debug.log` (file mode 0600), with token-like strings removed.
+
+## Standalone fleet and messages
+
+`GET /api/v1/fleet` and `just-build-it fleet [--run-dir PATH]` read the internal tracking record. `just-build-it fleet --offline` reads the `fleet.db` file in the run directory without a server.
+
+`message.send` sends one message to one session, or to every session when `all_sessions` is true. `just-build-it send --agent ID --text TEXT` and `just-build-it send --all --text TEXT` post this command. The fleet read shows delivery state. Delivery state does not prove that an agent acted.
+
+The CI transport runs `ci-conductor ready PR --head SHA` directly. A merge counts only after a green run and a verified squash SHA for the same head.
+
+All agent execution uses the neutral `claude-mux-lite` process. A new task starts a fresh history. A correction continues only the history of the same task.
+
+The cache rate is `read / (read + write + uncached_input)`. The rate is null when the denominator is zero.

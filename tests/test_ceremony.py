@@ -1,347 +1,310 @@
-"""Unit tests for task ceremony retry bounds, non-retryable notices, window resets, and CI polling."""
+"""Ceremony lifecycle tests: leased dispatch, direct CIAdapter, retry bounds. No real service."""
 
 from __future__ import annotations
 
 import inspect
 import json
-import sqlite3
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
+from types import SimpleNamespace
 
-from jbi import briefs, ceremony, protocol, waves, worktrees as wt
+from claude_mux_lite.harness import Usage
+from jbi import briefs, ceremony, ci_adapter, protocol, waves, worktrees as wt
 from jbi.ceremony import (
     MAX_ATTEMPTS,
     CeremonyError,
     CeremonyReceipt,
+    TaskLedger,
     WindowPool,
-    poll_ci_notice,
+    parse_agent_receipt,
     run_ceremony,
 )
 from jbi.store import Changes, Store, now
+from jbi.tracking import Tracking
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def _completed(argv: list[str], stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(argv, returncode=returncode, stdout=stdout, stderr="")
+def done(out: str = "", code: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], code, out, "")
 
 
-class CeremonyRetryAndPollingTest(unittest.TestCase):
+class FakeHarnessFactory:
+    """Builds fake leased harnesses. `script` maps a call index to (file writes, final text)."""
+
+    def __init__(self, script, tokens=(10, 5)):
+        self.script, self.tokens, self.calls = script, tokens, []
+
+    def __call__(self, **kwargs):
+        index = len(self.calls)
+        self.calls.append(kwargs)
+        writes, text = self.script(index, kwargs)
+        factory = self
+
+        class Harness:
+            def run(self, brief):
+                for rel, content in writes.items():
+                    kwargs["tracking"].authorize_write(kwargs["task_id"], rel)
+                    path = Path(kwargs["workdir"]) / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
+                factory.calls[index]["brief"] = brief
+                return SimpleNamespace(final_text=text, exit_code=0,
+                                       usage=Usage(factory.tokens[0], factory.tokens[1], 0, 0))
+
+            def take_messages(self):
+                return [{"role": "user", "content": "b"}, {"role": "assistant", "content": text}]
+
+        return Harness()
+
+
+class Fixture(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.run_dir = self.root / "run"
-        self.run_dir.mkdir(parents=True)
+        self.run_dir.mkdir()
         self.repo = self.root / "repo"
-        self.repo.mkdir(parents=True)
+        wt.init_repo(self.repo)
+        (self.repo / "README").write_text("base\n")
+        self.base = wt.commit_all(self.repo, "base")
+        self.calls: list[list[str]] = []
+        self.verdicts: list[str] = []
+        self.pr = 930
+        self.squash = self.base
+        self.tracking = Tracking(self.run_dir / "fleet.db")
+        self.addCleanup(self.tracking.close)
+        self.pool = WindowPool(self.run_dir / "window_pool.json", windows=("work1",))
 
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
+    def head(self, tid: str) -> str:
+        return wt.head(self.repo, f"jbi/{tid}") or ""
 
-    def test_defaults_match_ceremony_signature_and_polling_intervals(self) -> None:
+    def runner(self, argv, cwd):
+        self.calls.append(list(argv))
+        if argv[0] == "ci-conductor":
+            if argv[1] == "ready":
+                self.assertEqual(argv, ["ci-conductor", "ready", str(self.pr), "--head", self.head('D01')])
+                return done(json.dumps({"type": "queued", "job": "J1",
+                                        "text": f"#{self.pr} queued at {self.head('D01')[:9]}"}))
+            verdict = self.verdicts.pop(0) if self.verdicts else "GREEN"
+            head = self.head("D01")
+            lines = [f"prs: #{self.pr}@{head[:9]}", f"verdict {verdict}  failed gates: unit"]
+            if verdict == "GREEN":
+                lines.append(f"merge: #{self.pr}->{self.squash[:9]}; stopped=None")
+            if verdict == "NOMERGE":
+                lines[1] = "verdict GREEN  failed gates: none"
+            return done(json.dumps({"type": "data", "job": "J1", "text": "\n".join(lines)}))
+        if argv[0] == "git" and "rev-parse" in argv:
+            return done(self.squash)
+        if argv[:3] == ["gh", "pr", "list"]:
+            return done("[]")
+        if argv[:3] == ["gh", "pr", "create"]:
+            return done(f"https://example.test/pull/{self.pr}")
+        return done()
+
+    def ci(self) -> ci_adapter.CIAdapter:
+        return ci_adapter.CIAdapter(runner=self.runner)
+
+    def task(self, tid="D01", owns=("src/d01.py",)) -> dict:
+        return {"id": tid, "title": "Core", "goal": "Build core", "deps": [], "acceptance": "true",
+                "owns": list(owns)}
+
+    def pass_text(self, tid="D01") -> str:
+        return f"BRIEF {tid} | uncommitted | PASS\nDID: wrote file"
+
+    def go(self, factory, task=None, **kwargs):
+        return run_ceremony(task or self.task(), pool=self.pool, repo=self.repo, run_dir=self.run_dir,
+                            tracking=self.tracking, runner=self.runner, ci=self.ci(),
+                            harness_factory=factory, **kwargs)
+
+
+class DefaultsTest(unittest.TestCase):
+    def test_defaults_and_public_shapes(self) -> None:
         self.assertEqual(MAX_ATTEMPTS, 8)
+        sig = inspect.signature(run_ceremony)
+        self.assertEqual(sig.parameters["max_attempts"].default, 8)
+        self.assertIsNone(sig.parameters["reset_window_every"].default)
+        self.assertEqual([f for f in ceremony.CeremonyReceipt.__dataclass_fields__],
+                         ["task", "sha", "passed", "findings", "tokens"])
+        self.assertEqual([f for f in ceremony.TaskOutcome.__dataclass_fields__],
+                         ["task", "window", "pr_number", "head_sha", "merge_sha", "attempts", "tokens", "status"])
 
-        ceremony_sig = inspect.signature(run_ceremony)
-        self.assertEqual(ceremony_sig.parameters["max_attempts"].default, 8)
-        self.assertIsNone(ceremony_sig.parameters["reset_window_every"].default)
+    def test_parse_agent_receipt(self) -> None:
+        rec = parse_agent_receipt("BRIEF D01 | abc1234 | FAIL\ntokens: 12\nbad thing", "D01")
+        self.assertEqual((rec.passed, rec.tokens, rec.findings), (False, 12, ["bad thing"]))
+        self.assertIsNone(parse_agent_receipt("BRIEF D02 | abc1234 | PASS", "D01"))
 
-        poll_sig = inspect.signature(poll_ci_notice)
-        self.assertEqual(poll_sig.parameters["poll_interval"].default, 1.0)
-        self.assertEqual(poll_sig.parameters["status_interval"].default, 15.0)
+    def test_source_names_no_obsolete_transport(self) -> None:
+        text = (ROOT / "jbi" / "ceremony.py").read_text().lower()
+        for banned in ("illm", "interface-llm", "mailbox", "sb_messages", "ticket start", "sb send", "board.db"):
+            self.assertNotIn(banned, text)
 
-    def test_exceeding_max_attempts_frees_window_updates_store_and_raises(self) -> None:
-        wt.init_repo(self.repo)
-        (self.repo / "src").mkdir()
-        (self.repo / "src" / "owned.py").write_text("x = 1\n", encoding="utf-8")
-        (self.repo / "src" / "other.py").write_text("y = 1\n", encoding="utf-8")
-        wt.commit_all(self.repo, "initial")
 
-        state = protocol.initial_state(
-            "r-ceremony", now(), name="demo", mode="existing", target=str(self.repo),
-            max_sessions=1, lanes=1, tmux="tmux",
-        )
+class MergeTest(Fixture):
+    def test_green_verified_merge_releases_lease_and_parks_branch(self) -> None:
+        factory = FakeHarnessFactory(lambda i, k: ({"src/d01.py": "x = 1\n"}, self.pass_text()))
+        outcome = self.go(factory)
+        self.assertEqual((outcome.task, outcome.window, outcome.pr_number, outcome.attempts, outcome.status),
+                         ("D01", "work1", 930, 1, "done"))
+        self.assertEqual((outcome.tokens, outcome.merge_sha), (15, self.squash))
+        fleet = self.tracking.fleet()
+        self.assertEqual(fleet["tasks"][0]["state"], "merged")
+        self.assertEqual(len(fleet["merges"]), 1)
+        self.assertIsNotNone(fleet["leases"][0]["released_at"])
+        self.assertEqual(len(fleet["dispatches"]), 1)
+        self.assertEqual(fleet["dispatches"][0]["continuation"], 0)
+        self.assertEqual(fleet["costs"][0]["input_tokens"], 10)
+        self.assertTrue(wt.git(self.repo, "branch", "--list", "jbi-parked/D01-*"))
+        self.assertEqual(self.pool.get("work1")["status"], "free")
+        self.assertEqual(TaskLedger(self.run_dir / "task_ledger.jsonl").entries()[0]["merge_sha"], self.squash)
+        self.assertEqual(self.tracking.session_history("work1-D01")[1]["role"], "assistant")
+        for argv in self.calls:
+            self.assertIn(argv[0], ("git", "gh", "ci-conductor"))
+        self.assertEqual(factory.calls[0]["owns"], ("src/d01.py",))
+        self.assertIs(factory.calls[0]["tracking"], self.tracking)
+
+    def test_ci_failure_starts_fresh_same_task_correction_dispatch(self) -> None:
+        self.verdicts = ["RED", "GREEN"]
+        factory = FakeHarnessFactory(
+            lambda i, k: ({"src/d01.py": f"x = {i}\n"}, self.pass_text()))
+        outcome = self.go(factory)
+        self.assertEqual((outcome.attempts, outcome.tokens), (2, 30))
+        fleet = self.tracking.fleet()
+        self.assertEqual([d["attempt"] for d in fleet["dispatches"]], [1, 2])
+        self.assertEqual([d["continuation"] for d in fleet["dispatches"]], [0, 1])
+        self.assertEqual(len(fleet["leases"]), 1)
+        self.assertEqual(fleet["tasks"][0]["state"], "merged")
+        self.assertIn("CI did not confirm", factory.calls[1]["brief"])
+        self.assertEqual(factory.calls[1]["session"][0]["role"], "user")
+        self.assertEqual(self.tracking.fleet()["ci_submissions"][-1]["state"], "green")
+
+    def test_reset_window_every_keeps_same_task_history(self) -> None:
+        self.verdicts = ["RED", "GREEN"]
+        factory = FakeHarnessFactory(lambda i, k: ({"src/d01.py": f"x = {i}\n"}, self.pass_text()))
+        self.go(factory, max_attempts=4, reset_window_every=1)
+        self.assertEqual(factory.calls[1]["session"][0]["role"], "user")
+        self.assertEqual([d["continuation"] for d in self.tracking.fleet()["dispatches"]], [0, 1])
+
+    def test_agent_fail_receipt_retries_with_findings(self) -> None:
+        def script(i, kwargs):
+            if i == 0:
+                return {}, "BRIEF D01 | uncommitted | FAIL\ncompile error"
+            return {"src/d01.py": "ok\n"}, self.pass_text()
+        factory = FakeHarnessFactory(script)
+        outcome = self.go(factory)
+        self.assertEqual(outcome.attempts, 2)
+        self.assertIn("compile error", factory.calls[1]["brief"])
+
+
+class NoMergeEvidenceTest(Fixture):
+    def test_green_without_merge_record_is_never_marked_merged(self) -> None:
+        self.verdicts = ["NOMERGE"] * 3
+        factory = FakeHarnessFactory(lambda i, k: ({"src/d01.py": f"x = {i}\n"}, self.pass_text()))
+        with self.assertRaises(CeremonyError) as caught:
+            self.go(factory, max_attempts=2)
+        self.assertIn("failed after 2 attempts", str(caught.exception))
+        self.assertIn("no merge record", str(caught.exception))
+        fleet = self.tracking.fleet()
+        self.assertEqual(fleet["merges"], [])
+        self.assertNotEqual(fleet["tasks"][0]["state"], "merged")
+
+    def test_unresolvable_squash_commit_is_refused(self) -> None:
+        def runner(argv, cwd):
+            if argv[0] == "git" and "rev-parse" in argv:
+                return done("not-a-sha")
+            return self.runner(argv, cwd)
+        factory = FakeHarnessFactory(lambda i, k: ({"src/d01.py": f"x = {i}\n"}, self.pass_text()))
+        with self.assertRaises(CeremonyError):
+            run_ceremony(self.task(), pool=self.pool, repo=self.repo, run_dir=self.run_dir,
+                         tracking=self.tracking, ci=ci_adapter.CIAdapter(runner=runner),
+                         harness_factory=factory, max_attempts=1)
+        self.assertEqual(self.tracking.fleet()["merges"], [])
+
+
+class RetryBoundTest(Fixture):
+    def test_exceeding_max_attempts_abandons_clean_lease_frees_window_and_updates_store(self) -> None:
+        state = protocol.initial_state("r-cer", now(), name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="tmux")
         store = Store(self.run_dir / "run.db", state)
         self.addCleanup(store.close)
-        task = {
-            "id": "D02",
-            "title": "Owned module",
-            "goal": "Update owned module",
-            "deps": [],
-            "acceptance": "true",
-            "owns": ["src/owned.py"],
-        }
+        task = self.task()
         store.commit("plan.updated", Changes().replace("plan", waves.compile_plan([task], 1)))
+        factory = FakeHarnessFactory(lambda i, k: ({}, "BRIEF D01 | uncommitted | FAIL\ncompile error"))
+        with self.assertRaises(CeremonyError) as caught:
+            self.go(factory, task=task, store=store, max_attempts=3)
+        self.assertIn("D01", str(caught.exception))
+        self.assertIn("failed after 3 attempts", str(caught.exception))
+        self.assertIn("compile error", str(caught.exception))
+        self.assertEqual(len(factory.calls), 3)
+        self.assertEqual(self.pool.get("work1")["status"], "free")
+        self.assertEqual(store.read("/plan/tasks/D01/status"), "failed")
+        self.assertEqual(store.read("/plan/tasks/D01/attempts"), 3)
+        self.assertIsNone(store.read("/plan/tasks/D01/window"))
+        fleet = self.tracking.fleet()
+        self.assertEqual(fleet["tasks"][0]["state"], "abandoned")
+        self.assertEqual(len(fleet["dispatches"]), 3)
+        self.assertTrue(wt.git(self.repo, "branch", "--list", "jbi-parked/D01-*"))
 
-        pool = WindowPool(self.run_dir / "window_pool.json", windows=("work2",))
-        dispatched: list[list[str]] = []
+    def test_dirty_abandon_refusal_leaves_lease_live_and_window_busy(self) -> None:
+        factory = FakeHarnessFactory(
+            lambda i, k: ({"src/d01.py": f"x = {i}\n"}, "BRIEF D01 | uncommitted | FAIL\nbad"))
+        with self.assertRaises(CeremonyError) as caught:
+            self.go(factory, max_attempts=1)
+        self.assertIn("lease stays live", str(caught.exception))
+        fleet = self.tracking.fleet()
+        self.assertIsNone(fleet["leases"][0]["released_at"])
+        self.assertEqual(self.pool.get("work1")["status"], "busy")
 
-        def runner(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-            if argv[:1] in (["ticket"], ["sb"]):
-                dispatched.append(list(argv[:3]))
-                return _completed(argv)
-            if argv[:3] == ["gh", "pr", "list"]:
-                return _completed(argv, stdout=json.dumps([{"number": 42}]))
-            if argv[:3] == ["illm", "--json", "ci"]:
-                return _completed(argv, stdout=json.dumps({"queued": True}))
-            return _completed(argv)
+    def test_unowned_change_is_discarded_and_corrected(self) -> None:
+        def script(i, kwargs):
+            if i == 0:
+                (Path(kwargs["workdir"]) / "stray.txt").write_text("x")
+                return {"src/d01.py": "a\n"}, self.pass_text()
+            return {"src/d01.py": "b\n"}, self.pass_text()
+        factory = FakeHarnessFactory(script)
+        outcome = self.go(factory)
+        self.assertEqual(outcome.attempts, 2)
+        self.assertIn("modified unowned path stray.txt", factory.calls[1]["brief"])
 
-        def wait_receipt(window: str, tid: str, attempt: int, receipt_file: Path) -> CeremonyReceipt:
-            worktree = self.run_dir / "worktrees" / tid
-            if attempt == 0:
-                (worktree / "src" / "other.py").write_text("y = 2\n", encoding="utf-8")
-                return CeremonyReceipt(task=tid, sha="uncommitted", passed=True)
-            if attempt == 1:
-                return CeremonyReceipt(task=tid, sha="uncommitted", passed=False, findings=["compile error"])
-            (worktree / "src" / "owned.py").write_text(f"x = {attempt + 2}\n", encoding="utf-8")
-            return CeremonyReceipt(task=tid, sha="uncommitted", passed=True)
+    def test_invalid_limits_and_missing_owns_are_refused(self) -> None:
+        factory = FakeHarnessFactory(lambda i, k: ({}, ""))
+        with self.assertRaisesRegex(CeremonyError, "max_attempts"):
+            self.go(factory, max_attempts=0)
+        with self.assertRaisesRegex(CeremonyError, "reset_window_every"):
+            self.go(factory, reset_window_every=0)
+        with self.assertRaisesRegex(CeremonyError, "owns"):
+            self.go(factory, task=self.task(owns=()))
 
-        def wait_ci_notice(tid: str, pr_number: int, head_sha: str, attempt: int) -> dict[str, object]:
-            return {
-                "verdict": "red",
-                "retry_allowed": True,
-                "failed_gates": ["unit"],
-                "first_failure_excerpt": "assertion failed",
-            }
+    def test_agent_error_exit_is_a_failed_attempt(self) -> None:
+        class Failing:
+            def __init__(self, **kw):
+                pass
+
+            def run(self, brief):
+                return SimpleNamespace(final_text="ERROR: endpoint down", exit_code=1, usage=Usage())
 
         with self.assertRaises(CeremonyError) as caught:
-            run_ceremony(
-                task,
-                pool=pool,
-                repo=self.repo,
-                run_dir=self.run_dir,
-                store=store,
-                runner=runner,
-                wait_receipt=wait_receipt,
-                wait_ci_notice=wait_ci_notice,
-                max_attempts=4,
-            )
+            self.go(Failing, max_attempts=1)
+        self.assertIn("agent exit 1: ERROR: endpoint down", str(caught.exception))
+        self.assertEqual(self.tracking.fleet()["dispatches"][0]["verdict"], "error")
 
-        self.assertIn("D02", str(caught.exception))
-        self.assertIn("4", str(caught.exception))
-        self.assertEqual(pool.snapshot()["windows"]["work2"]["status"], "free")
-        self.assertEqual(store.read("/plan/tasks/D02/status"), "failed")
-        self.assertEqual(store.read("/plan/tasks/D02/attempts"), 4)
-        self.assertIsNone(store.read("/plan/tasks/D02/window"))
-        self.assertEqual(
-            dispatched,
-            [
-                ["ticket", "start", "work2"],
-                ["sb", "send", "work2"],
-                ["sb", "send", "work2"],
-                ["sb", "send", "work2"],
-            ],
-        )
 
-    def test_non_retryable_ci_notice_stops_immediately_and_frees_window(self) -> None:
-        state = protocol.initial_state(
-            "r-nonretry", now(), name="demo", mode="existing", target=str(self.repo),
-            max_sessions=1, lanes=1, tmux="tmux",
-        )
-        store = Store(self.run_dir / "run.db", state)
-        self.addCleanup(store.close)
-        task = {"id": "D09", "title": "Auth policy", "goal": "Enforce policy", "deps": [], "acceptance": "true"}
-        store.commit("plan.updated", Changes().replace("plan", waves.compile_plan([task], 1)))
-
-        pool = WindowPool(self.run_dir / "window_pool.json", windows=("work1",))
-        dispatched: list[list[str]] = []
-
-        def runner(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-            if argv[:1] in (["ticket"], ["sb"]):
-                dispatched.append(list(argv[:3]))
-            if argv[:3] == ["gh", "pr", "list"]:
-                return _completed(argv, stdout=json.dumps([{"number": 77}]))
-            return _completed(argv)
-
-        with self.assertRaises(CeremonyError) as caught:
-            run_ceremony(
-                task,
-                pool=pool,
-                repo=self.repo,
-                run_dir=self.run_dir,
-                store=store,
-                runner=runner,
-                wait_receipt=lambda w, t, a, p: CeremonyReceipt(task=t, sha="abc12345", passed=True),
-                wait_ci_notice=lambda t, pr, sha, a: {
-                    "verdict": "merge-blocked",
-                    "data": {"retry_allowed": False, "first_failure_excerpt": "protected branch rule"},
-                },
-            )
-
-        self.assertIn("D09", str(caught.exception))
-        self.assertEqual(pool.snapshot()["windows"]["work1"]["status"], "free")
-        self.assertEqual(store.read("/plan/tasks/D09/status"), "failed")
-        self.assertEqual(store.read("/plan/tasks/D09/attempts"), 1)
-        self.assertIsNone(store.read("/plan/tasks/D09/window"))
-        self.assertEqual(dispatched, [["ticket", "start", "work1"]])
-
-    def test_reset_window_every_and_cli_flags_reset_poisoned_window_via_ticket_start(self) -> None:
-        wt.init_repo(self.repo)
-        (self.repo / "README").write_text("base\n", encoding="utf-8")
-        wt.commit_all(self.repo, "base")
-
-        dag_file = self.root / "plan.yaml"
-        dag_file.write_text(
-            'project: "demo"\n'
-            'repo: "./demo"\n'
-            'mode: "existing"\n'
-            'waves: "auto"\n'
-            'tasks:\n'
-            '  - id: "D03"\n'
-            '    title: "Reset recovery"\n'
-            '    goal: "Recover after window reset"\n'
-            '    deps: []\n'
-            '    acceptance: "true"\n'
-            '    owns: ["src/d03.py"]\n',
-            encoding="utf-8",
-        )
-        board_db = self.root / "board.db"
-        with sqlite3.connect(str(board_db)) as conn:
-            conn.execute("CREATE TABLE sb_messages (id INTEGER PRIMARY KEY, from_slot TEXT, to_slot TEXT, text TEXT)")
-        illm_state = self.root / "illm_state"
-        queue_dir = illm_state / "mailboxes" / "main" / "queue"
-        queue_dir.mkdir(parents=True)
-
-        dispatched: list[list[str]] = []
-        call_index = 0
-
-        def runner(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-            nonlocal call_index
-            if argv[:2] in (["ticket", "start"], ["sb", "send"]):
-                dispatched.append(list(argv[:3]))
-                worktree = self.run_dir / "worktrees" / "D03"
-                (worktree / "src").mkdir(exist_ok=True)
-                rec_path = briefs.receipt_path(self.run_dir, "D03", "implement", call_index)
-                rec_path.parent.mkdir(parents=True, exist_ok=True)
-                if call_index < 2:
-                    rec_path.write_text("BRIEF D03 | uncommitted | FAIL\npoisoned context\n", encoding="utf-8")
-                else:
-                    (worktree / "src" / "d03.py").write_text("ok = True\n", encoding="utf-8")
-                    rec_path.write_text("BRIEF D03 | uncommitted | PASS\ntokens: 400\n", encoding="utf-8")
-                call_index += 1
-                return _completed(argv, stdout="ok\n")
-            if argv[:3] == ["gh", "pr", "list"]:
-                return _completed(argv, stdout="[]")
-            if argv[:3] == ["gh", "pr", "create"]:
-                return _completed(argv, stdout="920\n")
-            if argv[:4] == ["illm", "--json", "ci", "submit"]:
-                sha = argv[6]
-                (queue_dir / "2001-green.json").write_text(
-                    json.dumps({
-                        "id": "2001-green",
-                        "from": "ci",
-                        "type": "done",
-                        "data": {"pr_number": 920, "head_sha": sha, "verdict": "merged", "merge_sha": sha},
-                    }),
-                    encoding="utf-8",
-                )
-                return _completed(argv, stdout=json.dumps({"status": "queued"}))
-            return _completed(argv)
-
-        rc = ceremony.main(
-            [
-                "--dag", str(dag_file),
-                "--repo", str(self.repo),
-                "--run-dir", str(self.run_dir),
-                "--windows", "work3",
-                "--max-attempts", "4",
-                "--reset-window-every", "2",
-            ],
-            runner=runner,
-            board_db=board_db,
-            illm_state_dir=illm_state,
-        )
+class MainTest(Fixture):
+    def test_main_runs_a_dag_with_injected_adapters(self) -> None:
+        dag = self.root / "plan.yaml"
+        dag.write_text('project: "demo"\nrepo: "./demo"\nmode: "existing"\nwaves: "auto"\ntasks:\n'
+                       '  - id: "D01"\n    title: "Core"\n    goal: "Build core"\n    deps: []\n'
+                       '    acceptance: "true"\n    owns: ["src/d01.py"]\n', encoding="utf-8")
+        factory = FakeHarnessFactory(lambda i, k: ({"src/d01.py": "x\n"}, self.pass_text()))
+        rc = ceremony.main(["--dag", str(dag), "--repo", str(self.repo), "--run-dir", str(self.run_dir / "m"),
+                            "--windows", "work9", "--max-attempts", "2"],
+                           runner=self.runner, harness_factory=factory, ci=self.ci())
         self.assertEqual(rc, 0)
-        self.assertEqual(
-            dispatched,
-            [
-                ["ticket", "start", "work3"],
-                ["sb", "send", "work3"],
-                ["ticket", "start", "work3"],
-            ],
-        )
-
-    def test_poll_ci_notice_throttles_status_runner_and_checks_mailbox_each_tick(self) -> None:
-        state_dir = self.root / "illm"
-        queue_dir = state_dir / "mailboxes" / "main" / "queue"
-        queue_dir.mkdir(parents=True)
-        clock = [0.0]
-        sleeps: list[float] = []
-        status_calls: list[float] = []
-
-        def fake_monotonic() -> float:
-            return clock[0]
-
-        def fake_sleep(seconds: float) -> None:
-            sleeps.append(seconds)
-            clock[0] += seconds
-            if len(sleeps) == 3:
-                (queue_dir / "001.json").write_text(
-                    json.dumps({
-                        "from": "ci",
-                        "type": "done",
-                        "data": {"pr_number": 77, "head_sha": "deadbeef00", "verdict": "merged"},
-                    }),
-                    encoding="utf-8",
-                )
-
-        def runner(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-            status_calls.append(clock[0])
-            return _completed(argv, stdout=json.dumps({"status": "running", "head_sha": "deadbeef00"}))
-
-        with mock.patch.object(ceremony.time, "monotonic", side_effect=fake_monotonic), \
-                mock.patch.object(ceremony.time, "sleep", side_effect=fake_sleep):
-            verdict = poll_ci_notice(
-                "D04",
-                77,
-                "deadbeef00",
-                0,
-                run_dir=self.run_dir,
-                repo=self.repo,
-                runner=runner,
-                illm_state_dir=state_dir,
-            )
-
-        self.assertEqual(verdict["verdict"], "merged")
-        self.assertEqual(sleeps, [1.0, 1.0, 1.0])
-        self.assertEqual(status_calls, [0.0])
-
-    def test_poll_ci_notice_queries_status_again_only_after_status_interval(self) -> None:
-        state_dir = self.root / "illm-empty"
-        clock = [0.0]
-        status_calls: list[float] = []
-
-        def fake_monotonic() -> float:
-            return clock[0]
-
-        def fake_sleep(seconds: float) -> None:
-            clock[0] += seconds
-
-        def runner(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-            status_calls.append(clock[0])
-            if len(status_calls) == 1:
-                return _completed(argv, stdout=json.dumps({"status": "running", "head_sha": "cafe123456"}))
-            return _completed(argv, stdout=json.dumps({"verdict": "green", "head_sha": "cafe123456"}))
-
-        with mock.patch.object(ceremony.time, "monotonic", side_effect=fake_monotonic), \
-                mock.patch.object(ceremony.time, "sleep", side_effect=fake_sleep):
-            verdict = poll_ci_notice(
-                "D05",
-                88,
-                "cafe123456",
-                0,
-                run_dir=self.run_dir,
-                repo=self.repo,
-                runner=runner,
-                illm_state_dir=state_dir,
-                poll_interval=0.05,
-                status_interval=0.2,
-                timeout=2.0,
-            )
-
-        self.assertEqual(verdict["verdict"], "green")
-        self.assertEqual(len(status_calls), 2)
-        self.assertGreaterEqual(status_calls[1] - status_calls[0], 0.2 - 1e-9)
+        entries = TaskLedger(self.run_dir / "m" / "task_ledger.jsonl").entries()
+        self.assertEqual((entries[0]["task"], entries[0]["pr_number"]), ("D01", 930))
 
 
 if __name__ == "__main__":

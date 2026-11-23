@@ -1,309 +1,125 @@
-// Deterministic metrics view: reads /api/v1/metrics via ctx.api.metrics() with no LLM call.
-// If any source is missing or unreadable, renders "unavailable" and names the source path.
+// Internal fleet metrics: local SQLite records only. No other service or registry is read.
 
-import { h, setText, compactNumber, shortSha } from './dom.js';
+import { h, shortSha } from './dom.js';
 import { icon } from './icons.js';
 import { pill } from './ui.js';
 
-function formatNumber(value) {
-  if (value === null || value === undefined) return 'unavailable';
-  return new Intl.NumberFormat().format(value);
+function number(value) {
+  return value === null || value === undefined ? 'unavailable' : new Intl.NumberFormat().format(value);
 }
 
-function formatDuration(seconds) {
+function duration(seconds) {
   if (seconds === null || seconds === undefined) return 'unavailable';
   const total = Math.max(0, Math.round(Number(seconds)));
   if (total < 60) return `${total}s`;
-  const mins = Math.floor(total / 60);
-  const secs = total % 60;
-  if (mins < 60) return `${mins}m ${secs}s`;
-  const hours = Math.floor(mins / 60);
-  return `${hours}h ${mins % 60}m`;
+  return total < 3600 ? `${Math.floor(total / 60)}m ${total % 60}s` : `${Math.floor(total / 3600)}h`;
 }
 
-function unavailableBlock(path, error) {
-  return h('div', { class: 'metrics-unavailable' },
-    pill('unavailable', 'amber', { dot: true }),
-    h('code', { class: 'metrics-path mono', text: String(path || 'unknown path') }),
-    error ? h('span', { class: 'metrics-error faint', text: String(error) }) : null);
+function section(title, rows, detail) {
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('list'), title)),
+    detail ? h('p', { class: 'metrics-subhead faint', text: detail }) : null,
+    rows?.length ? h('div', { class: 'metrics-list' }, ...rows) : h('p', { class: 'empty', text: 'No records.' }));
 }
 
-function renderSeries(rows, valueKey, unitLabel) {
-  if (!rows || !rows.length) {
-    return h('p', { class: 'empty', text: `No ${unitLabel} recorded in the window.` });
-  }
-  const recent = rows.slice(-14);
-  const maxVal = Math.max(1, ...recent.map((r) => Number(r[valueKey] || 0)));
-  return h('div', { class: 'metrics-series' },
-    ...recent.slice().reverse().map((row) => {
-      const value = Number(row[valueKey] || 0);
-      const pct = Math.max(2, Math.round((value / maxVal) * 100));
-      return h('div', { class: 'metrics-bar-row' },
-        h('span', { class: 'metrics-bar-date mono tabular', text: row.date }),
-        h('div', { class: 'metrics-bar-track' },
-          h('span', { class: 'metrics-bar-fill', style: { width: `${pct}%` } })),
-        h('span', { class: 'metrics-bar-value tabular', text: formatNumber(value) }));
-    }));
+function row(label, state, detail, tone = 'blue') {
+  return h('div', { class: 'metrics-row' },
+    h('div', { class: 'metrics-row-top' }, h('span', { class: 'mono', text: label }), pill(state, tone)),
+    h('div', { class: 'metrics-row-sub faint', text: detail || '' }));
+}
+
+function series(rows, key, unit) {
+  return h('div', { class: 'metrics-chart-body' }, ...(rows || []).slice(-14).map((entry) =>
+    row(entry.date, `${number(entry[key])} ${unit}`, '', 'violet')));
+}
+
+function line(id, text) {
+  return h('div', { class: 'metrics-row' }, h('div', { class: 'metrics-row-top', id }, text));
+}
+
+function unavailable(path) {
+  return h('div', { class: 'metrics-unavailable', id: 'metrics-unavailable' },
+    pill('unavailable', 'amber'), h('code', { text: path }));
 }
 
 export function mountMetrics(ctx, root) {
-  const statusNote = h('span', { class: 'metrics-stamp faint tabular' });
-  const refreshBtn = h('button', {
-    class: 'btn btn-sm',
-    type: 'button',
-    onclick: () => refresh(),
-  }, icon('retry', { size: 13 }), 'Refresh');
-
-  const averagesGrid = h('div', { class: 'metrics-tiles' });
-  const busyWindowsHost = h('div', { class: 'metrics-list' });
-  const prsInCiHost = h('div', { class: 'metrics-list' });
-  const trainHost = h('div', { class: 'metrics-list' });
-  const boardHost = h('div', { class: 'metrics-list' });
-  const tokensDayHost = h('div', { class: 'metrics-chart-body' });
-  const prsDayHost = h('div', { class: 'metrics-chart-body' });
-  const tasksDayHost = h('div', { class: 'metrics-chart-body' });
-
-  root.replaceChildren(
-    h('div', { class: 'metrics-head' },
-      h('div', { class: 'board-title' },
-        h('div', { class: 'eyebrow', text: 'Direct telemetry · No LLM' }),
-        h('h1', { class: 'phase-title', text: 'Dispatcher & CI Metrics' }),
-        h('p', { class: 'phase-sub', text: 'Live window pool, CI train, board rows, token usage, and merged PRs.' })),
-      h('div', { class: 'metrics-actions' }, statusNote, refreshBtn)),
-    averagesGrid,
-    h('div', { class: 'metrics-grid-now' },
-      h('section', { class: 'card' },
-        h('div', { class: 'card-head' },
-          h('h2', { class: 'card-title' }, icon('terminal'), 'Right now: Window pool')),
-        busyWindowsHost),
-      h('section', { class: 'card' },
-        h('div', { class: 'card-head' },
-          h('h2', { class: 'card-title' }, icon('lane'), 'Right now: PRs in CI')),
-        prsInCiHost),
-      h('section', { class: 'card' },
-        h('div', { class: 'card-head' },
-          h('h2', { class: 'card-title' }, icon('bolt'), 'CI train, lanes & held greens')),
-        trainHost),
-      h('section', { class: 'card' },
-        h('div', { class: 'card-head' },
-          h('h2', { class: 'card-title' }, icon('list'), 'Board rows (open & done)')),
-        boardHost)),
-    h('div', { class: 'metrics-grid-time' },
-      h('section', { class: 'card' },
-        h('div', { class: 'card-head' },
-          h('h2', { class: 'card-title' }, icon('coins'), 'Over time: Tokens per day')),
-        tokensDayHost),
-      h('section', { class: 'card' },
-        h('div', { class: 'card-head' },
-          h('h2', { class: 'card-title' }, icon('dag'), 'Over time: PRs merged per day')),
-        prsDayHost),
-      h('section', { class: 'card' },
-        h('div', { class: 'card-head' },
-          h('h2', { class: 'card-title' }, icon('check'), 'Over time: Tasks completed per day')),
-        tasksDayHost)));
+  const status = h('span', { class: 'metrics-stamp faint tabular' });
+  const left = h('div', { class: 'metrics-sections' });
+  const center = h('div', { class: 'metrics-sections' });
+  const right = h('div', { class: 'metrics-sections' });
+  const refresh = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => update() });
+  root.append(h('div', { class: 'metrics-head' },
+    h('div', { class: 'board-title' },
+      h('div', { class: 'eyebrow', text: 'Local fleet store' }),
+      h('h1', { class: 'phase-title', text: 'Dispatch & CI Records' }),
+      h('p', { id: 'metrics-provenance', class: 'phase-sub', text: 'Recorded leases, costs, messages and verified merges. No external registry.' })),
+    h('div', { class: 'metrics-actions' }, status, refresh)), left, center, right);
 
   function render(data) {
-    if (!data) return;
-    setText(statusNote, data.generated_at ? `Updated ${data.generated_at}` : '');
-    const { tokens, task_ledger: ledger, prs_merged: prs, ci_train: train, board, window_pool: pool } = data;
-
-    // 1. Averages & Totals tiles
-    averagesGrid.replaceChildren(
-      renderSummaryTile(
-        'Tokens used, total',
-        tokens,
-        tokens?.available ? compactNumber(tokens.total) : null,
-        tokens?.available ? `${formatNumber(tokens.total)} tokens` : null,
-      ),
-      renderSummaryTile(
-        'Tokens per task, average',
-        ledger,
-        ledger?.available && ledger.avg_tokens_per_task !== null ? compactNumber(ledger.avg_tokens_per_task) : null,
-        ledger?.available
-          ? (ledger.avg_tokens_per_task !== null ? `${formatNumber(ledger.avg_tokens_per_task)} avg (${ledger.completed_count} tasks)` : 'No token samples in ledger')
-          : null,
-      ),
-      renderSummaryTile(
-        'Time per task, average',
-        ledger,
-        ledger?.available && ledger.avg_time_per_task_s !== null ? formatDuration(ledger.avg_time_per_task_s) : null,
-        ledger?.available
-          ? (ledger.avg_time_per_task_s !== null ? `${ledger.avg_time_per_task_s}s avg (${ledger.completed_count} tasks)` : 'No duration samples in ledger')
-          : null,
-      ),
-      renderSummaryTile(
-        'Window pool (busy / free)',
-        pool,
-        pool?.available ? `${pool.busy_count} busy · ${pool.free_count} free` : null,
-        pool?.available ? pool.path : null,
-      ),
-      renderSummaryTile(
-        'Board rows (open / done)',
-        board,
-        board?.available ? `${formatNumber(board.open_rows)} open · ${formatNumber(board.done_rows)} done` : null,
-        board?.available ? board.path : null,
-      ),
-      renderSummaryTile(
-        'PRs merged (14d)',
-        prs,
-        prs?.available ? formatNumber(prs.total) : null,
-        prs?.available ? prs.path : null,
-      ),
-    );
-
-    // 2. Right now: Window pool
-    if (!pool?.available) {
-      busyWindowsHost.replaceChildren(unavailableBlock(pool?.path, pool?.error));
-    } else {
-      const windows = pool.windows || [];
-      if (!windows.length) {
-        busyWindowsHost.replaceChildren(h('p', { class: 'empty', text: 'No windows registered in pool.' }));
-      } else {
-        busyWindowsHost.replaceChildren(
-          h('div', { class: 'metrics-subhead faint mono', text: `${pool.busy_count} busy, ${pool.free_count} free — ${pool.path}` }),
-          ...windows.map((w) => h('div', { class: 'metrics-row' },
-            h('div', { class: 'metrics-row-top' },
-              h('span', { class: 'mono', text: w.window }),
-              pill(w.status, w.status === 'busy' ? 'blue' : 'green'),
-              w.task ? h('span', { class: 'metrics-task-label', text: w.title ? `${w.task} · ${w.title}` : w.task }) : h('span', { class: 'faint', text: 'Idle' }),
-              w.pr_number ? pill(`PR #${w.pr_number}`, 'violet', { dot: false }) : null),
-            w.head_sha ? h('div', { class: 'metrics-row-sub mono faint', text: `head ${shortSha(w.head_sha)} · attempt ${w.attempts || 1}` }) : null)),
-        );
-      }
+    status.textContent = data.generated_at ? `Updated ${data.generated_at}` : '';
+    const store = data.store || {};
+    if (!store.available) {
+      left.replaceChildren(unavailable(store.path));
+      center.replaceChildren();
+      right.replaceChildren();
+      return;
     }
-
-    // 3. Right now: PRs in CI
-    if (!pool?.available && !train?.available) {
-      prsInCiHost.replaceChildren(unavailableBlock(`${pool?.path || ''}, ${train?.path || ''}`, 'window pool and CI train history are unavailable'));
-    } else {
-      const activePrs = data.right_now?.prs_in_ci || [];
-      if (!activePrs.length) {
-        prsInCiHost.replaceChildren(h('p', { class: 'empty', text: 'No pull requests in CI right now.' }));
-      } else {
-        prsInCiHost.replaceChildren(
-          ...activePrs.map((item) => h('div', { class: 'metrics-row' },
-            h('div', { class: 'metrics-row-top' },
-              h('span', { class: 'mono', text: `PR #${item.pr_number}` }),
-              pill(item.status || 'in CI', 'violet'),
-              item.task ? h('span', { text: `task ${item.task}` }) : null,
-              item.window ? h('span', { class: 'mono faint', text: item.window }) : null,
-              item.lane ? h('span', { class: 'mono faint', text: `lane ${item.lane}` }) : null),
-            item.head_sha ? h('div', { class: 'metrics-row-sub mono faint', text: `head ${shortSha(item.head_sha)}` }) : null)),
-        );
-      }
-    }
-
-    // 4. CI train, lanes, held greens
-    if (!train?.available) {
-      trainHost.replaceChildren(unavailableBlock(train?.path, train?.error));
-    } else {
-      const lanes = train.lanes || [];
-      const held = train.held_greens || [];
-      trainHost.replaceChildren(
-        h('div', { class: 'metrics-row' },
-          h('div', { class: 'metrics-row-top' },
-            h('span', { text: 'Train state' }),
-            pill(train.train_state || 'idle', train.train_state === 'red' ? 'red' : 'teal'),
-            train.train_id ? h('code', { class: 'mono faint', text: train.train_id }) : null)),
-        h('div', { class: 'metrics-subhead faint', text: `Lanes (${lanes.length})` }),
-        ...(lanes.length
-          ? lanes.map((l) => h('div', { class: 'metrics-row' },
-              h('div', { class: 'metrics-row-top' },
-                h('span', { class: 'mono', text: `Lane ${l.lane}` }),
-                pill(l.status || 'idle', l.status === 'red' ? 'red' : l.status === 'green' ? 'green' : 'blue'),
-                l.prs?.length ? h('span', { class: 'mono', text: l.prs.map((p) => `#${p}`).join(', ') }) : null),
-              l.failed_gates?.length ? h('div', { class: 'metrics-row-sub faint', text: `failed gates: ${l.failed_gates.join(', ')}` }) : null))
-          : [h('p', { class: 'empty', text: 'No lane records.' })]),
-        h('div', { class: 'metrics-subhead faint', text: `Held greens (${held.length})` }),
-        ...(held.length
-          ? held.map((hg) => h('div', { class: 'metrics-row' },
-              h('div', { class: 'metrics-row-top' },
-                h('code', { class: 'mono', text: hg.train_id || hg.input_key || 'train' }),
-                pill(hg.state || 'held', 'amber')),
-              hg.other_lanes?.length ? h('div', { class: 'metrics-row-sub faint', text: `waiting on: ${hg.other_lanes.join(', ')}` }) : null))
-          : [h('p', { class: 'empty', text: 'No held green trains.' })]),
-      );
-    }
-
-    // 5. Board rows open and done
-    if (!board?.available) {
-      boardHost.replaceChildren(unavailableBlock(board?.path, board?.error));
-    } else {
-      const states = Object.entries(board.by_state || {});
-      boardHost.replaceChildren(
-        h('div', { class: 'metrics-row' },
-          h('div', { class: 'metrics-row-top' },
-            pill(`${formatNumber(board.open_rows)} open`, 'amber'),
-            pill(`${formatNumber(board.done_rows)} done`, 'green'))),
-        h('div', { class: 'metrics-subhead faint mono', text: board.path }),
-        ...states.map(([stateName, count]) => h('div', { class: 'metrics-row' },
-          h('div', { class: 'metrics-row-top' },
-            h('span', { class: 'mono', text: stateName }),
-            h('span', { class: 'tabular', text: formatNumber(count) })))),
-      );
-    }
-
-    // 6. Over time: Tokens per day (plus sub-source availability check)
-    if (!tokens?.available) {
-      tokensDayHost.replaceChildren(unavailableBlock(tokens?.path, tokens?.error));
-    } else {
-      const subSources = [];
-      for (const [label, src] of [['glm-proxy', tokens.sources?.glm_proxy], ['claude transcripts', tokens.sources?.claude_projects]]) {
-        if (src && !src.available) {
-          subSources.push(h('div', { class: 'metrics-sub-unavail' },
-            h('span', { class: 'faint', text: `${label}: ` }),
-            unavailableBlock(src.path, src.error)));
-        } else if (src?.available) {
-          subSources.push(h('div', { class: 'metrics-subhead faint mono', text: `${label}: ${formatNumber(src.total)} (${src.path})` }));
-        }
-      }
-      tokensDayHost.replaceChildren(...subSources, renderSeries(tokens.by_day, 'tokens', 'tokens'));
-    }
-
-    // 7. Over time: PRs merged per day
-    if (!prs?.available) {
-      prsDayHost.replaceChildren(unavailableBlock(prs?.path, prs?.error));
-    } else {
-      prsDayHost.replaceChildren(
-        h('div', { class: 'metrics-subhead faint mono', text: `${prs.path} (origin/develop)` }),
-        renderSeries(prs.by_day, 'count', 'merged PRs'),
-      );
-    }
-
-    // 8. Over time: Tasks completed per day
-    if (!ledger?.available) {
-      tasksDayHost.replaceChildren(unavailableBlock(ledger?.path, ledger?.error));
-    } else {
-      tasksDayHost.replaceChildren(
-        h('div', { class: 'metrics-subhead faint mono', text: ledger.path }),
-        renderSeries(ledger.tasks_per_day, 'count', 'completed tasks'),
-      );
-    }
+    const token = data.tokens || {};
+    const cache = data.cache;
+    left.replaceChildren(
+      h('div', { class: 'tokens', id: 'metrics-token-loop' },
+        section('Token usage', [
+          row('Input', number(token.total), 'Reported provider usage', 'violet'),
+          row('Cache read', number(cache?.read), 'Stable-prefix accounting', 'green'),
+          row('Cache write', number(cache?.write), 'Reported cache writes', 'green'),
+          row('Cache rate', cache?.hit_rate == null ? 'unavailable' : `${Math.round(cache.hit_rate * 100)}%`,
+            'read / (read + write + uncached input)', 'green'),
+        ], token.path),
+        line('metrics-source', 'Local fleet store'),
+        line('metrics-token-total', `${number(token.total)} tokens recorded`),
+        line('metrics-token-cache_read', `${number(cache?.read)} cache-read tokens`),
+        line('metrics-token-hit-rate', `Cache rate ${cache?.hit_rate ?? 'unavailable'}`),
+        line('metrics-token-heads', 'Track each dispatch, not one session total')),
+      section('Leases', (data.leases || []).map((lease) =>
+        row(lease.task_id, lease.released_at ? 'released' : 'live',
+          `${(lease.owns || []).join(', ')} · ${lease.worktree}`, lease.released_at ? 'green' : 'amber')),
+        'The lease remains live until the release guard succeeds.'),
+      section('Message anatomy', (data.messages || []).map((message) =>
+        row(message.target, message.delivery_state, `${message.sender}: ${message.text}`, 'teal'))));
+    const dispatchRows = (data.dispatches || []).map((dispatch) => {
+      const cost = (data.costs || []).find((item) => item.dispatch_id === dispatch.id);
+      return row(`${dispatch.task_id} · ${dispatch.attempt}`,
+        dispatch.verdict || 'running', `${dispatch.model || 'model unknown'} · ${dispatch.continuation ? 'continuation' : 'fresh'}\n` +
+        `Cache ${cost?.cache_read || 0}/${cost?.cache_write || 0}`);
+    });
+    center.replaceChildren(
+      section('Dispatches', dispatchRows, 'A correction appends the same task history.'),
+      section('CI submissions', (data.ci_submissions || []).map((submission) =>
+        row(`${submission.task_id} · #${submission.pr_number}`, submission.state,
+          `${shortSha(submission.head_sha)} · ${submission.green_run || 'No completed run'}`, 'teal'))));
+    const ledger = data.task_ledger || {};
+    right.replaceChildren(
+      section('Verified merges', (data.merges || []).map((merge) =>
+        row(`${merge.task_id} · #${merge.pr_number}`, 'merged',
+          `${shortSha(merge.head_sha)} → ${shortSha(merge.squash_sha)}`, 'green')),
+        `Average duration ${duration(ledger.avg_time_per_task_s)} · average tokens ${number(ledger.avg_tokens_per_task)}`),
+      section('Tokens per day', [series(data.over_time?.tokens_per_day, 'tokens', 'tokens')]),
+      section('PRs merged per day', [series(data.over_time?.prs_merged_per_day, 'count', 'merged')]),
+      section('Tasks completed per day', [series(data.over_time?.tasks_completed_per_day, 'count', 'completed')]),
+      section('Token usage',
+        [row('Tokens per task, average', number(ledger.avg_tokens_per_task), '', 'violet'),
+         row('Time per task, average', duration(ledger.avg_time_per_task_s), '', 'green')]));
   }
 
-  function renderSummaryTile(label, source, primaryText, secondaryText) {
-    if (!source || !source.available) {
-      return h('div', { class: 'tile is-unknown' },
-        h('span', { class: 'tile-label', text: label }),
-        unavailableBlock(source?.path, source?.error));
-    }
-    return h('div', { class: 'tile' },
-      h('span', { class: 'tile-label', text: label }),
-      h('span', { class: 'tile-value tabular', text: primaryText ?? 'unavailable' }),
-      secondaryText ? h('span', { class: 'metrics-tile-sub faint mono', text: secondaryText }) : null);
-  }
-
-  async function refresh() {
-    refreshBtn.classList.add('is-busy');
+  async function update() {
     try {
       const response = await ctx.api.metrics();
       if (response?.metrics) render(response.metrics);
     } catch (error) {
-      setText(statusNote, error.message || 'Metrics request failed.');
-    } finally {
-      refreshBtn.classList.remove('is-busy');
+      status.textContent = error.message || 'Metrics request failed.';
     }
   }
 
-  return { refresh, render };
+  refresh.append(icon('retry', { size: 13 }), document.createTextNode('Refresh'));
+  return { refresh: update, render };
 }

@@ -322,8 +322,8 @@ class RigorTest(unittest.TestCase):
         m_brief = briefs.render(task=sample, role="review", stage="methodology-audit", attempt=0, receipt=Path("/tmp/r"))
         d_brief = briefs.render(task=sample, role="review", stage="dry-run", attempt=0, receipt=Path("/tmp/r"))
         self.assertIn("confirm they actually prove the behaviour", t_brief)
-        self.assertIn("tg work:ready", m_brief)
-        self.assertIn("no attribution lines, no --amend, atomic commits", m_brief)
+        self.assertIn("CI evidence", m_brief)
+        self.assertIn("governed repository test", m_brief)
         self.assertIn("in-weight rehearsal of the app itself", d_brief)
 
     def test_escalation_moves_the_implementer_up(self):
@@ -389,20 +389,14 @@ class CeremonyPoolAndLedgerTest(unittest.TestCase):
             self.assertEqual(again.snapshot()["busy_count"], 0)
             self.assertEqual(again.snapshot()["free_count"], 3)
 
-    def test_poll_sb_receipt_reads_sqlite_switchboard(self):
-        import sqlite3
-        from jbi.ceremony import poll_sb_receipt
-        with tempfile.TemporaryDirectory() as tmp:
-            db = Path(tmp) / "board.db"
-            with sqlite3.connect(str(db)) as conn:
-                conn.execute("CREATE TABLE sb_messages (id INTEGER PRIMARY KEY, from_slot TEXT, to_slot TEXT, text TEXT)")
-                conn.execute("INSERT INTO sb_messages VALUES (10, 'work1', 'main', 'BRIEF D01 | deadbeef | PASS\ntokens: 1450\nall green')")
-            rec = poll_sb_receipt("work1", "D01", 0, Path(tmp) / "missing.txt", board_db=db, timeout=1.0)
-            self.assertTrue(rec.passed)
-            self.assertEqual(rec.task, "D01")
-            self.assertEqual(rec.sha, "deadbeef")
-            self.assertEqual(rec.tokens, 1450)
-            self.assertEqual(rec.findings, ["all green"])
+    def test_parse_agent_receipt_reads_the_local_receipt(self):
+        from jbi.ceremony import parse_agent_receipt
+        rec = parse_agent_receipt("BRIEF D01 | deadbeef | PASS\ntokens: 1450\nall green", "D01")
+        self.assertTrue(rec.passed)
+        self.assertEqual(rec.task, "D01")
+        self.assertEqual(rec.sha, "deadbeef")
+        self.assertEqual(rec.tokens, 1450)
+        self.assertEqual(rec.findings, ["all green"])
 
 
 class StoreTest(unittest.TestCase):
@@ -555,27 +549,17 @@ class EngineTest(unittest.TestCase):
             time.sleep(0.02)
         self.assertIn("claude: exit 2. The CLI call failed.", self.store.read("/timeline")[-1]["text"])
 
-    def test_ci_notice_matches_pr_and_head_and_records_structured_findings(self):
+    def test_notice_without_a_runtime_cannot_mark_a_merge(self):
         plan = waves.compile_plan([task("core")], 1)
         plan["tasks"]["core"]["pr_number"] = 812
         plan["tasks"]["core"]["commit"] = "ec95b9dbd0123456789abcdef0123456789abcde"
         self.store.commit("plan.updated", Changes().replace("plan", plan).replace("run", "phase", "execute"))
-        self.send("ci.notice", {
-            "schema": "illm.ci.failure.v1",
-            "job_id": "20261116-183000-l0-gA",
-            "pr_number": 812,
-            "head_sha": "ec95b9dbd0123456789abcdef0123456789abcde",
-            "verdict": "red",
-            "failed_gates": ["backend-unit", "authority"],
-            "evidence_url": "file:///tmp/result.json",
-            "first_failure_excerpt": "412: FAIL src/auth/authority.spec.ts",
-            "retry_allowed": True,
-        })
-        findings = "\n".join(self.store.read("/plan/tasks/core/findings"))
-        self.assertIn("20261116-183000-l0-gA", findings)
-        self.assertIn("backend-unit, authority", findings)
-        self.assertIn("file:///tmp/result.json", findings)
-        self.assertIn("412: FAIL src/auth/authority.spec.ts", findings)
+        with self.assertRaises(ProtocolError) as caught:
+            self.send("ci.notice", {"pr_number": 812,
+                                     "head_sha": "ec95b9dbd0123456789abcdef0123456789abcde",
+                                     "verdict": "green", "merge_sha": "ffff"})
+        self.assertEqual(caught.exception.code, "conflict")
+        self.assertNotEqual(self.store.read("/plan/tasks/core/status"), "merged")
         with self.assertRaises(ProtocolError) as caught:
             self.send("ci.notice", {"pr_number": 812, "head_sha": "wrong-sha", "verdict": "red"})
         self.assertEqual(caught.exception.code, "conflict")
@@ -882,149 +866,61 @@ class ServerTest(unittest.TestCase):
             body = error.read()
         self.assertNotIn(b"root:", body)
 
-    def test_metrics_endpoint_reads_all_six_sources_with_no_llm(self):
-        import sqlite3
-        from jbi import ceremony, metrics, worktrees as wt
-        root = Path(self.tmp.name) / "metrics_fx"
-        glm_dir = root / "glm-proxy"
-        claude_dir = root / "claude" / "proj1"
-        workspace = root / "workspace"
-        train_hist = root / "ci-train" / "history.jsonl"
-        board_db = root / "board.db"
-        ledger_path = root / "task_ledger.jsonl"
-        pool_path = root / "window_pool.json"
-
-        glm_dir.mkdir(parents=True)
-        (glm_dir / "gemini-usage.jsonl").write_text(
-            json.dumps({"ts": "2026-11-15T10:00:00Z", "input_tokens": 1000, "output_tokens": 200}) + "\n"
-            + json.dumps({"ts": "2026-11-16T11:00:00Z", "input_tokens": 500, "output_tokens": 100}) + "\n"
-        )
-        claude_dir.mkdir(parents=True)
-        (claude_dir / "sess1.jsonl").write_text(
-            json.dumps({
-                "type": "assistant",
-                "timestamp": "2026-11-16T12:00:00Z",
-                "message": {"usage": {"input_tokens": 300, "cache_read_input_tokens": 700, "output_tokens": 50}},
-            }) + "\n"
-        )
-
-        ledger = ceremony.TaskLedger(ledger_path)
-        ledger.record_done(
-            task="D01", title="Core", window="work1", pr_number=801, head_sha="aaa111",
-            attempts=1, tokens=1200, started_at="2026-11-15T10:00:00Z",
-            completed_at="2026-11-15T10:02:00Z", duration_s=120.0,
-        )
-        ledger.record_done(
-            task="D02", title="API", window="work2", pr_number=802, head_sha="bbb222",
-            attempts=2, tokens=2400, started_at="2026-11-16T10:00:00Z",
-            completed_at="2026-11-16T10:04:00Z", duration_s=240.0,
-        )
-
-        wt.init_repo(workspace)
-        (workspace / "a.txt").write_text("1\n")
-        wt.commit_all(workspace, "[work1] First feature (#801)")
-        (workspace / "b.txt").write_text("2\n")
-        sha2 = wt.commit_all(workspace, "[work2] Second feature (#802)")
-        wt.git(workspace, "update-ref", "refs/remotes/origin/develop", sha2)
-
-        train_hist.parent.mkdir(parents=True)
-        train_hist.write_text(
-            json.dumps({
-                "train_id": "20261116-135337-l1-gB",
-                "lane": 1,
-                "prs": [812],
-                "head_sha": "deadbeef1234",
-                "verdict": "running",
-            }) + "\n"
-            + json.dumps({
-                "record": "merge",
-                "train_id": "20261116-135407-l3-gB",
-                "input_key": "k1",
-                "stamped": "2026-11-16T14:40:00Z",
-                "merge": {
-                    "attempted": False,
-                    "state": "green-waiting-other-lanes",
-                    "stopped": "merge-serialized",
-                    "other_lanes": ["lane 1 gate 6040"],
-                },
-            }) + "\n"
-        )
-
-        with sqlite3.connect(str(board_db)) as conn:
-            conn.execute("CREATE TABLE todo_items (id INTEGER PRIMARY KEY, state TEXT)")
-            conn.executemany(
-                "INSERT INTO todo_items (state) VALUES (?)",
-                [("todo",), ("doing",), ("halted",), ("done",), ("done",), ("dropped",)],
-            )
-
-        pool = ceremony.WindowPool(pool_path, windows=("work1", "work2"))
-        pool.mark_busy("work1", "D03", title="UI metrics", pr_number=815, head_sha="c0ffee12", ci_status="submitted")
-
-        self.server.app.metrics_sources = metrics.MetricsSources(
-            glm_proxy_dir=glm_dir,
-            claude_projects_dir=root / "claude",
-            task_ledger_path=ledger_path,
-            workspace_repo=workspace,
-            ci_train_history=train_hist,
-            board_db=board_db,
-            window_registry_path=pool_path,
-            days=14,
-        )
+    def test_metrics_endpoint_reads_internal_fleet_with_no_llm(self):
+        from jbi import tracking, worktrees as wt
+        from unittest import mock
+        root = Path(self.tmp.name) / "metrics_repo"
+        wt.init_repo(root)
+        (root / "README").write_text("base\n")
+        base = wt.commit_all(root, "base")
+        tr = tracking.Tracking(self.store.path.parent / "fleet.db")
+        for number, (tid, day, seconds) in enumerate((("D01", "2026-11-15", 120), ("D02", "2026-11-16", 240)), 800):
+            path = wt.create_worktree(root, tid, base, root.parent / "trees")
+            with mock.patch.object(tracking, "_now", return_value=f"{day}T10:00:00Z"):
+                tr.create_task(title=tid, owns=[f"src/{tid}.txt"], branch=f"jbi/{tid}",
+                               worktree=path, base_commit=base, task_id=tid)
+                grant = tr.dispatch(tid, session_id=f"s-{tid}", owns=[f"src/{tid}.txt"], branch=f"jbi/{tid}",
+                                    worktree=path, continuation=False)
+            (path / "src").mkdir()
+            (path / f"src/{tid}.txt").write_text(tid + "\n", encoding="utf-8")
+            head = wt.commit_all(path, tid + ": write owned file")
+            tr.record_commit(tid, head)
+            split = 2400 if number == 801 else 3600
+            tr.record_cost(grant["dispatch_id"], input_tokens=split // 2, output_tokens=split // 2,
+                           cache_read=100 * (number - 799), cache_write=5 * (number - 799))
+            tr.record_ci(tid, pr_number=number, head_sha=head, base_commit=base,
+                         green_run=f"job-{number}", squash_sha=base,
+                         service_reply={"type": "data", "text": "verdict GREEN"}, state="green")
+            with mock.patch.object(tracking, "_now", side_effect=[f"{day}T10:00:00Z", f"{day}T10:0{seconds // 60}:00Z"]):
+                tr.mark_task_state(tid, "merging")
+                tr.record_merge(tid, number, head, base, f"job-{number}")
+            tr.release(tid, reason="merged", repository=root)
+        tr.close()
         status, body = self.call("GET", "/api/v1/metrics")
         self.assertEqual(status, 200)
         m = body["metrics"]
         self.assertTrue(m["tokens"]["available"])
-        self.assertEqual(m["tokens"]["total"], 1200 + 600 + 1050)
-        self.assertEqual(m["averages"]["tokens_per_task"], 1800.0)
+        self.assertEqual(m["tokens"]["total"], 6000)
+        self.assertEqual(m["averages"]["tokens_per_task"], 3000.0)
         self.assertEqual(m["averages"]["time_per_task_s"], 180.0)
-        self.assertTrue(m["prs_merged"]["available"])
         self.assertEqual(m["prs_merged"]["total"], 2)
-        self.assertTrue(m["ci_train"]["available"])
-        self.assertEqual(m["ci_train"]["train_state"], "green-waiting-other-lanes")
-        self.assertEqual(len(m["ci_train"]["lanes"]), 1)
-        self.assertEqual(len(m["ci_train"]["held_greens"]), 1)
-        self.assertTrue(m["board"]["available"])
-        self.assertEqual((m["board"]["open_rows"], m["board"]["done_rows"]), (3, 2))
-        self.assertTrue(m["window_pool"]["available"])
-        self.assertEqual((m["window_pool"]["busy_count"], m["window_pool"]["free_count"]), (1, 1))
-        self.assertEqual(m["right_now"]["busy_windows"][0]["task"], "D03")
-        self.assertEqual({p["pr_number"] for p in m["right_now"]["prs_in_ci"]}, {815, 812})
+        self.assertEqual(len(m["merges"]), 2)
+        self.assertEqual(len(m["ci_submissions"]), 2)
+        self.assertTrue(all(row["released_at"] for row in m["leases"]))
 
-    def test_metrics_missing_sources_report_unavailable_with_path_and_no_invented_numbers(self):
-        from jbi import metrics
-        missing = Path(self.tmp.name) / "does-not-exist"
-        self.server.app.metrics_sources = metrics.MetricsSources(
-            glm_proxy_dir=missing / "glm",
-            claude_projects_dir=missing / "claude",
-            task_ledger_path=missing / "task_ledger.jsonl",
-            workspace_repo=missing / "workspace",
-            ci_train_history=missing / "history.jsonl",
-            board_db=missing / "board.db",
-            window_registry_path=missing / "window_pool.json",
-        )
+    def test_metrics_missing_store_reports_unavailable_with_path_and_no_invented_numbers(self):
         status, body = self.call("GET", "/api/v1/metrics")
         self.assertEqual(status, 200)
         m = body["metrics"]
-        for section, expected_subpath in (
-            ("tokens", "glm"),
-            ("task_ledger", "task_ledger.jsonl"),
-            ("prs_merged", "workspace"),
-            ("ci_train", "history.jsonl"),
-            ("board", "board.db"),
-            ("window_pool", "window_pool.json"),
-        ):
-            with self.subTest(section=section):
-                self.assertFalse(m[section]["available"])
-                self.assertEqual(m[section]["status"], "unavailable")
-                self.assertIn(expected_subpath, m[section]["path"])
+        for section in ("tokens", "task_ledger", "prs_merged"):
+            self.assertFalse(m[section]["available"])
+            self.assertEqual(m[section]["status"], "unavailable")
+            self.assertIn("fleet.db", m[section]["path"])
         self.assertIsNone(m["tokens"]["total"])
         self.assertIsNone(m["averages"]["tokens_per_task"])
         self.assertIsNone(m["averages"]["time_per_task_s"])
         self.assertIsNone(m["prs_merged"]["total"])
-        self.assertIsNone(m["board"]["open_rows"])
-        self.assertIsNone(m["board"]["done_rows"])
-        self.assertIsNone(m["window_pool"]["busy_count"])
-        self.assertIsNone(m["window_pool"]["free_count"])
+        self.assertEqual(m["leases"], [])
 
     def test_preview_endpoint_returns_waves_critical_path_and_etas(self):
         plan = waves.compile_plan([task("core"), task("api", "core"), task("ui", "core"), task("e2e", "api", "ui")], 1)
@@ -1085,7 +981,15 @@ class InstallAndResumeTest(unittest.TestCase):
             fake_ctl = Path(tmp) / "fake-systemctl"
             fake_ctl.write_text(f"#!/usr/bin/env bash\necho \"$*\" >> {str(ctl_log)!r}\n")
             fake_ctl.chmod(0o755)
-            env = {**os.environ, "HOME": str(fake_home), "SYSTEMCTL": str(fake_ctl)}
+            tools = Path(tmp) / "bin"
+            tools.mkdir()
+            for name in ("ci-conductor",):
+                path = tools / name
+                path.write_text("#!/usr/bin/env bash\nexit 0\n")
+                path.chmod(0o755)
+            suffix = os.environ.get("PATH", "")
+            env = {**os.environ, "HOME": str(fake_home), "SYSTEMCTL": str(fake_ctl),
+                   "PATH": os.pathsep.join([str(tools), suffix])}
 
             inst = subprocess.run(["bash", str(ROOT / "install.sh")], cwd=str(ROOT), env=env,
                                   capture_output=True, text=True, check=False)

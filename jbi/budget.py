@@ -390,7 +390,7 @@ def _rss_sum(cgroup: Path) -> int:
 
 
 def tree_memory(cgroup: Path) -> tuple[int, str]:
-    """The tree's memory for the kill decision, with its source.
+    """The tree's memory for the kill choice, with its source.
 
     cgroup v2 charges a page to the cgroup of the task that faults it, so a
     process moved into this cgroup keeps its earlier pages charged elsewhere.

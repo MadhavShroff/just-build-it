@@ -1,18 +1,15 @@
-"""The execution runtime: tmux sessions, the scheduler, stage runs, CI lanes, stop modes.
+"""The execution runtime: private tmux sessions, internal leases, direct CI, and stop modes.
 
-`Supervisor` implements `jbi.contracts.Runtime`. Every agent runs under `jbi.shim` in
-its own window of a private tmux server (`tmux -L jbi-<run-id>`). The scheduler admits
-a task as soon as its own dependencies are merged, never by wave.
+`Supervisor` implements `jbi.contracts.Runtime`. Every agent runs through the shim in
+its own private tmux window. The scheduler admits tasks when dependencies are merged.
 
-One step, one window: REQUIREMENT 1.1 to 1.6 in
-`~/.tangram-dev/evidence/jbi-run/REQUIREMENT-executor.md`. The window name is
-`<dagName>-wave<n>-task<n>-<provider>` (1.2); the window is closed and its process
-tree and temp files are reclaimed when the step ends (1.5); only the receipt
-survives (1.6). The close is VERIFIED, never merely requested.
+A dispatch grants a lease before an agent execution. A verified CI merge ends the task.
+A refusal preserves the lease and uncommitted work.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -25,11 +22,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, briefs, ci_adapter as ci_mod, models, rigor, taskkey, waves, worktrees as wt
+from . import agents, briefs, ci_adapter as ci_mod, guards, models, rigor, taskkey, waves, worktrees as wt
 from .contracts import Hooks
-from .lanes import Lanes, MergeJob
+from .lanes import MergeJob
 from .shim import Groups, alive, process_start, run_command
 from .store import Changes, Store, now
+from .tracking import Tracking
 
 ACCEPTANCE_TIMEOUT = 900.0
 STANDDOWN_WAIT = 20.0
@@ -37,6 +35,14 @@ TICK = 1.0
 CLOSE_WAIT = 10.0                 # a window close is verified within this time, not assumed
 STAGE_STATUS = {"implement": "running", "merge": "queued"}
 WINDOW_NAME = re.compile(r"^[a-z0-9-]+-wave\d+-task\d+-[a-z-]+$")    # REQUIREMENT 1.2
+
+
+def _bounded_id(prefix: str, *parts: str) -> str:
+    """Preserve readable short ids and bound longer unique task identities."""
+    raw = "-".join((prefix, *parts))
+    if len(raw) <= 64:
+        return raw
+    return prefix + "-" + hashlib.blake2s(raw.encode(), digest_size=16).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -173,14 +179,16 @@ class Session:
 class Supervisor:
     def __init__(self, store: Store, hooks: Hooks, run_dir: Path, repo: Path | None = None, *,
                  parent_pid: int | None = None, use_tmux: bool = True,
-                 ci_service: str | None = None, ci_adapter: ci_mod.CIAdapter | None = None):
-        """`repo` pins the repository for tests. A real run leaves it None: the repository is
-        always `state.run.target`, which the user can change until bootstrap starts."""
+                 ci_service: str = "ci-conductor", ci_adapter: ci_mod.CIAdapter | None = None,
+                 tracking: Tracking | None = None):
+        """`repo` pins the repository for tests. A real run reads `state.run.target`."""
         self.store, self.hooks = store, hooks
         self.run_dir, self._repo = Path(run_dir), Path(repo) if repo else None
         self.parent_pid = parent_pid or os.getpid()
-        self.ci_service = ci_service or store.read("/config/ci_service") or "local"
+        self.tracking = tracking or Tracking(self.run_dir / "fleet.db")
+        self.ci_service = ci_service
         self.ci_adapter = ci_adapter or ci_mod.CIAdapter()
+        self.active_dispatch: dict[str, int] = {}
         run_id = store.read("/run/id")
         self.tmux = Tmux(f"jbi-{run_id}", self.run_dir, self.parent_pid)
         self.tmux.available = self.tmux.available and use_tmux
@@ -190,6 +198,12 @@ class Supervisor:
         self.identities: dict[str, dict[int, str]] = {}   # sid -> {pid: start time} at spawn
         self.branch: str = wt.MAIN
         self._lock = threading.RLock()
+        self.cooldowns = models.ProviderCooldowns()
+        raw_pool = store.read("/config/provider_pool") or []
+        self.provider_pool = models.ProviderPool(
+            (item.get("provider"), item.get("model"))
+            for item in raw_pool if isinstance(item, dict) and item.get("provider")
+        ) if raw_pool else None
         self._task_cache = taskkey.WorkCache(self.run_dir, str(run_id or "run"))
         self._wake = threading.Event()
         self._stopping: str | None = None
@@ -200,10 +214,11 @@ class Supervisor:
         self._waves_done: set[int] = set()
         self._all_merged = False
         self._scheduler: threading.Thread | None = None
-        lanes = int(store.read("/config/lanes") or 1)
-        self.lanes = Lanes(lanes, store=store, repo=lambda: self.repo, run_dir=self.run_dir, groups=self.groups,
-                           on_merged=self._merged, on_failed=self._merge_failed, open_window=self._lane_window,
-                           branch=lambda: self.branch, parent_pid=self.parent_pid)
+        self._handovers: dict[str, ci_mod.HandoverResult] = {}
+        self._handover_lock = threading.Lock()
+        self.ci_poll_interval = 1.0
+        self._ci_lock = threading.Lock()
+        self.session_dispatches: dict[str, int] = {}
 
     @property
     def repo(self) -> Path:
@@ -217,6 +232,31 @@ class Supervisor:
     # REQUIREMENT 1.2 and 1.3: the name is
     # `<dagName>-wave<n>-task<n>-<provider>`. The wave is the task's compiled wave
     # index and the task number is its ordinal in that wave; both count from 1.
+
+    def _restore_handovers(self) -> None:
+        """Recover queued work whose PR and exact head still match the task."""
+        if not hasattr(self.tracking, "pending_ci"):
+            return
+        for tid, task in (self.store.read("/plan") or {}).get("tasks", {}).items():
+            records = self.tracking.pending_ci(tid)
+            if not records or task.get("commit") is None:
+                continue
+            if len(records) != 1:
+                raise RuntimeError(f"task {tid} has ambiguous unanswered CI submissions")
+            record = records[0]
+            reply = record["service_reply"]
+            bound = reply.get("bound") if isinstance(reply, dict) else None
+            if task["commit"] != record["head_sha"]:
+                continue
+            if not bound or bound.get("task") != tid or bound.get("head_sha") != record["head_sha"]:
+                raise RuntimeError(f"task {tid} has no bound handover")
+            if int(bound.get("pr_number", 0)) != record["pr_number"]:
+                raise RuntimeError(f"task {tid} has a PR mismatch")
+            if not isinstance(reply.get("job"), str) or not reply["job"].strip():
+                raise RuntimeError(f"task {tid} has no direct CI job id")
+            self._handovers[tid] = ci_mod.HandoverResult(
+                task=tid, branch=task["branch"], pr_number=record["pr_number"],
+                head_sha=record["head_sha"], reply=reply, base_commit=record["base_commit"])
 
     @staticmethod
     def _slug(text: str, fallback: str = "dag") -> str:
@@ -242,8 +282,75 @@ class Supervisor:
         wave, ordinal = self.placement(task)
         return f"{self.dag_name()}-wave{wave}-task{ordinal}-{self._slug(provider, 'none')}"
 
+    def _task_lease(self, task_id: str, cwd: Path | None = None) -> dict:
+        """Register the task before agent execution. Return its one live lease."""
+        task = self.store.read(f"/plan/tasks/{task_id}") or {}
+        worktree = cwd or self.run_dir / "worktrees" / task_id
+        owns = list(task.get("owns") or [])
+        if task_id == "bootstrap":
+            owns = ["*"]
+        existing = self.tracking.get_task(task_id)
+        base = (existing or {}).get("base_commit")
+        if existing is None:
+            base = wt.head(self.repo, self.store.read("/bootstrap/branch") or self.branch)
+        if base is None:
+            raise ValueError(f"task {task_id} needs a base commit")
+        branch = f"jbi/{task_id}"
+        self.tracking.ensure_task(task_id=task_id, title=str(task.get("title") or task_id),
+                                  goal=str(task.get("goal") or ""), owns=owns, branch=branch,
+                                  worktree=worktree, base_commit=base, node=self.dag_name())
+        for lease in self.tracking.fleet()["leases"]:
+            if lease["task_id"] == task_id and lease["released_at"] is None:
+                return lease
+        session_id = _bounded_id("s", self.dag_name(), task_id)
+        grant = self.tracking.dispatch(task_id, session_id=session_id, owns=owns,
+                                       branch=branch, worktree=worktree)
+        return grant["lease"]
+
+    def _stage_dispatch(self, sid: str, task_id: str, cwd: Path, model: str,
+                        brief: Path | None = None, attempt: int = 0) -> dict:
+        """Renew a dispatch. Only a prior dispatch in this same task supplies history."""
+        lease = self._task_lease(task_id, cwd)
+        stage_key = re.sub(r"-\d+$", "", sid)
+        history_key = f"h-{lease['session_id']}-{stage_key}"
+        if len(history_key) > 64:
+            digest = hashlib.sha256(f"{lease['session_id']}\0{stage_key}".encode()).hexdigest()
+            history_key = f"h-{digest[:32]}-{lease['task_id'][-12:]}-{stage_key[-12:]}"
+        self.tracking.start_history_session(history_key, node=self.dag_name())
+        history = self.tracking.session_history(history_key) if attempt > 0 else []
+        digest = hashlib.sha256(brief.read_bytes()).hexdigest() if brief else None
+        continuation = bool(history)
+        dispatch = self.tracking.renew_dispatch(task_id, model=model, brief_digest=digest,
+                                                continuation=continuation)
+        self.active_dispatch[sid] = dispatch["dispatch_id"]
+        return {**dispatch, "continuation": continuation,
+                "history": history, "history_session_id": history_key,
+                "session_id": lease["session_id"]}
+
+    def _store_lite_spec(self, task_id: str, role: str, cwd: Path, model: str, attempt: int,
+                         brief: Path, receipt: Path, base: Path, timeout_sec: float) -> Path:
+        dispatch = self._stage_dispatch(f"s-{task_id}-{role}-{attempt + 1}", task_id, cwd, model, brief,
+                                        attempt=attempt)
+        task = self.store.read(f"/plan/tasks/{task_id}") or {}
+        lease = self._task_lease(task_id, cwd)
+        spec = {"tracking": str(self.tracking.path), "workdir": str(cwd), "model": model,
+                "task_id": task_id, "owns": lease["owns"], "session_id": dispatch["session_id"],
+                "history_session_id": dispatch["history_session_id"],
+                "dispatch_id": dispatch["dispatch_id"], "continuation": dispatch["continuation"],
+                "receipt": str(receipt), "checkpoint": str(base / "checkpoint.json"),
+                "timeout_sec": timeout_sec or 1800, "max_turns": rigor.task_timeouts(task)["max_turns"],
+                "effort": rigor.effort_for(role, task=task, attempts=attempt), "brief": brief.read_text(encoding="utf-8"),
+                "repo_context": json.dumps(self.store.read("/plan/prd") or {}, sort_keys=True),
+                "frozen_contracts": json.dumps(task.get("contracts") or [], sort_keys=True),
+                "usage_path": str(base / "usage.json")}
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "spec.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
     def run_session(self, task: str, role: str, cmd: list[str], cwd: Path, provider: str,
-                    model: str, attempt: int) -> Session:
+                    model: str, attempt: int, *, timeout_sec: float = 0.0,
+                    idle_timeout_sec: float = 0.0) -> Session:
         """Start one agent under the shim, wait until it ends, then reclaim its window.
 
         REQUIREMENT 1.1 to 1.6: the step owns a window of its own, named by
@@ -257,6 +364,16 @@ class Supervisor:
         spec = {"cmd": cmd, "cwd": str(cwd), "provider": provider, "env": agents.extra_env(provider),
                 "parent_pid": self.parent_pid, "parent_start": process_start(self.parent_pid),
                 "status": f"{base}.status.json", "log": f"{base}.log"}
+        lite_usage_path = base / "usage.json"
+        if provider != "simulator":
+            if cmd[:3] != [sys.executable, "-m", "claude_mux_lite"] or len(cmd) != 4:
+                raise ValueError("a neutral agent needs its claude_mux_lite spec path")
+            # The shim maps stored credentials to its inherited environment. None enters this spec.
+            spec["env"] = {"PYTHONPATH": str(agents.PACKAGE_ROOT)}
+        if timeout_sec > 0:
+            spec["timeout_sec"] = float(timeout_sec)
+        if idle_timeout_sec > 0:
+            spec["idle_timeout_sec"] = float(idle_timeout_sec)
         Path(f"{base}.spec.json").write_text(json.dumps(spec))
         argv = [sys.executable, "-m", "jbi.shim", f"{base}.spec.json"]
         opened = self.tmux.open(self.window_name(task, provider), argv)
@@ -282,10 +399,15 @@ class Supervisor:
         with self._lock:
             ident = self.identities.pop(sid, {})            # an ended session leaves the kill set
         self._end_session(session)
+        if lite_usage_path.is_file():
+            session.status.update(json.loads(lite_usage_path.read_text(encoding="utf-8")))
+        self._record_lite_usage(sid)
         session.finished = True
         self._reclaim_window(session)
         self._stop_tree(ident)
         self._remove_session_files(base)
+        if provider != "simulator" and base.parent.name == "sessions" and base.is_dir():
+            shutil.rmtree(base, ignore_errors=True)
         return session
 
     def _reclaim_window(self, session: Session) -> None:
@@ -307,11 +429,32 @@ class Supervisor:
             self._verified_signal(pid, start, signal.SIGKILL, group=True)
             self._verified_signal(pid, start, signal.SIGKILL, group=False)
 
+    def _record_lite_usage(self, sid: str) -> None:
+        base = self.run_dir / "sessions" / sid
+        usage_path = base / "usage.json"
+        if not usage_path.is_file():
+            return
+        usage = json.loads(usage_path.read_text(encoding="utf-8"))
+        did = self.active_dispatch.pop(sid, None)
+        if did is None:
+            return
+        self.tracking.record_cost(did, input_tokens=usage.get("input_tokens"),
+                                  output_tokens=usage.get("output_tokens"),
+                                  cache_read=usage.get("cache_read"), cache_write=usage.get("cache_write"))
+        phase = "passed" if usage.get("exit_code") == 0 else "failed"
+        self.tracking.finish_dispatch(did, verdict=phase)
+        session = self.sessions.get(sid)
+        if session:
+            self.store.commit("session.status", Changes().set("sessions", sid, "usage", usage),
+                              {"session": sid, "task": session.task})
+
     @staticmethod
     def _remove_session_files(base: Path) -> None:
         """Drop the step's scratch files (REQUIREMENT 1.6). The receipt is not here: it lives in `receipts/`."""
         for suffix in (".spec.json", ".status.json", ".log"):
             Path(f"{base}{suffix}").unlink(missing_ok=True)
+        for file_name in ("spec.json", "checkpoint.json"):
+            (base / file_name).unlink(missing_ok=True)
 
     def _record(self, session: Session) -> None:
         ident = self.identities.setdefault(session.sid, {})
@@ -376,25 +519,48 @@ class Supervisor:
         from . import bootstrap
         state = self.store.snapshot()[1]
         self.branch = wt.init_repo(self.repo)
+        task = {"id": "bootstrap", "title": "Bootstrap", "goal": "configure the target repository",
+                "owns": ["*"], "acceptance": "build and lint exit 0"}
         self.store.commit("bootstrap.status", Changes().set("bootstrap", "branch", self.branch))
-        task = {"id": "bootstrap", "title": "Bootstrap", "goal": bootstrap.brief(state),
-                "owns": [], "acceptance": "build and lint exit 0"}
+        base = wt.head(self.repo, self.branch)
+        if base is None:
+            wt.git(self.repo, "commit", "--allow-empty", "-m", "Initialize the repository base")
+        self._task_lease("bootstrap", self.repo)
+        if wt.git(self.repo, "symbolic-ref", "-q", "--short", "HEAD", check=False) != "jbi/bootstrap":
+            if wt.head(self.repo, "jbi/bootstrap") is None:
+                wt.git(self.repo, "checkout", "-q", "-b", "jbi/bootstrap")
+            else:
+                wt.git(self.repo, "checkout", "-q", "jbi/bootstrap")
         brief, receipt = briefs.write(self.run_dir, task=task, role="bootstrap", stage="bootstrap", attempt=0)
-        choice = models.select(state, "implement")
-        job = agents.AgentJob(choice.provider, choice.model, "bootstrap", "bootstrap", self.repo, brief, receipt)
-        self.run_session("bootstrap", "bootstrap", agents.command(job), self.repo, choice.provider,
-                         choice.model, 0)
-        ok, detail = bootstrap.check(self.repo, parent_pid=self.parent_pid, groups=self.groups)
-        sha = wt.commit_all(self.repo, "Bootstrap the repository") or wt.head(self.repo)
-        self.store.commit("bootstrap.status", Changes().replace("bootstrap", "detail", detail)
-                          .replace("bootstrap", "commit", sha))
+        brief.write_text(bootstrap.render_brief(state, receipt), encoding="utf-8")
+        try:
+            choice = models.select(state, "implement")
+            job = agents.AgentJob(choice.provider, choice.model, "bootstrap", "bootstrap", self.repo, brief, receipt)
+            if choice.provider != "simulator":
+                path = self._store_lite_spec("bootstrap", "bootstrap", self.repo, choice.model, 0, brief, receipt,
+                                             self.run_dir / "sessions" / "s-bootstrap-bootstrap-1", 1800)
+                job = agents.AgentJob(**{**job.__dict__, "spec_path": path})
+            self.run_session("bootstrap", "bootstrap", agents.command(job), self.repo, choice.provider,
+                             choice.model, 0)
+            ok, detail = bootstrap.check(self.repo, parent_pid=self.parent_pid, groups=self.groups)
+            sha = wt.commit_all(self.repo, "Bootstrap the repository") or wt.head(self.repo)
+            self.store.commit("bootstrap.status", Changes().replace("bootstrap", "detail", detail)
+                              .replace("bootstrap", "commit", sha))
+        finally:
+            lease = next((row for row in self.tracking.fleet()["leases"]
+                          if row["task_id"] == "bootstrap" and row["released_at"] is None), None)
+            if lease is not None:
+                head = wt.head(self.repo, "jbi/bootstrap")
+                if head:
+                    self.tracking.record_commit("bootstrap", head)
+                self.tracking.release("bootstrap", reason="abandon", abandon=True, repository=self.repo)
         self.hooks.bootstrap_finished(ok, detail, sha)
 
     # ---- the scheduler ---------------------------------------------------------------
 
     def start_execution(self) -> None:
         self.branch = self.store.read("/bootstrap/branch") or self.branch
-        self.lanes.start()
+        self._restore_handovers()
         self._scheduler = threading.Thread(target=self._schedule, name="jbi-scheduler", daemon=True)
         self._scheduler.start()
 
@@ -414,8 +580,14 @@ class Supervisor:
         with self._lock:
             plan, config = self.store.read("/plan"), self.store.read("/config")
             state = self.store.snapshot()[1]
+            admit_err = wt.host_admission_check(
+                max_load_per_cpu=float(config.get("max_load_per_cpu") or 0.0),
+                min_free_mem_mb=int(config.get("min_free_mem_mb") or 0),
+            )
+            if admit_err:
+                return
             running = [t for t, th in self._running.items() if th.is_alive()]
-            for tid in waves.ready_tasks(plan):
+            for tid in waves.prioritize_ready(plan, config=config):
                 if len(running) >= config["max_sessions"]:
                     break
                 if tid in running or waves.owns_conflict(plan, tid, running):
@@ -438,6 +610,15 @@ class Supervisor:
         for key, value in values.items():
             changes.set("plan", "tasks", tid, key, value)
         self.store.commit(etype, changes, {"task": tid})
+        state = values.get("status")
+        if state not in ("skipped", "waiting-model"):
+            target = {"request": "blocked", "ready": "running"}.get(state, state)
+            states = {r["id"]: r for r in self.tracking.fleet()["tasks"]}
+            if tid in states and target in ("running", "verifying", "queued", "merging", "failed", "paused", "blocked", "abandoned"):
+                if not (states[tid]["state"] == "merged" and target != "merged"):
+                    if states[tid]["state"] == "abandoned" and target == "paused":
+                        return
+                    self.tracking.mark_task_state(tid, target)
 
     def _run_task(self, tid: str) -> None:
         try:
@@ -479,7 +660,15 @@ class Supervisor:
         base = wt.head(self.repo, self.branch)
         if base is None:
             raise wt.GitError(f"base branch {self.branch} has no commit")
-        worktree = wt.create_worktree(self.repo, tid, base, self.run_dir / "worktrees")
+        existing = self.tracking.get_task(tid)
+        if existing is not None:
+            base = existing["base_commit"]
+        worktree = wt.restore_worktree(self.repo, tid, base, self.run_dir / "worktrees",
+                                       expected_head=(existing or {}).get("head_commit"))
+        wt.pin_git_metadata(worktree, self.repo)
+        setup_cmds = self.store.read("/config/worktree_setup_commands") or ()
+        wt.prepare_worktree(worktree, setup_commands=setup_cmds, cache_key=base)
+        self._task_lease(tid, worktree)
         findings: list[str] = task.get("findings") or []
         stage_name: str | None = task.get("resume_after")
         while not self._stopping or self._stopping == "finish":
@@ -489,6 +678,11 @@ class Supervisor:
                 return
             level, profile = rigor.effective(task, self.store.read("/config"))
             stage = rigor.next_stage(level, stage_name)
+            if stage is None and tid in self._handovers:
+                if self._merge(tid, level, worktree):
+                    self._reclaim_worktree(tid, worktree)
+                    self._progress()
+                return
             if stage is None:
                 self._reclaim_worktree(tid, worktree)
                 return
@@ -497,8 +691,9 @@ class Supervisor:
             if hit is not None:
                 ok, detail, model = True, hit.detail, hit.model
                 if stage.name == "implement":
-                    # the reset also moved branch jbi/<tid>, so the merge lands this work
+                    # Cache restoration changes the leased branch. Record its exact head.
                     self._task_update(tid, commit=hit.commit)
+                    self.tracking.record_commit(tid, hit.commit)
                 self.store.log("task", f"{tid}: {detail}", task=tid)
             else:
                 ok, detail, model = self._run_stage(task, stage, level, worktree, findings)
@@ -534,23 +729,31 @@ class Supervisor:
                               resume_after=None)
             stage_name = None
             if attempts >= rigor.DECISION_AFTER:
-                self._open_decision(tid, attempts, findings)
+                self._open_request(tid, attempts, findings)
                 return
             if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
                 self._task_update(tid, resume_after=None)
                 return
 
     def _reclaim_worktree(self, tid: str, worktree: Path) -> None:
-        """Remove the task worktree once the task has ended (REQUIREMENT 1.5).
+        """Release a clean lease. Its detached worktree remains at the base.
 
-        The worktree spans every step of one task, so it is reclaimed at the end of
-        the task and not between steps. A paused or failed task keeps its worktree
-        for the resume.
+        A dirty worktree cannot release. Its lease and uncommitted files remain.
         """
+        dry_run = bool(self.store.read("/config/dry_run"))
+        merged = not dry_run and self.store.read(f"/plan/tasks/{tid}/status") == "merged"
+        if not merged:
+            if (self.tracking.get_task(tid) or {}).get("state") != "abandoned":
+                self.tracking.mark_task_state(tid, "paused")
+        if not any(row["task_id"] == tid and row["released_at"] is None
+                   for row in self.tracking.fleet()["leases"]):
+            return
         try:
-            wt.remove_worktree(self.repo, worktree)
-        except wt.GitError as error:
-            self.store.log("task", f"{tid}: cannot remove {worktree}: {error}", task=tid)
+            self.tracking.release(tid, reason="merged" if merged else "abandon", abandon=not merged, repository=self.repo)
+        except Exception as error:
+            self.store.log("lease", f"{tid}: cannot release lease: {error}", task=tid)
+            self._task_update(tid, status="paused" if not merged else "merged",
+                              lease_state="held", release_error=str(error))
 
     def _taskkey(self, tid: str, stage: rigor.Stage, base: str,
                  findings: list[str]) -> str | None:
@@ -574,8 +777,19 @@ class Supervisor:
         else:
             self._task_update(tid, "task.stage", stage=stage.name)
         if stage.role == "acceptance":
-            result = run_command(task["acceptance"], cwd=worktree, env=agents.child_env(None),
-                                 timeout=ACCEPTANCE_TIMEOUT, parent_pid=self.parent_pid, groups=self.groups)
+            wt.purge_tsbuildinfo(worktree)
+            self._task_lease(tid, worktree)
+            acc_timeout = float(rigor.task_timeouts(task).get("acceptance_timeout_s") or ACCEPTANCE_TIMEOUT)
+            sid = f"s-{tid}-acceptance-{task.get('attempts', 0) + 1}"
+            self._stage_dispatch(sid, tid, worktree,
+                                 "acceptance", attempt=task.get("attempts", 0))
+            try:
+                result = run_command(task["acceptance"], cwd=worktree, env=agents.child_env(None),
+                                     timeout=acc_timeout, parent_pid=self.parent_pid, groups=self.groups)
+            finally:
+                did = self.active_dispatch.pop(sid, None)
+                if did is not None:
+                    self.tracking.finish_dispatch(did, verdict="ended")
             code, out = result.returncode, result.output
             return code == 0, f"exit {'timeout' if code is None else code}\n{out[-2000:]}", None
         if stage.role == "merge":
@@ -639,68 +853,192 @@ class Supervisor:
                      findings: list[str], *, discard: bool = True) -> tuple[bool, str, str | None]:
         tid, attempt = task["id"], task.get("attempts", 0)
         state = self.store.snapshot()[1]
-        choice = models.select(state, stage.role, task=task, attempts=attempt)
+        choice = models.select(state, stage.role, task=task, attempts=attempt,
+                               pool=self.provider_pool, cooldowns=self.cooldowns)
+        shared = briefs.discover_shared_helpers(worktree) if stage.role == "implement" else None
+        limits = rigor.task_timeouts(task)
+        ckpt_path = worktree / ".jbi_checkpoint.json"
+        ckpt_note: str | None = None
+        if stage.role == "implement" and ckpt_path.is_file():
+            try:
+                data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    ckpt_note = f"Resuming after {data.get('reason', 'previous attempt')}."
+            except (OSError, ValueError):
+                pass
         brief, receipt = briefs.write(self.run_dir, task=task, role=stage.role, stage=stage.name,
-                                      attempt=attempt, findings=findings if stage.role == "implement" else None)
+                                      attempt=attempt, findings=findings if stage.role == "implement" else None,
+                                      shared_helpers=shared, checkpoint_note=ckpt_note)
         job = agents.AgentJob(choice.provider, choice.model, tid, stage.role, worktree, brief, receipt,
                               attempt, tuple(task.get("owns") or ()))
-        session = self.run_session(tid, stage.name, agents.command(job), worktree, choice.provider,
-                                   choice.model, attempt)
+        if choice.provider != "simulator":
+            self._task_lease(tid, worktree)
+            lite_spec = self._store_lite_spec(
+                tid, stage.name, worktree, choice.model, attempt, brief, receipt,
+                self.run_dir / "sessions" / f"s-{tid}-{stage.name}-{attempt + 1}", limits["agent_timeout_s"])
+            job = agents.AgentJob(**{**job.__dict__, "spec_path": lite_spec})
+        limits = rigor.task_timeouts(task)
+        use_watchdog = choice.provider != "simulator" or bool(state.get("config", {}).get("enforce_timeouts"))
+        if use_watchdog:
+            session = self.run_session(
+                tid, stage.name, agents.command(job), worktree, choice.provider, choice.model, attempt,
+                timeout_sec=float(limits["agent_timeout_s"]),
+                idle_timeout_sec=float(limits["idle_timeout_s"]),
+            )
+        else:
+            session = self.run_session(tid, stage.name, agents.command(job), worktree, choice.provider,
+                                       choice.model, attempt)
         if self._stopping in ("quit", "kill", "standdown"):
             return False, f"stopped by {self._stopping}", choice.model
+        reason = session.status.get("reason")
+        if reason in ("timeout", "idle-timeout") and stage.role == "implement":
+            try:
+                ckpt_path.write_text(json.dumps({"task": tid, "attempt": attempt + 1, "reason": reason,
+                                                 "provider": choice.provider, "model": choice.model}), encoding="utf-8")
+            except OSError:
+                pass
         result = briefs.parse_receipt(receipt)
         if stage.role == "implement":
             owns = task.get("owns") or []
-            if owns:
+            check_syntax = choice.provider != "simulator" or bool(state.get("config", {}).get("enforce_syntax_guards"))
+            if check_syntax:
+                guard_errors = guards.validate_worktree_edits(worktree, owns)
+            elif owns:
                 unowned = [p for p in wt.dirty_paths(worktree) if not wt.path_owned(p, owns)]
-                if unowned:
-                    wt.discard_changes(worktree)
-                    return False, f"modified unowned path {', '.join(unowned)}", choice.model
+                guard_errors = [f"modified unowned path {', '.join(unowned)}"] if unowned else []
+            else:
+                guard_errors = []
+            if guard_errors:
+                wt.discard_changes(worktree)
+                return False, "; ".join(guard_errors), choice.model
             sha = wt.commit_all(worktree, f"{tid}: implement attempt {attempt + 1}")
-            self._task_update(tid, commit=sha or wt.head(worktree, "HEAD"), receipt=str(receipt))
+            sha = sha or wt.head(worktree, "HEAD")
+            self._task_update(tid, commit=sha, receipt=str(receipt))
+            if sha:
+                self.tracking.record_commit(tid, sha)
+            ckpt_path.unlink(missing_ok=True)
         elif discard:
             wt.discard_changes(worktree)        # verifiers and reviewers never edit code
         if result is None:
-            return False, f"no valid receipt (exit {session.status.get('exit_code')})", choice.model
+            return False, f"no valid receipt (exit {session.status.get('exit_code')}, reason {reason or 'none'})", choice.model
         return result.passed, "\n".join(result.findings), choice.model
 
     # ---- merging ---------------------------------------------------------------------
 
     def _merge(self, tid: str, level: str, worktree: Path) -> bool:
-        if self.store.read("/config/dry_run"):
-            # A dry run rehearses the landing path and never takes it. Report what
-            # the merge would do, so the rehearsal proves the pipeline end to end.
+        dry_run = bool(self.store.read("/config/dry_run"))
+        if dry_run:
             task = self.store.read(f"/plan/tasks/{tid}") or {}
             head = task.get("commit") or wt.head(worktree, "HEAD") or ""
-            self.store.log("lane", f"DRY RUN: {tid} would hand {head[:10]} to the CI service "
-                                   f"({self.store.read('/config/ci_service') or self.ci_service}) "
-                                   f"and merge on green. Nothing was pushed and nothing merged.",
-                           task=tid)
+            self.store.log("ci", f"DRY RUN: {tid} would submit {head[:10]} through ci-conductor. "
+                                 "Nothing was pushed or merged.", task=tid)
             self._task_update(tid, status="merged", commit=head, dry_run=True)
             return True
         done = threading.Event()
         self._merge_done[tid] = done
-        service = self.store.read("/config/ci_service") or self.ci_service
-        if service == "illm":
-            task = self.store.read(f"/plan/tasks/{tid}")
+        self._merge_ok.pop(tid, None)
+        target_branch = self.store.read("/config/epic_branch") if level == "wave-epic" else None
+        job = MergeJob(tid, f"jbi/{tid}", level, worktree, target_branch=target_branch)
+        with self._handover_lock:
             try:
-                handover = self.ci_adapter.handover(self.repo, task, base=self.branch)
-            except ci_mod.CIAdapterError as error:
-                self._merge_failed(MergeJob(tid, f"jbi/{tid}", level, worktree), [str(error)])
-                return self._merge_ok.pop(tid, False)
-            self._task_update(tid, pr_number=handover.pr_number, commit=handover.head_sha)
-            if not done.is_set():
-                self._task_update(tid, status="merging")
-            self.store.log("lane", f"{tid} handed over to illm ci ready #{handover.pr_number} @ {handover.head_sha[:10]}",
-                           task=tid)
-        else:
-            self.lanes.submit(MergeJob(tid, f"jbi/{tid}", level, worktree))
-        while not done.wait(0.2):
-            if self._stopping in ("quit", "kill", "standdown"):
-                return False
+                task = self.store.read(f"/plan/tasks/{tid}")
+                handover = self._handovers.get(tid)
+                if handover is None:
+                    original = self.tracking.get_task(tid) or {}
+                    existing = [row for row in self.tracking.pending_ci(tid)
+                                if row["head_sha"] == task.get("commit")]
+                    if original.get("state") == "merging" and len(existing) == 1:
+                        row = existing[0]
+                        handover = ci_mod.HandoverResult(tid, f"jbi/{tid}", row["pr_number"], row["head_sha"],
+                                                         row["service_reply"], row["base_commit"])
+                    elif original.get("head_commit") == task.get("commit"):
+                        records = [row for row in self.tracking.fleet()["ci_submissions"]
+                                   if row["task_id"] == tid and row["state"] == "green"
+                                   and row["head_sha"] == task.get("commit")]
+                        if len(records) == 1:
+                            row = records[0]
+                            handover = ci_mod.HandoverResult(tid, f"jbi/{tid}", row["pr_number"], row["head_sha"],
+                                                             row["service_reply"], row["base_commit"])
+                    if handover is not None:
+                        self._handovers[tid] = handover
+                if handover is None:
+                    handover = self.ci_adapter.handover(self.repo, task, base=target_branch or self.branch,
+                                                       tracking=self.tracking)
+                    self._handovers[tid] = handover
+                self._task_update(tid, status="merging", pr_number=handover.pr_number,
+                                  commit=handover.head_sha)
+                while not done.is_set() and self._stopping not in ("quit", "kill", "standdown"):
+                    if self.ci_adapter.pending(self.repo, handover):
+                        time.sleep(self.ci_poll_interval)
+                        continue
+                    with self._ci_lock:
+                        evidence = self.ci_adapter.confirm_merge(self.repo, handover, tracking=self.tracking)
+                        if not self._finish_verified_merge(job, handover, evidence["squash_sha"]):
+                            break
+                    time.sleep(self.ci_poll_interval)
+            except (ci_mod.CIAdapterError, OSError, ValueError, KeyError) as error:
+                if self.store.read(f"/plan/tasks/{tid}/status") == "merged":
+                    return True
+                bound = self._handovers.pop(tid, None)
+                if bound is not None and (self.tracking.get_task(tid) or {}).get("state") != "merged":
+                    self._record_ci_failure(bound, str(error))
+                self._merge_failed(job, [str(error)])
         return self._merge_ok.pop(tid, False)
 
+    def _record_ci_failure(self, handover: ci_mod.HandoverResult, detail: str) -> None:
+        """Close the bound queued record without changing a verified terminal record."""
+        tid = handover.task
+        rows = self.tracking.pending_ci(tid)
+        wanted = next((row for row in rows if row["head_sha"] == handover.head_sha
+                      and row["pr_number"] == handover.pr_number), None)
+        reply = {"type": "data", "text": detail, "job": handover.reply.get("job"),
+                 "bound": handover.reply.get("bound")}
+        self.tracking.record_ci(tid, pr_number=handover.pr_number, head_sha=handover.head_sha,
+                                base_commit=handover.base_commit, state="failed", service_reply=reply)
+        if wanted is not None:
+            self._handovers.pop(tid, None)
+
+    def _finish_verified_merge(self, job: MergeJob, handover: ci_mod.HandoverResult, squash: str) -> bool:
+        """Release the exact branch before moving the local base to its CI squash."""
+        tid = job.task
+        result = self.tracking.get_task(tid)
+        if self.store.read(f"/plan/tasks/{tid}/status") == "merged":
+            self._merge_ok[tid] = True
+            if tid in self._merge_done:
+                self._merge_done[tid].set()
+            return True
+        if (result or {}).get("state") != "merged":
+            raise ci_mod.CIAdapterError("verified task state changed before cleanup")
+        live = any(row["task_id"] == tid and row["released_at"] is None
+                   for row in self.tracking.fleet()["leases"])
+        if live:
+            try:
+                self.tracking.release(tid, reason="merged", repository=self.repo)
+            except Exception as error:
+                self._handovers[tid] = handover
+                self.store.log("lease", f"{tid}: verified CI cannot release its worktree: {error}", task=tid)
+                self._merge_notes[tid] = [str(error)]
+                self._task_update(tid, status="merging", lease_state="held", release_error=str(error))
+                return False
+        base = job.target_branch or self.branch
+        current = wt.head(self.repo, base)
+        if not current:
+            raise ci_mod.CIAdapterError(f"base {base} has no commit")
+        if live and not wt.is_ancestor(self.repo, handover.base_commit, current):
+            raise ci_mod.CIAdapterError(f"base {base} diverged before task lease release")
+        if live and current != handover.base_commit and not wt.is_ancestor(self.repo, current, squash):
+            raise ci_mod.CIAdapterError(f"base {base} changed after CI verification; submit a fresh exact head")
+        if current != squash and not wt.fast_forward_main(self.repo, squash, current, branch=base):
+            raise ci_mod.CIAdapterError(f"base {base} changed before CI squash synchronization")
+        self._handovers.pop(tid, None)
+        self._merged(job, squash)
+        return True
+
     def _merged(self, job: MergeJob, sha: str) -> None:
+        if self._merge_ok.get(job.task) and self.store.read(f"/plan/tasks/{job.task}/commit") == sha:
+            if job.task in self._merge_done:
+                self._merge_done[job.task].set()
+            return
         self._task_update(job.task, status="merged", commit=sha)
         patch_file = job.worktree / ".jbi" / "architecture.patch.json"
         try:
@@ -722,18 +1060,40 @@ class Supervisor:
             self._merge_done[job.task].set()
 
     def ci_notice(self, tid: str, notice: dict) -> None:
-        verdict = notice.get("verdict")
-        worktree = self.run_dir / "worktrees" / tid
-        level = self.store.read("/config/rigor") or "high"
-        job = MergeJob(tid, f"jbi/{tid}", level, worktree)
-        if verdict in ("green", "merged"):
-            sha = str(notice.get("merge_sha") or notice.get("head_sha")
-                      or self.store.read(f"/plan/tasks/{tid}/commit") or "")
-            self._merged(job, sha)
-            return
-        findings = ci_mod.format_failure_findings(notice)
-        self._task_update(tid, findings=findings)
-        self._merge_failed(job, findings)
+        self._merge_done.setdefault(tid, threading.Event())
+        self._merge_ok.pop(tid, None)
+        # A notice cannot bypass the current-base handover lock of a concurrent poll.
+        with self._handover_lock, self._ci_lock:
+            job = MergeJob(tid, f"jbi/{tid}", self.store.read("/config/rigor") or "high",
+                           self.run_dir / "worktrees" / tid)
+            handover = self._handovers.get(tid)
+            if handover is None and (notice.get("job") or notice.get("job_id")):
+                wanted = str(notice.get("job") or notice.get("job_id"))
+                rows = [row for row in self.tracking.fleet()["ci_submissions"]
+                        if row["task_id"] == tid and row["service_reply"].get("job") == wanted]
+                if len(rows) == 1:
+                    row = rows[0]
+                    handover = ci_mod.HandoverResult(
+                        task=tid, branch=f"jbi/{tid}", pr_number=row["pr_number"],
+                        head_sha=row["head_sha"], reply=row["service_reply"], base_commit=row["base_commit"])
+                    self._handovers[tid] = handover
+            if handover is None and hasattr(self.tracking, "pending_ci"):
+                rows = self.tracking.pending_ci(tid)
+                if len(rows) == 1:
+                    row = rows[0]
+                    handover = ci_mod.HandoverResult(
+                        task=tid, branch=f"jbi/{tid}", pr_number=row["pr_number"],
+                        head_sha=row["head_sha"], reply=row["service_reply"], base_commit=row["base_commit"])
+                    self._handovers[tid] = handover
+            if handover is None:
+                self._merge_failed(job, ["No bound CI handover exists. Read the direct job record."])
+                return
+            try:
+                evidence = self.ci_adapter.confirm_merge(self.repo, handover, tracking=self.tracking)
+            except ci_mod.CIAdapterError:
+                self._merge_failed(job, ci_mod.format_failure_findings(notice))
+            else:
+                self._finish_verified_merge(job, handover, evidence["squash_sha"])
 
     def _block_dependents(self, skipped: str) -> None:
         plan = self.store.read("/plan")
@@ -761,20 +1121,26 @@ class Supervisor:
             self._all_merged = True
             self.hooks.all_merged()
 
-    # ---- decisions and control -------------------------------------------------------
+    # ---- user requests and control ---------------------------------------------------
 
-    def _open_decision(self, tid: str, attempts: int, findings: list[str]) -> None:
-        did = f"d-{tid}-{attempts}"
-        self.store.commit("decision.opened", Changes().set("decisions", did, {
+    def _open_request(self, tid: str, attempts: int, findings: list[str]) -> None:
+        rid = f"r-{tid}-{attempts}"
+        self.store.commit("request.opened", Changes().set("requests", rid, {
             "title": f"{tid} failed {attempts} times", "body": "\n".join(findings[:10]),
             "options": ["retry", "skip", "pause"], "status": "open", "owner": "runtime", "task": tid}),
-            {"decision": did, "task": tid})
-        self._task_update(tid, status="decision")
+            {"request": rid, "task": tid})
+        self._task_update(tid, status="request")
 
-    def answer(self, decision: str, answer: str) -> None:
-        tid = self.store.read(f"/decisions/{decision}/task")
+    def answer(self, request_id: str, answer: str) -> None:
+        tid = self.store.read(f"/requests/{request_id}/task")
         if tid:
             self.control(tid, {"skip": "skip", "pause": "pause"}.get(answer, "retry"))
+
+    def send_message(self, target: str, text: str, all_sessions: bool = False) -> None:
+        for message in self.tracking.send(target, text, all_sessions=all_sessions):
+            self.tracking.message_receipt(message["id"], "sent", "recorded for the agent")
+            self.store.log("message", f"Message accepted for {message['target']}", target=message["target"])
+
 
     def control(self, task: str, action: str) -> None:
         if action == "pause":
@@ -835,20 +1201,36 @@ class Supervisor:
 
     def _stop(self, mode: str) -> None:
         if mode == "finish":
-            while any(th.is_alive() for th in list(self._running.values())):
-                time.sleep(0.2)
+            for thread in list(self._running.values()):
+                thread.join()
         if mode == "standdown":
             self._signal_sessions(signal.SIGINT, groups_too=False)
             self._wait_sessions(STANDDOWN_WAIT)
-            for tid, thread in list(self._running.items()):
+            for tid in list(self._running):
                 worktree = self.run_dir / "worktrees" / tid
                 if (worktree / ".git").exists():
+                    task = self.tracking.get_task(tid) or {}
+                    unsafe = [rel for rel in wt.dirty_paths(worktree)
+                              if not wt.path_owned(rel, task.get("owns") or [])]
+                    if unsafe:
+                        self.store.log("task", f"{tid}: unowned work preserved; stand-down commit refused: "
+                                       f"{', '.join(unsafe)}", task=tid)
+                        continue
                     try:
-                        wt.commit_all(worktree, f"{tid}: work in progress (standdown)")
+                        wt.commit_all(worktree, f"{tid}: work in progress (stand down)")
                     except wt.GitError as error:
-                        self.store.log("task", f"{tid}: cannot commit work in progress: {error}", task=tid)
-                if self.store.read(f"/plan/tasks/{tid}/status") != "merged":
-                    self._task_update(tid, status="paused")
+                        self.store.log("task", f"{tid}: uncommitted work preserved: {error}", task=tid)
+                if self.store.read(f"/plan/tasks/{tid}/status") == "merged":
+                    continue
+                self.tracking.mark_task_state(tid, "paused")
+                head = wt.head(worktree, "HEAD")
+                if head:
+                    self.tracking.record_commit(tid, head)
+                try:
+                    self.tracking.release(tid, reason="abandon", abandon=True, repository=self.repo)
+                except Exception as error:
+                    self.store.log("lease", f"{tid}: uncommitted work and lease preserved: {error}", task=tid)
+                self._task_update(tid, status="paused")
         if mode == "kill":
             self._kill_now()
         else:
@@ -861,7 +1243,6 @@ class Supervisor:
                     session.direct.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     pass
-        self.lanes.close()
         self.hooks.stopped(mode)
 
     def recorded(self) -> set[int]:

@@ -23,13 +23,23 @@ render() {  # render <template> <target>
   mkdir -p "$(dirname "$2")"; sed -e "s|@ROOT@|$ROOT|g" -e "s|@HOME@|$HOME|g" "$1" > "$2.tmp.$$" && mv -f "$2.tmp.$$" "$2"
 }
 
-echo "runtime check: interface-llm"
-if ! { [ -n "${ILLM_HOME:-}" ] && [ -f "$ILLM_HOME/lib/interface_llm.py" ]; } && [ ! -x "$HOME/.local/bin/illm" ]; then
-  echo "  WARNING: no interface-llm found. Install it first: ~/src/interface-llm/install.sh --only runtime" >&2
-fi
+echo "runtime check: required programs and Python packages"
+for executable in python3 git tmux gh ci-conductor bwrap; do
+  command -v "$executable" >/dev/null 2>&1 || {
+    printf 'install: required executable is missing: %s\n' "$executable" >&2
+    exit 1
+  }
+done
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'import jbi, claude_mux_lite' || {
+  echo "install: local jbi and claude-mux-lite modules must import" >&2
+  exit 1
+}
+
+JBI_HOME="${JBI_HOME:-$HOME/.just-build-it}"
+echo "  state folder: $JBI_HOME"
 
 echo "just-build-it: CLI link, state folders and systemd user unit"
-run mkdir -p "$HOME/.local/bin" "$HOME/.just-build-it/runs" "$HOME/.local/state/just-build-it"
+run mkdir -p "$HOME/.local/bin" "$JBI_HOME/runs" "$HOME/.local/state/just-build-it"
 run ln -sfn "$ROOT/just-build-it" "$HOME/.local/bin/just-build-it"
 for unit in just-build-it.service; do
   render "$ROOT/systemd/$unit" "$HOME/.config/systemd/user/$unit"

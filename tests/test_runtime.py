@@ -13,12 +13,14 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
-from jbi import briefs, protocol, waves, worktrees as wt
-from jbi.lanes import Lanes, MergeJob
+from jbi import briefs, ci_adapter as ci_mod, protocol, waves, worktrees as wt
+from jbi.lanes import run_checks
 from jbi.shim import Groups
 from jbi.store import Changes, Store
 from jbi.supervisor import WINDOW_NAME, Supervisor
+from jbi.tracking import Tracking
 
 HAS_TMUX = shutil.which("tmux") is not None
 
@@ -55,9 +57,88 @@ class Hooks:
     def stopped(self, mode): self.calls.append(("stopped", mode)); self.stopped_event.set()
 
 
-def task(tid, deps=(), owns=(), acceptance="true"):
+def task(tid, deps=(), owns=None, acceptance="true"):
+    """A plan task. A fresh task owns exactly `src/<tid>.txt`, never a wildcard."""
+    owns = [f"src/{tid}.txt"] if owns is None else list(owns)
     return {"id": tid, "title": tid, "goal": f"build {tid}", "deps": list(deps),
-            "acceptance": acceptance, "owns": list(owns)}
+            "acceptance": acceptance, "owns": owns}
+
+
+class FakeCI:
+    """A fake external CI service behind the real `CIAdapter` and the real `Tracking` store.
+
+    The runner answers `git push`, `gh pr` and the `ci-conductor` verbs. It lands a pull
+    request ONLY when the supervisor reads a job whose scripted verdict is green, the way
+    the external service would. Production code never merges. `script[tid]` is a list of
+    verdicts, one for each submission of that task. The default verdict is `green`.
+    """
+
+    def __init__(self, repo: Path, scratch: Path):
+        self.repo, self.scratch = Path(repo), Path(scratch)
+        self.script: dict[str, list[str]] = {}
+        self.calls: list[list[str]] = []
+        self.prs: dict[int, dict] = {}
+        self.jobs: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self.adapter = ci_mod.CIAdapter(runner=self.runner)
+
+    def _reply(self, argv, payload, code=0):
+        return subprocess.CompletedProcess(argv, code, json.dumps(payload), "")
+
+    def runner(self, argv, cwd):
+        with self._lock:
+            self.calls.append(list(argv))
+            if argv[0] == "git" and "push" in argv:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[:3] == ["gh", "pr", "list"]:
+                branch = argv[argv.index("--head") + 1]
+                found = [{"number": n, "baseRefName": pr["base"]} for n, pr in self.prs.items()
+                         if pr["branch"] == branch]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(found) if found else "[]", "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                number = 900 + len(self.prs) + 1
+                self.prs[number] = {"branch": argv[argv.index("--head") + 1],
+                                    "base": argv[argv.index("--base") + 1], "submissions": 0}
+                return subprocess.CompletedProcess(argv, 0, f"https://example.test/pull/{number}\n", "")
+            if argv[0] == "ci-conductor" and argv[1] in ("ready", "submit"):
+                number = int(argv[2])
+                pr = self.prs[number]
+                head = wt.head(self.repo, pr["branch"])
+                tid = pr["branch"].split("/", 1)[1]
+                verdicts = self.script.get(tid) or ["green"]
+                verdict = verdicts[min(pr["submissions"], len(verdicts) - 1)]
+                pr["submissions"] += 1
+                job = f"job-{number}-{pr['submissions']}"
+                self.jobs[job] = {"pr": number, "head": head, "verdict": verdict, "squash": None}
+                return self._reply(argv, {"type": "queued", "job": job,
+                                          "text": f"#{number} at {head[:9]} is queued."})
+            if argv[0] == "ci-conductor" and argv[1] == "job":
+                return self._reply(argv, {"type": "data", "text": self._job_text(argv[2])})
+            return subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL)
+
+    def _job_text(self, job_id: str) -> str:
+        job = self.jobs[job_id]
+        number, head = job["pr"], job["head"]
+        if job["verdict"] != "green":
+            return (f"prs: #{number}@{head[:9]}\nstarted 1  finished 2\n"
+                    "verdict RED  failed gates: backend-unit, authority\n"
+                    "FAIL src/auth/authority.spec.ts")
+        if job["squash"] is None:
+            job["squash"] = self._land(self.prs[number])
+        return (f"prs: #{number}@{head[:9]}\nstarted 1  finished 2\n"
+                f"verdict GREEN  failed gates: none\nmerge: #{number}->{job['squash']}; stopped=None")
+
+    def _land(self, pr: dict) -> str:
+        """The external service squash-merges the branch onto its recorded base."""
+        base_sha = wt.head(self.repo, pr["base"])
+        tmp = self.scratch / f"squash-{pr['branch'].replace('/', '-')}"
+        try:
+            tree = wt.squash_merge_tree(self.repo, base_sha, pr["branch"], tmp)
+            sha = wt.commit_tree(self.repo, tree, base_sha, f"squash {pr['branch']}")
+        finally:
+            wt.remove_worktree(self.repo, tmp)
+        return sha
 
 
 class RunFixture(unittest.TestCase):
@@ -80,7 +161,9 @@ class RunFixture(unittest.TestCase):
         self.hooks = Hooks()
         self._saved = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
-        self.sup = supervisor(self.store, self.hooks, self.run_dir, self.repo, use_tmux=use_tmux)
+        self.ci = FakeCI(self.repo, self.tmp / "ci-scratch")
+        self.sup = supervisor(self.store, self.hooks, self.run_dir, self.repo, use_tmux=use_tmux,
+                              ci_adapter=self.ci.adapter)
         self.addCleanup(self.cleanup)
         return self.sup
 
@@ -91,6 +174,7 @@ class RunFixture(unittest.TestCase):
         self.sup.tmux.kill_server()
         for key, value in self._saved.items():
             os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+        self.sup.tracking.close()
         self.store.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -305,6 +389,10 @@ class Runs(RunFixture):
         self.assertTrue(self.hooks.merged_event.wait(60), self.store.read("/timeline"))
         self.assertEqual({self.status("a"), self.status("b")}, {"merged"})
         self.assertIn("a attempt 1", wt.git(self.repo, "show", "main:src/a.txt"))
+        self.assertEqual((self.run_dir / "worktrees/b/src/a.txt").read_text(), "a attempt 1\n")
+        self.assertEqual(self.sup.tracking.get_task("b")["base_commit"],
+                         self.store.read("/plan/tasks/a/commit"))
+        self.assertIsNotNone(self.sup.tracking.get_task("a")["base_commit"])
         stages = self.store.read("/plan/tasks/a/stages")
         self.assertEqual(list(stages), ["implement", "merge"])
         self.assertIn(("wave", 2), self.hooks.calls)
@@ -442,58 +530,51 @@ class PinnedTaskWaits(RunFixture):
 class Failures(RunFixture):
     env = {"JBI_SIM_FAIL": "x:implement:9"}
 
-    def test_fail_retry_escalation_decision(self):
+    def test_fail_retry_escalation_request(self):
         sup = self.make([task("x")], rigor="vibe")
         sup.start_execution()
-        self.assertTrue(wait_for(lambda: self.status("x") == "decision", 90))
+        self.assertTrue(wait_for(lambda: self.status("x") == "request", 90))
         models = [self.store.read(f"/sessions/s-x-implement-{n}/model") for n in range(1, 5)]
         self.assertEqual(models, ["sim-s", "sim-s", "sim-l", "sim-l"], "tier escalates after 2 FAILs")
-        decision = self.store.read("/decisions/d-x-4")
-        self.assertEqual((decision["owner"], decision["options"]), ("runtime", ["retry", "skip", "pause"]))
+        request = self.store.read("/requests/r-x-4")
+        self.assertEqual((request["owner"], request["options"]), ("runtime", ["retry", "skip", "pause"]))
         self.assertEqual(self.store.read("/plan/tasks/x/attempts"), 4)
 
 
-class LaneTests(unittest.TestCase):
+class RunChecksNeverMerge(unittest.TestCase):
+    """`jbi.lanes.run_checks` runs static CI declarations and never lands a commit."""
+
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-lane-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-chk-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.repo, run_dir = self.tmp / "repo", self.tmp / "run"
+        self.repo = self.tmp / "repo"
         wt.init_repo(self.repo)
         (self.repo / ".jbi").mkdir()
         (self.repo / ".jbi" / "commands.json").write_text(json.dumps({"build": "true", "test": "true"}))
-        wt.commit_all(self.repo, "base")
-        worktree = wt.create_worktree(self.repo, "t", wt.head(self.repo), run_dir / "worktrees")
+        self.base = wt.commit_all(self.repo, "base")
+
+    def test_passing_checks_leave_the_base_branch_untouched(self):
+        worktree = wt.create_worktree(self.repo, "t", self.base, self.tmp / "wts")
         (worktree / "t.txt").write_text("t\n")
         wt.commit_all(worktree, "t")
-        self.store = Store(run_dir / "run.db", {"lanes": {}})
-        self.merged: list[str] = []
-        self.lanes = Lanes(1, store=self.store, repo=self.repo, run_dir=run_dir, groups=Groups(),
-                           on_merged=lambda job, sha: self.merged.append(sha),
-                           on_failed=lambda job, notes: self.fail(notes))
-        self.lanes._status = lambda n, **values: None
-        self.job = MergeJob("t", "jbi/t", "medium", worktree)
-        (run_dir / "lanes").mkdir(parents=True, exist_ok=True)
-        self.addCleanup(self.store.close)
+        result = run_checks(("build", "test"), worktree)
+        self.assertTrue(result.ok, result.notes)
+        self.assertEqual(result.notes, ["build: passed", "test: passed"])
+        self.assertEqual(wt.head(self.repo, "main"), self.base, "run_checks must never merge")
 
-    def test_base_moved_recheck_and_cache_hit(self):
-        original, moved = self.lanes.run_checks, []
+    def test_failing_missing_and_malformed_declarations_fail_closed(self):
+        self.assertFalse(run_checks(("lint",), self.repo).ok)
+        (self.repo / ".jbi" / "commands.json").write_text(json.dumps({"build": "exit 3"}))
+        failed = run_checks(("build",), self.repo)
+        self.assertFalse(failed.ok)
+        self.assertIn("build failed (3)", failed.notes[0])
+        (self.repo / ".jbi" / "commands.json").write_text("[]")
+        self.assertFalse(run_checks(("build",), self.repo).ok)
 
-        def run_checks(checks, tree_dir, lane):
-            result = original(checks, tree_dir, lane)
-            if not moved:                       # another lane merges while this one tests
-                (self.repo / "other.txt").write_text("other\n")
-                moved.append(wt.commit_all(self.repo, "other"))
-            return result
-        self.lanes.run_checks = run_checks
-        sha = self.lanes.merge(1, self.job)
-        self.assertEqual(self.lanes.check_runs, 2, "a moved base must run the checks again")
-        self.assertEqual(wt.git(self.repo, "rev-parse", f"{sha}^"), moved[0])
-        self.assertEqual(wt.head(self.repo), sha)
-        self.assertEqual(sorted(wt.git(self.repo, "ls-tree", "--name-only", sha).split()),
-                         [".jbi", "other.txt", "t.txt"])
-        base, head = moved[0], wt.head(self.repo, "jbi/t")
-        self.lanes.checked(base, head, ("build", "test"), self.repo)
-        self.assertEqual(self.lanes.check_runs, 2, "the same inputs never run twice")
+    def test_no_checks_and_no_file_are_skipped(self):
+        self.assertTrue(run_checks((), self.repo).ok)
+        (self.repo / ".jbi" / "commands.json").unlink()
+        self.assertTrue(run_checks(("build",), self.repo).ok)
 
 
 class StopModes(RunFixture):
@@ -560,7 +641,11 @@ class TargetFollowsTheUser(unittest.TestCase):
             time.sleep(0.2)
         self.assertEqual(store.read("/bootstrap/status"), "passed", store.read("/bootstrap/detail"))
         self.assertTrue((chosen / ".git").exists())
-        self.assertTrue((chosen / ".jbi" / "commands.json").exists())
+        parked = wt.git(chosen, "for-each-ref", "--format=%(refname:short)", "refs/heads/jbi-parked").splitlines()
+        self.assertTrue(len(parked) == 1 and parked[0].startswith("jbi-parked/bootstrap-"), parked)
+        wt.git(chosen, "show", parked[0] + ":.jbi/commands.json")
+        self.assertFalse((chosen / ".jbi" / "commands.json").exists(),
+                         "clean bootstrap parks the branch and resets its worktree")
         self.assertFalse(default.exists())
 
 
@@ -631,38 +716,13 @@ class ReviewFindings(unittest.TestCase):
         store = Store(self.tmp / f"run-{uuid.uuid4().hex[:6]}.db", state)
         self.addCleanup(store.close)
         hooks = Hooks()
-        sup = Supervisor(store, hooks, self.tmp / "run", repo, use_tmux=False)
         (self.tmp / "run").mkdir(exist_ok=True)
+        self.ci = FakeCI(repo or self.tmp, self.tmp / "ci-scratch")
+        sup = Supervisor(store, hooks, self.tmp / "run", repo, use_tmux=False, ci_adapter=self.ci.adapter,
+                         tracking=Tracking(self.tmp / f"fleet-{uuid.uuid4().hex[:6]}.db"))
+        self.addCleanup(sup.tracking.close)
         self.addCleanup(lambda: (sup.stop("kill"), hooks.stopped_event.wait(20)))
         return sup, store, hooks
-
-    def test_1_lane_survives_missing_binary_and_reports(self):
-        repo, run = self.tmp / "repo", self.tmp / "lrun"
-        run.mkdir()
-        wt.init_repo(repo)
-        (repo / ".jbi").mkdir()
-        (repo / ".jbi/commands.json").write_text(json.dumps({"build": "no-such-binary-xyz && true", "test": "true"}))
-        wt.commit_all(repo, "base")
-        wtp = wt.create_worktree(repo, "a", wt.head(repo), run / "worktrees")
-        (wtp / "a.txt").write_text("a")
-        wt.commit_all(wtp, "a")
-        store = Store(run / "run.db", {"lanes": {}})
-        self.addCleanup(store.close)
-        calls = []
-        lanes = Lanes(1, store=store, repo=repo, run_dir=run, groups=Groups(),
-                      on_merged=lambda j, s: calls.append(("merged", s)),
-                      on_failed=lambda j, n: calls.append(("failed", n)))
-        lanes.start()
-        lanes.submit(MergeJob("a", "jbi/a", "medium", wtp))
-        self.assertTrue(wait_for(lambda: calls, 20), "on_failed never ran")
-        self.assertEqual(calls[0][0], "failed")
-        self.assertIn("127", " ".join(calls[0][1]))
-        boom = MergeJob("b", "jbi/a", "no-such-level", wtp)       # _merge raises KeyError
-        lanes.submit(boom)
-        self.assertTrue(wait_for(lambda: len(calls) == 2, 20))
-        self.assertEqual(calls[1][0], "failed")
-        self.assertTrue(lanes._threads[0].is_alive(), "the lane thread died")
-        lanes.close()
 
     def test_2_kill_never_signals_a_reused_pid(self):
         sup, store, hooks = self.supervisor()
@@ -683,16 +743,14 @@ class ReviewFindings(unittest.TestCase):
             f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
             "from pathlib import Path\n"
             "from jbi.shim import Groups, run_command\n"
-            "from jbi.lanes import Lanes\n"
+            "from jbi.lanes import run_checks\n"
             "from jbi.agents import child_env\n"
             "g = Groups()\n"
             f"cmd = 'sleep 47.{marker}1; true'\n"
             "threading.Thread(target=run_command, args=(cmd,), kwargs=dict(cwd=Path('/tmp'), env=child_env(None), timeout=900, groups=g), daemon=True).start()\n"
             f"tree = Path({str(self.tmp)!r}) / 'tree'; (tree / '.jbi').mkdir(parents=True, exist_ok=True)\n"
             f"(tree / '.jbi/commands.json').write_text(json.dumps({{'build': 'sleep 47.{marker}2; true'}}))\n"
-            "lanes = Lanes(1, store=None, repo=tree, run_dir=tree, groups=g, on_merged=None, on_failed=None)\n"
-            "lanes._log = lambda *a: None\n"
-            "threading.Thread(target=lanes.run_checks, args=(('build',), tree, 1), daemon=True).start()\n"
+            "threading.Thread(target=run_checks, args=(('build',), tree), kwargs=dict(groups=g), daemon=True).start()\n"
             "print('ready', flush=True); time.sleep(60)\n")
         parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, start_new_session=True)
         self.addCleanup(lambda: parent.poll() is None and parent.kill())
@@ -855,275 +913,94 @@ class ReviewFindings(unittest.TestCase):
         self.assertEqual(wt.head(worktree, "HEAD"), base_sha)
         self.assertFalse((worktree / "src" / "unowned.py").exists())
 
-    def test_10_external_ci_handover_pushes_creates_pr_and_calls_illm(self):
-        from jbi import ci_adapter as ci_mod
-        repo = self.tmp / "ci_repo"
+    def lander(self, name, tid, repo_files):
+        """A repo, a supervisor and a task worktree with one committed implementation."""
+        repo = self.tmp / name
         wt.init_repo(repo)
         (repo / "README").write_text("base\n")
         base_sha = wt.commit_all(repo, "base")
-        t = task("a", owns=["src/a.py"])
-        sup, store, hooks = self.supervisor(repo, [t])
-        sup.ci_service = "illm"
-        worktree = wt.create_worktree(repo, "a", base_sha, sup.run_dir / "worktrees")
-        (worktree / "src").mkdir(exist_ok=True)
-        (worktree / "src" / "a.py").write_text("x = 1\n")
-        head_sha = wt.commit_all(worktree, "a: implement attempt 1")
-        sup._task_update("a", commit=head_sha)
-        calls: list[list[str]] = []
+        sup, store, hooks = self.supervisor(repo, [task(tid)])
+        worktree = wt.create_worktree(repo, tid, base_sha, sup.run_dir / "worktrees")
+        for rel, text in repo_files.items():
+            (worktree / rel).parent.mkdir(parents=True, exist_ok=True)
+            (worktree / rel).write_text(text)
+        head_sha = wt.commit_all(worktree, f"{tid}: implement attempt 1")
+        sup._task_lease(tid, worktree)
+        sup._task_update(tid, commit=head_sha)
+        sup.tracking.record_commit(tid, head_sha)
+        sup.ci_poll_interval = 0.05
+        return sup, store, repo, worktree, head_sha
 
-        def fake_runner(argv, cwd):
-            calls.append(list(argv))
-            if argv[:3] == ["gh", "pr", "list"]:
-                return subprocess.CompletedProcess(argv, 0, "[]", "")
-            if argv[:3] == ["gh", "pr", "create"]:
-                return subprocess.CompletedProcess(argv, 0, "https://github.com/org/repo/pull/812\n", "")
-            if argv[:4] == ["illm", "--json", "ci", "ready"]:
-                threading.Timer(0.05, lambda: sup._merged(MergeJob("a", "jbi/a", "vibe", worktree), head_sha)).start()
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued", "pr": 812}), "")
-            return subprocess.CompletedProcess(argv, 0, "", "")
-
-        sup.ci_adapter = ci_mod.CIAdapter(runner=fake_runner)
-        ok = sup._merge("a", "vibe", worktree)
-        self.assertTrue(ok)
-        self.assertEqual(store.read("/plan/tasks/a/pr_number"), 812)
+    def test_10_direct_ci_handover_records_a_submission_and_an_exact_merge(self):
+        sup, store, repo, worktree, head_sha = self.lander("ci_repo", "a", {"src/a.txt": "x = 1\n"})
+        base_before = wt.head(repo, "main")
+        self.assertTrue(sup._merge("a", "vibe", worktree))
+        self.assertEqual(store.read("/plan/tasks/a/pr_number"), 901)
         self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
-        self.assertTrue(any(c[:3] == ["gh", "pr", "create"] and "--draft" in c for c in calls))
-        self.assertIn(["illm", "--json", "ci", "ready", "812", "--head", head_sha], calls)
+        self.assertTrue(any(c[:3] == ["gh", "pr", "create"] and "--draft" in c for c in self.ci.calls))
+        self.assertIn(["ci-conductor", "ready", "901", "--head", head_sha], self.ci.calls)
+        squash = store.read("/plan/tasks/a/commit")
+        self.assertRegex(squash, r"^[0-9a-f]{40}$")
+        self.assertEqual(wt.head(repo, "main"), squash, "the runtime synchronized exact CI squash evidence")
+        self.assertEqual(wt.git(repo, "rev-parse", f"{squash}^"), base_before)
+        fleet = sup.tracking.fleet()
+        self.assertEqual([r["state"] for r in fleet["ci_submissions"]], ["green", "green"])
+        self.assertEqual(len(fleet["merges"]), 1)
+        merge = fleet["merges"][0]
+        self.assertEqual((merge["pr_number"], merge["head_sha"], merge["squash_sha"], merge["green_run"]),
+                         (901, head_sha, squash, "job-901-1"))
 
-    def test_11_ci_notice_failure_wakes_task_and_rebriefs_with_structured_findings(self):
-        from jbi import briefs, ci_adapter as ci_mod
+    def test_11_notice_text_alone_never_records_a_merge(self):
+        sup, store, repo, worktree, head_sha = self.lander("notice_repo", "a", {"src/a.txt": "x = 1\n"})
+        self.ci.script["a"] = ["red"]
+        base_before = wt.head(repo, "main")
+        self.assertFalse(sup._merge("a", "vibe", worktree))
+        self.assertEqual(wt.head(repo, "main"), base_before)
+        self.assertEqual(sup.tracking.fleet()["merges"], [])
+        self.assertNotEqual(store.read("/plan/tasks/a/status"), "merged")
+        # A notice that claims a merge proves nothing: only a green job record with a merge line does.
+        notice = {"pr_number": 901, "head_sha": head_sha, "verdict": "merged", "merge_sha": head_sha,
+                  "text": "PR #901 merged"}
+        sup.ci_notice("a", notice)
+        self.assertEqual(sup.tracking.fleet()["merges"], [])
+        self.assertNotEqual(store.read("/plan/tasks/a/status"), "merged")
+        findings = "\n".join(sup._merge_notes.get("a") or [])
+        self.assertIn("No bound CI handover", findings)
+        self.assertIn("failed", [r["state"] for r in sup.tracking.fleet()["ci_submissions"]])
+
+    def test_11b_unknown_notice_without_a_handover_records_no_merge(self):
+        sup, store, repo, worktree, head_sha = self.lander("unknown_repo", "a", {"src/a.txt": "x = 1\n"})
+        sup.ci_notice("a", {"pr_number": 7, "head_sha": head_sha, "verdict": "green"})
+        self.assertEqual(sup.tracking.fleet()["merges"], [])
+        self.assertIn("No bound CI handover", "\n".join(sup._merge_notes["a"]))
+
+    def test_11c_red_job_wakes_the_task_and_the_rebrief_carries_the_failure(self):
         from jbi.engine import Engine
-        repo = self.tmp / "notice_repo"
+        repo = self.tmp / "red_repo"
         wt.init_repo(repo)
         (repo / "README").write_text("base\n")
         wt.commit_all(repo, "base")
-        t = task("a", owns=["src/a.txt"])
-        sup, store, hooks = self.supervisor(repo, [t])
+        sup, store, hooks = self.supervisor(repo, [task("a")])
         store.commit("p", Changes().replace("run", "phase", "execute"))
-        sup.ci_service = "illm"
-        engine = Engine(store, completer=None, runtime=sup)
-        ready_calls = 0
+        sup.ci_poll_interval = 0.05
+        self.ci.script["a"] = ["red", "green"]
+        original, calls = sup.ci_adapter.confirm_merge, []
 
-        def fake_runner(argv, cwd):
-            nonlocal ready_calls
-            if argv[:3] == ["gh", "pr", "list"]:
-                return subprocess.CompletedProcess(argv, 0, json.dumps([{"number": 812}]) if ready_calls else "[]", "")
-            if argv[:3] == ["gh", "pr", "create"]:
-                return subprocess.CompletedProcess(argv, 0, "812\n", "")
-            if argv[:4] == ["illm", "--json", "ci", "ready"]:
-                ready_calls += 1
-                sha = argv[6]
-                if ready_calls == 1:
-                    threading.Timer(0.05, lambda: engine.submit({
-                        "id": "n-1",
-                        "type": "ci.notice",
-                        "payload": {
-                            "schema": "illm.ci.failure.v1",
-                            "job_id": "20261116-183000-l0-gA",
-                            "pr_number": 812,
-                            "head_sha": sha,
-                            "verdict": "red",
-                            "failed_gates": ["backend-unit", "authority"],
-                            "evidence_url": "file:///tmp/ev/result.json",
-                            "first_failure_excerpt": "412: FAIL src/auth/authority.spec.ts",
-                            "retry_allowed": True,
-                        },
-                    })).start()
-                else:
-                    threading.Timer(0.05, lambda: engine.submit({
-                        "id": "n-2",
-                        "type": "ci.notice",
-                        "payload": {"pr_number": 812, "head_sha": sha, "verdict": "merged", "merge_sha": sha},
-                    })).start()
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
-            return subprocess.CompletedProcess(argv, 0, "", "")
-
-        sup.ci_adapter = ci_mod.CIAdapter(runner=fake_runner)
+        def confirm(repo_, result, **kw):
+            try:
+                return original(repo_, result, **kw)
+            except ci_mod.CIAdapterError as error:
+                calls.append(str(error))
+                raise
+        sup.ci_adapter.confirm_merge = confirm
         sup.start_execution()
         self.assertTrue(hooks.merged_event.wait(60), store.read("/plan/tasks/a"))
         self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
         self.assertEqual(store.read("/plan/tasks/a/attempts"), 1)
+        self.assertTrue(any("no green verdict" in c for c in calls), calls)
         second_brief = briefs.brief_path(sup.run_dir, "a", "implement", 1).read_text()
-        self.assertIn("20261116-183000-l0-gA", second_brief)
-        self.assertIn("backend-unit, authority", second_brief)
-        self.assertIn("file:///tmp/ev/result.json", second_brief)
-        self.assertIn("412: FAIL src/auth/authority.spec.ts", second_brief)
-
-    def test_12_ceremony_runs_full_9_step_loop_rebriefs_same_window_and_takes_next_task(self):
-        from jbi import briefs
-        from jbi.ceremony import CeremonyReceipt, TaskLedger, WindowPool, run_ceremony
-        repo = self.tmp / "ceremony_repo"
-        wt.init_repo(repo)
-        (repo / "README").write_text("base\n")
-        wt.commit_all(repo, "base")
-        t1 = task("a", owns=["src/a.py"])
-        t2 = task("b", deps=["a"], owns=["src/b.py"])
-        sup, store, hooks = self.supervisor(repo, [t1, t2])
-        pool = WindowPool(sup.run_dir / "window_pool.json", windows=("work1",))
-        ledger = TaskLedger(sup.run_dir / "task_ledger.jsonl")
-        commands: list[list[str]] = []
-        busy_snapshots: list[dict] = []
-
-        def fake_runner(argv, cwd):
-            commands.append(list(argv))
-            if argv[:3] == ["gh", "pr", "list"]:
-                return subprocess.CompletedProcess(argv, 0, "[]", "")
-            if argv[:3] == ["gh", "pr", "create"]:
-                pr = "901\n" if "jbi/a" in argv else "902\n"
-                return subprocess.CompletedProcess(argv, 0, pr, "")
-            if argv[:4] == ["illm", "--json", "ci", "submit"]:
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
-            return subprocess.CompletedProcess(argv, 0, "ok\n", "")
-
-        def wait_receipt(window, tid, attempt, receipt_file):
-            busy_snapshots.append(pool.get(window))
-            worktree = sup.run_dir / "worktrees" / tid
-            (worktree / "src").mkdir(exist_ok=True)
-            (worktree / "src" / f"{tid}.py").write_text(f"attempt = {attempt}\n")
-            return CeremonyReceipt(task=tid, sha="uncommitted", passed=True, findings=[], tokens=500)
-
-        def wait_ci_notice(tid, pr_number, head_sha, attempt):
-            # Fail 5 times on task 'a' (> rigor.DECISION_AFTER = 4) to prove no decision card opens.
-            if tid == "a" and attempt < 5:
-                return {
-                    "schema": "illm.ci.failure.v1",
-                    "job_id": f"job-{attempt}",
-                    "pr_number": pr_number,
-                    "head_sha": head_sha,
-                    "verdict": "red",
-                    "failed_gates": ["unit"],
-                    "evidence_url": f"file:///tmp/ev/{attempt}.json",
-                    "first_failure_excerpt": f"failure on attempt {attempt}",
-                    "retry_allowed": True,
-                }
-            return {"pr_number": pr_number, "head_sha": head_sha, "verdict": "green", "merge_sha": head_sha}
-
-        outcome = run_ceremony(
-            t1, next_tasks=[t2], pool=pool, ledger=ledger, repo=repo, run_dir=sup.run_dir,
-            store=store, runner=fake_runner, wait_receipt=wait_receipt, wait_ci_notice=wait_ci_notice,
-        )
-        self.assertEqual(len(outcome), 2)
-        self.assertEqual((outcome[0].task, outcome[0].window, outcome[0].pr_number, outcome[0].attempts, outcome[0].tokens),
-                         ("a", "work1", 901, 6, 3000))
-        self.assertEqual((outcome[1].task, outcome[1].window, outcome[1].pr_number, outcome[1].attempts, outcome[1].tokens),
-                         ("b", "work1", 902, 1, 500))
-        self.assertTrue(all(s["status"] == "busy" for s in busy_snapshots))
-        self.assertEqual(pool.get("work1")["status"], "free")
-        self.assertEqual(store.read("/decisions"), {}, "ceremony must never open a decision card")
-        self.assertEqual(store.read("/plan/tasks/a/status"), "merged")
-        self.assertEqual(store.read("/plan/tasks/b/status"), "merged")
-        ticket_starts = [c for c in commands if c[:2] == ["ticket", "start"]]
-        sb_rebriefs = [c for c in commands if c[:2] == ["sb", "send"]]
-        ci_submits = [c for c in commands if c[:4] == ["illm", "--json", "ci", "submit"]]
-        self.assertEqual(len(ticket_starts), 2)
-        self.assertEqual(len(sb_rebriefs), 5)
-        self.assertTrue(all(c[2] == "work1" for c in sb_rebriefs), "must re-brief the SAME window")
-        self.assertEqual(len(ci_submits), 7)
-        rebrief_text = briefs.brief_path(sup.run_dir, "a", "implement", 5).read_text()
-        self.assertIn("job-4", rebrief_text)
-        self.assertIn("failure on attempt 4", rebrief_text)
-        entries = ledger.entries()
-        self.assertEqual([e["task"] for e in entries], ["a", "b"])
-        self.assertEqual([e["tokens"] for e in entries], [3000, 500])
-
-    def test_13_ceremony_main_runs_end_to_end_with_illm_mailbox_notice(self):
-        import sqlite3
-        from jbi import briefs, ceremony
-        repo = self.tmp / "main_repo"
-        run_dir = self.tmp / "main_run"
-        wt.init_repo(repo)
-        (repo / "README").write_text("base\n")
-        wt.commit_all(repo, "base")
-
-        dag_file = self.tmp / "plan.yaml"
-        dag_file.write_text(
-            'project: "demo"\n'
-            'repo: "./demo"\n'
-            'mode: "existing"\n'
-            'waves: "auto"\n'
-            'tasks:\n'
-            '  - id: "D01"\n'
-            '    title: "Build core"\n'
-            '    goal: "Provide core"\n'
-            '    deps: []\n'
-            '    acceptance: "true"\n'
-            '    owns: ["src/core.py"]\n'
-        )
-        board_db = self.tmp / "board.db"
-        with sqlite3.connect(str(board_db)) as conn:
-            conn.execute("CREATE TABLE sb_messages (id INTEGER PRIMARY KEY, from_slot TEXT, to_slot TEXT, text TEXT)")
-        illm_state = self.tmp / "illm_state"
-        queue_dir = illm_state / "mailboxes" / "main" / "queue"
-        queue_dir.mkdir(parents=True)
-        submit_count = 0
-
-        def fake_runner(argv, cwd):
-            nonlocal submit_count
-            if argv[:2] == ["ticket", "start"] or argv[:2] == ["sb", "send"]:
-                worktree = run_dir / "worktrees" / "D01"
-                (worktree / "src").mkdir(exist_ok=True)
-                (worktree / "src" / "core.py").write_text(f"v = {submit_count + 1}\n")
-                rec_path = briefs.receipt_path(run_dir, "D01", "implement", submit_count)
-                rec_path.parent.mkdir(parents=True, exist_ok=True)
-                rec_path.write_text("BRIEF D01 | uncommitted | PASS\ntokens: 800\n")
-                return subprocess.CompletedProcess(argv, 0, "ok\n", "")
-            if argv[:3] == ["gh", "pr", "list"]:
-                return subprocess.CompletedProcess(argv, 0, "[]", "")
-            if argv[:3] == ["gh", "pr", "create"]:
-                return subprocess.CompletedProcess(argv, 0, "910\n", "")
-            if argv[:4] == ["illm", "--json", "ci", "submit"]:
-                submit_count += 1
-                sha = argv[6]
-                if submit_count == 1:
-                    (queue_dir / "1001-red.json").write_text(json.dumps({
-                        "id": "1001-red",
-                        "from": "ci",
-                        "to": "main",
-                        "type": "failed",
-                        "job": "j-red-1",
-                        "text": "CI red on unit",
-                        "data": {
-                            "schema": "illm.ci.failure.v1",
-                            "job_id": "j-red-1",
-                            "pr_number": 910,
-                            "head_sha": sha,
-                            "verdict": "red",
-                            "failed_gates": ["unit"],
-                            "first_failure_excerpt": "FAIL src/core.spec.py",
-                        },
-                    }))
-                else:
-                    (queue_dir / "1002-green.json").write_text(json.dumps({
-                        "id": "1002-green",
-                        "from": "ci",
-                        "to": "main",
-                        "type": "done",
-                        "job": "j-green-2",
-                        "text": "PR #910 merged",
-                        "data": {
-                            "pr_number": 910,
-                            "head_sha": sha,
-                            "verdict": "merged",
-                            "merge_sha": sha,
-                        },
-                    }))
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "queued"}), "")
-            return subprocess.CompletedProcess(argv, 0, "", "")
-
-        rc = ceremony.main(
-            ["--dag", str(dag_file), "--repo", str(repo), "--run-dir", str(run_dir), "--windows", "work1"],
-            runner=fake_runner,
-            board_db=board_db,
-            illm_state_dir=illm_state,
-        )
-        self.assertEqual(rc, 0)
-        self.assertEqual(submit_count, 2)
-        entries = ceremony.TaskLedger(run_dir / "task_ledger.jsonl").entries()
-        self.assertEqual(len(entries), 1)
-        self.assertEqual((entries[0]["task"], entries[0]["pr_number"], entries[0]["attempts"], entries[0]["tokens"]),
-                         ("D01", 910, 2, 1600))
-        pool = ceremony.WindowPool(run_dir / "window_pool.json")
-        self.assertEqual(pool.get("work1")["status"], "free")
+        self.assertIn("no green verdict", second_brief)
+        self.assertEqual(len(sup.tracking.fleet()["merges"]), 1)
 
     def test_14_cli_resume_reopens_stored_run_and_finishes_remaining_tasks(self):
         from jbi import cli
@@ -1151,7 +1028,9 @@ class ReviewFindings(unittest.TestCase):
         store.close()
 
         args = cli.parse_args(["resume", str(run_dir), "--offline", "--no-tailscale", "--no-menu"])
-        resumed = cli.Run(args, resume_dir=run_dir)
+        fake = FakeCI(repo, self.tmp / "ci-scratch")
+        with mock.patch.object(ci_mod, "CIAdapter", lambda *a, **k: fake.adapter):
+            resumed = cli.Run(args, resume_dir=run_dir)
         self.addCleanup(resumed.close)
         self.addCleanup(lambda: (resumed.runtime.stop("kill"), resumed.stopped.wait(20)))
         self.assertTrue(wait_for(lambda: resumed.store.read("/run/phase") == "complete", 60),

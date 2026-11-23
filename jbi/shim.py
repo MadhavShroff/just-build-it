@@ -67,6 +67,35 @@ def _stored_key_env(provider: str | None) -> dict[str, str]:
         return {}
 
 
+def is_neutral(cmd: object) -> bool:
+    """True when `cmd` starts the neutral claude_mux_lite child."""
+    return isinstance(cmd, list) and len(cmd) == 4 and cmd[1:3] == ["-m", "claude_mux_lite"]
+
+
+def neutral_launch(spec: dict, source: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """The bootstrap argv and environment for a neutral child.
+
+    The inherited environment of the shim supplies the real credentials. The spec never does:
+    a credential name in the spec env is ignored. The bootstrap strips every credential and
+    gives the child a random token instead."""
+    from .agents import BASE_ENV, BASE_PREFIXES, PROVIDER_ENV
+    allowed = set(BASE_ENV) | set(PROVIDER_ENV["claude-mux-lite"])
+    env = {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
+    for name, value in (spec.get("env") or {}).items():
+        if name not in PROVIDER_ENV["claude-mux-lite"]:
+            env[name] = value
+    if not env.get("CLAUDE_MUX_API_KEY"):
+        try:
+            from .providers import KEY_ENV
+            variable = KEY_ENV.get(spec.get("provider") or "")
+        except Exception:
+            variable = None
+        if variable and source.get(variable):
+            env["CLAUDE_MUX_API_KEY"] = source[variable]
+    cmd = spec["cmd"]
+    return [cmd[0], "-m", "claude_mux_lite", "--bootstrap", cmd[3]], env
+
+
 class Groups:
     """Process groups that the runtime started directly (acceptance, lane and bootstrap checks).
 
@@ -236,6 +265,10 @@ class Shim:
         self.spec = spec
         self.status_path = Path(spec["status"])
         self.grace = float(spec.get("grace", DEFAULT_GRACE))
+        self.timeout_sec = float(spec["timeout_sec"]) if spec.get("timeout_sec") else 0.0
+        self.idle_timeout_sec = float(spec["idle_timeout_sec"]) if spec.get("idle_timeout_sec") else 0.0
+        self._started_mono = 0.0
+        self._last_output_mono = 0.0
         self.usage = Usage()
         self.proc: subprocess.Popen | None = None
         self.status: dict = {"shim_pid": os.getpid(), "shim_start": process_start(os.getpid()),
@@ -278,16 +311,25 @@ class Shim:
     def _watch_parent(self) -> None:
         parent = int(self.spec["parent_pid"])
         start = self.spec.get("parent_start")
+        poll = min(POLL_SECONDS, 0.2) if (self.timeout_sec > 0 or self.idle_timeout_sec > 0) else POLL_SECONDS
         while self.proc is not None and self.proc.returncode is None:
             if not alive(parent, start):
                 self.terminate("parent-gone")
                 return
-            time.sleep(POLL_SECONDS)
+            now_m = time.monotonic()
+            if self.timeout_sec > 0 and self._started_mono > 0 and (now_m - self._started_mono) >= self.timeout_sec:
+                self.terminate("timeout")
+                return
+            if self.idle_timeout_sec > 0 and self._last_output_mono > 0 and (now_m - self._last_output_mono) >= self.idle_timeout_sec:
+                self.terminate("idle-timeout")
+                return
+            time.sleep(poll)
 
     def _tee(self, log) -> None:
         assert self.proc and self.proc.stdout
         window_ok = True
         for raw in iter(self.proc.stdout.readline, b""):
+            self._last_output_mono = time.monotonic()
             line = raw.decode("utf-8", "replace")
             log.write(line)
             log.flush()
@@ -317,13 +359,17 @@ class Shim:
     def run(self) -> int:
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(sig, self._on_signal)
-        env = child_env(self.spec.get("provider"), os.environ, self.spec.get("env") or {})
-        env.update(_stored_key_env(self.spec.get("provider")))
+        argv = self.spec["cmd"]
+        if is_neutral(argv):
+            argv, env = neutral_launch(self.spec, dict(os.environ))
+        else:
+            env = child_env(self.spec.get("provider"), os.environ, self.spec.get("env") or {})
+            env.update(_stored_key_env(self.spec.get("provider")))
         log_path = Path(self.spec["log"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as log:
             try:
-                self.proc = subprocess.Popen(self.spec["cmd"], cwd=self.spec["cwd"], env=env,
+                self.proc = subprocess.Popen(argv, cwd=self.spec["cwd"], env=env,
                                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, start_new_session=True)
             except OSError as error:
@@ -331,6 +377,8 @@ class Shim:
                 self.status.update(started=now(), ended=now(), exit_code=127, reason="spawn-failed")
                 write_json(self.status_path, self.status)
                 return 127
+            self._started_mono = time.monotonic()
+            self._last_output_mono = self._started_mono
             self.status.update(pid=self.proc.pid, pgid=self.proc.pid, start=process_start(self.proc.pid),
                                started=now())
             write_json(self.status_path, self.status)

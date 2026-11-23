@@ -74,7 +74,8 @@ def normalise(text: str) -> str:
 
 
 def _owned(raw: str) -> str:
-    return str(raw or "").strip().lstrip("./").rstrip("/")
+    text = str(raw or "").strip()
+    return (text[2:] if text.startswith("./") else text).rstrip("/")
 
 
 def _hashes(repo: Path, base: str, paths: list[str]) -> dict[str, str] | None:

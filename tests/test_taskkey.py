@@ -24,6 +24,7 @@ from jbi import protocol, rigor, taskkey, waves, worktrees as wt
 from jbi.models import Choice
 from jbi.store import Store
 from jbi.supervisor import Supervisor
+from tests.test_runtime import FakeCI
 
 IMPLEMENT = rigor.stage("vibe", "implement")
 MERGE = rigor.stage("vibe", "merge")
@@ -296,7 +297,7 @@ class Run(unittest.TestCase):
         self.repo = self.tmp / "repo"
         wt.init_repo(self.repo)
         (self.repo / "README").write_text("base\n")
-        wt.commit_all(self.repo, "base")
+        self.base = wt.commit_all(self.repo, "base")
         self.runs = 0
 
     def supervisor(self, tasks: list[dict], rigor_name: str = "vibe", share: Path | None = None):
@@ -311,11 +312,16 @@ class Run(unittest.TestCase):
                                        mode="new", target=str(self.repo), max_sessions=1,
                                        lanes=1, tmux="")
         state["config"]["rigor"] = rigor_name
-        state["plan"] = waves.compile_plan(tasks, 1)
+        # Each simulated run uses the same unmanaged base inputs. The fake external
+        # merge changes only its base ref; the cached task object must stay reachable.
+        wt.git(self.repo, "update-ref", "refs/heads/main", self.base)
+        state["plan"] = waves.compile_plan([{**item, "owns": ["data/a.txt"]} for item in tasks], 1)
         store = Store(run_dir / "run.db", state)
         self.addCleanup(store.close)
         hooks = Hooks()
-        sup = Supervisor(store, hooks, run_dir, self.repo, use_tmux=False)
+        service = FakeCI(self.repo, run_dir / "fake-ci")
+        sup = Supervisor(store, hooks, run_dir, self.repo, use_tmux=False, ci_adapter=service.adapter)
+        self.addCleanup(sup.tracking.close)
         self.addCleanup(lambda: (sup.stop("kill"), hooks.stopped_event.wait(20)))
         return sup, store, hooks
 
@@ -340,11 +346,16 @@ class Run(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(status, "merged", f"{tid} did not merge: {store.read('/timeline')}")
         self.assertIn("merge", events, "the task merged without a merge stage record")
-        self.assertTrue(hooks.merged_event.wait(timeout), "all_merged never fired")
+        self.assertTrue(hooks.merged_event.wait(timeout), f"all_merged never fired: {store.read('/plan')}")
 
     def drop_worktree(self, run_dir: Path, tid: str = "a") -> None:
         wt.remove_worktree(self.repo, run_dir / "worktrees" / tid)
-        wt.git(self.repo, "branch", "-D", f"jbi/{tid}", check=False)
+        wt.git(self.repo, "update-ref", "-d", f"refs/heads/jbi/{tid}", check=False)
+        refs = wt.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/heads/jbi-parked/", check=False)
+        matches = [ref for ref in refs.splitlines() if ref.startswith(f"refs/heads/jbi-parked/{tid}-")]
+        self.assertEqual(len(matches), 1, matches)
+        wt.git(self.repo, "update-ref", f"refs/heads/jbi/{tid}", matches[0])
+        wt.git(self.repo, "update-ref", "-d", matches[0])
 
 
 class HitStillGates(Run):
@@ -372,9 +383,12 @@ class HitStillGates(Run):
         # The implement stage read the cache: no agent session ran for it.
         self.assertIsNone(store2.read("/sessions/s-b-implement-1/status"),
                           "a hit still started an implement session")
+        entry = json.loads((warm / taskkey.CACHE_NAME).read_text())
         hits = [row["text"] for row in store2.read("/timeline") or []
                 if row.get("kind") == "task" and "cache hit" in str(row.get("text"))]
-        self.assertTrue(hits, "the hit was not recorded (4.3)")
+        self.assertTrue(hits, f"the first task was {store.read('/plan/tasks/a')}; second={store2.read('/plan/tasks/b')}; base={wt.head(self.repo, 'main')}; cache={entry}")
+        self.assertIsNone(store2.read("/sessions/s-b-implement-1/status"),
+                          "a hit still started an implement session")
         # 4.3: the record names the key and the run it reused.
         entry = json.loads((warm / taskkey.CACHE_NAME).read_text())
         key = next(iter(entry))
@@ -423,8 +437,16 @@ class UnknownInputReruns(Run):
 
         # ARM 2: remove the recorded commit. The key cannot see it, so it means CHANGED.
         implement_commit = next(iter(entry.values()))["commit"]
-        wt.git(self.repo, "reflog", "expire", "--expire=now", "--all", check=False)
-        wt.git(self.repo, "gc", "-q", "--prune=now", check=False)
+        # Clear every ref that still reaches it, in this temporary repository only:
+        # the fixture branches, the fake service refs and the reflogs. Keep main at base.
+        started_head = wt.git(self.repo, "rev-parse", self.base)
+        for ref in wt.git(self.repo, "for-each-ref", "--format=%(refname)").splitlines():
+            if ref != "refs/heads/main":
+                wt.git(self.repo, "update-ref", "-d", ref)
+        wt.git(self.repo, "update-ref", "refs/heads/main", started_head)
+        wt.git(self.repo, "reset", "-q", "--hard", started_head)   # the checkout follows main
+        wt.git(self.repo, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+        wt.git(self.repo, "gc", "-q", "--prune=now")
         self.assertNotEqual(wt.git(self.repo, "cat-file", "-t", implement_commit, check=False),
                             "commit", "the test did not remove the recorded commit")
         hits, sessions = self._run_and_check(warm, "c")

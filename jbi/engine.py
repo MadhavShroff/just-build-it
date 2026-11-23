@@ -39,9 +39,10 @@ class Engine:
             "run.start": self._run_start, "task.override": self._task_override,
             "task.retry": self._task_control, "task.pause": self._task_control,
             "task.resume": self._task_control, "ci.notice": self._ci_notice,
-            "decision.answer": self._decision_answer,
+            "request.answer": self._request_answer,
             "account.set": self._account_set, "account.probe": self._account_probe,
             "architecture.refresh": self._architecture_refresh, "run.stop": self._run_stop,
+            "message.send": self._message_send,
         }
         missing = set(protocol.COMMANDS) - set(self._handlers)
         assert not missing, f"commands without a handler: {missing}"
@@ -279,25 +280,22 @@ class Engine:
         if self.runtime is not None and callable(getattr(self.runtime, "ci_notice", None)):
             self.runtime.ci_notice(tid, notice)
             return
-        if verdict in ("green", "merged"):
-            sha = notice.get("merge_sha") or notice.get("head_sha") or self.store.read(f"/plan/tasks/{tid}/commit")
-            self.store.commit("task.status", Changes().set("plan", "tasks", tid, "status", "merged")
-                              .set("plan", "tasks", tid, "commit", sha), {"task": tid})
-        else:
-            findings = ci_adapter.format_failure_findings(notice)
-            self.store.commit("task.status", Changes().set("plan", "tasks", tid, "findings", findings),
-                              {"task": tid})
+        raise ProtocolError("conflict", "The runtime must verify every merge through ci-conductor.")
 
-    def _decision_answer(self, ctype: str, payload: dict) -> None:
-        decision = self.store.read(f"/decisions/{payload['decision']}")
-        if decision is None or decision.get("status") != "open":
-            raise ProtocolError("conflict", "That decision is not open.", decision=payload["decision"])
-        changes = (Changes().replace("decisions", payload["decision"], "status", "answered")
-                   .set("decisions", payload["decision"], "answer", payload["answer"]))
-        self.store.log("decision", f"Answered: {decision['title']}", extra=changes,
-                       etype="decision.answered", decision=payload["decision"])
-        if decision.get("owner") == "runtime" and self.runtime:
-            self.runtime.answer(payload["decision"], payload["answer"])
+    def _request_answer(self, ctype: str, payload: dict) -> None:
+        request = self.store.read(f"/requests/{payload['request']}")
+        if request is None or request.get("status") != "open":
+            raise ProtocolError("conflict", "That request is not open.", request=payload["request"])
+        changes = (Changes().replace("requests", payload["request"], "status", "answered")
+                   .set("requests", payload["request"], "answer", payload["answer"]))
+        self.store.log("request", f"Answered: {request['title']}", extra=changes,
+                       etype="request.answered", request=payload["request"])
+        if request.get("owner") == "runtime" and self.runtime:
+            self.runtime.answer(payload["request"], payload["answer"])
+
+    def _message_send(self, ctype: str, payload: dict) -> None:
+        self._require_runtime().send_message(payload["target"], payload["text"],
+                                             bool(payload.get("all_sessions", False)))
 
     # ---- accounts ----------------------------------------------------------------------
 

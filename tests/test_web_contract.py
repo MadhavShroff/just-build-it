@@ -164,6 +164,7 @@ class TestWebContract(unittest.TestCase):
         self.assertIn("Tasks completed per day", metrics_js)
         self.assertIn("Tokens per task, average", metrics_js)
         self.assertIn("Time per task, average", metrics_js)
+        self.assertIn("cache?.hit_rate == null ? 'unavailable'", metrics_js)
         self.assertNotIn("send(", metrics_js, "metrics.js must not invoke any LLM or write command")
 
     @unittest.skipIf(shutil.which("node") is None, "node is not installed")

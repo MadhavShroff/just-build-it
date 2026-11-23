@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .just-build-it/
+.jbi-receipts/
+.jbi-plans/
 *.db
 *.db-wal
 *.db-shm

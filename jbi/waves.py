@@ -9,6 +9,8 @@ as its own dependencies are merged (`ready_tasks`).
 from __future__ import annotations
 
 import fnmatch
+import shutil
+from pathlib import Path
 from typing import Any, Iterable
 
 from . import rigor
@@ -49,7 +51,7 @@ def normalize(task: dict) -> dict:
         "wave": 0, "status": "blocked", "stage": None, "attempts": 0,
         # A DAG node's routing override must survive compilation. The supervisor
         # reads the compiled plan, so an override dropped here is an override the
-        # runtime never sees: a pinned node would run on the cascade instead.
+        # runtime never sees: a pinned node would run on the account preference instead.
         "override": dict(task.get("override") or {}),
         "branch": f"jbi/{task['id']}", "commit": None, "receipt": None,
     }
@@ -195,9 +197,9 @@ def _segments_overlap(a: str, b: str) -> bool:
     if not _has_glob(b):
         return fnmatch.fnmatchcase(b, a)
     if "[" not in a and "[" not in b and "?" not in a and "?" not in b:
-        pa, sa = a.split("*", 1)[0], a.rsplit("*", 1)[-1]
-        pb, sb = b.split("*", 1)[0], b.rsplit("*", 1)[-1]
-        return (pa.startswith(pb) or pb.startswith(pa)) and (sa.endswith(sb) or sb.endswith(sa))
+        pa, tail_a = a.split("*", 1)[0], a.rsplit("*", 1)[-1]
+        pb, tail_b = b.split("*", 1)[0], b.rsplit("*", 1)[-1]
+        return (pa.startswith(pb) or pb.startswith(pa)) and (tail_a.endswith(tail_b) or tail_b.endswith(tail_a))
     return True
 
 
@@ -270,6 +272,109 @@ def owns_conflict(plan: dict, tid: str, running: Iterable[str]) -> str | None:
         if other != tid and _owns_overlap(mine, plan["tasks"][other].get("owns") or []):
             return other
     return None
+
+
+def detect_wave_owns_conflicts(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return every pair of parallel tasks in the same wave whose `owns` paths overlap."""
+    tasks = plan.get("tasks") or {}
+    conflicts: list[dict[str, Any]] = []
+    for wave_num, wave_ids in enumerate(plan.get("waves") or (), start=1):
+        valid = [tid for tid in wave_ids if tid in tasks]
+        for i, a in enumerate(valid):
+            owns_a = tasks[a].get("owns") or ()
+            for b in valid[i + 1:]:
+                owns_b = tasks[b].get("owns") or ()
+                if _owns_overlap(owns_a, owns_b):
+                    conflicts.append({"wave": wave_num, "task_a": a, "task_b": b})
+    return conflicts
+
+
+def prioritize_ready(plan: dict[str, Any], ready_ids: Iterable[str] | None = None,
+                     config: dict[str, Any] | None = None) -> list[str]:
+    """Order ready tasks by finish-first boost, critical path, downstream fan-out, then plan order."""
+    tasks = plan.get("tasks") or {}
+    order = plan.get("order") or list(tasks)
+    index_map = {tid: idx for idx, tid in enumerate(order)}
+    candidates = list(ready_tasks(plan) if ready_ids is None else ready_ids)
+    if len(candidates) <= 1:
+        return candidates
+    cp = set(critical_path(plan, config=config).get("path") or ())
+    fanout: dict[str, int] = {tid: 0 for tid in tasks}
+    for tid, task in tasks.items():
+        if task.get("status") in (DONE, "skipped"):
+            continue
+        for dep in task.get("deps") or ():
+            if dep in fanout:
+                fanout[dep] += 1
+
+    def sort_key(tid: str) -> tuple[int, int, int, int]:
+        task = tasks.get(tid) or {}
+        finish_boost = 0 if int(task.get("attempts") or 0) > 0 else 1
+        on_cp = 0 if tid in cp else 1
+        return (finish_boost, on_cp, -fanout.get(tid, 0), index_map.get(tid, 0))
+
+    ranked = sorted(candidates, key=sort_key)
+    grouped: dict[str, list[str]] = {}
+    for tid in ranked:
+        node = str((tasks.get(tid) or {}).get("node") or tid)
+        grouped.setdefault(node, []).append(tid)
+    # A task that is ready later joins its node without displacing an earlier, independent node.
+    return [tid for group in grouped.values() for tid in group]
+
+
+def wave_preflight(plan: dict[str, Any], wave_number: int, *,
+                   open_requests: Iterable[dict[str, Any]] = (),
+                   repo: Path | None = None, base_branch: str | None = None,
+                   required_tools: Iterable[str] = ()) -> dict[str, Any]:
+    """Deterministic Wave Preflight Gate before starting Wave `wave_number`.
+
+    `open_requests` is the one open-request parameter: a list of dicts with
+    `id`, `status`, `task` or `node`, `blocking`, `urgency` and `title`.
+    """
+    tasks = plan.get("tasks") or {}
+    raw_waves = plan.get("waves") or []
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if wave_number < 1 or wave_number > len(raw_waves):
+        blockers.append(f"wave {wave_number} does not exist (plan has {len(raw_waves)} wave(s))")
+        return {"ok": False, "wave": wave_number, "blockers": blockers, "warnings": warnings}
+
+    wave_ids = [tid for tid in raw_waves[wave_number - 1] if tid in tasks]
+    wave_set = set(wave_ids)
+    wave_nodes = {str(tasks[tid].get("node") or tid) for tid in wave_ids}
+
+    for tid in wave_ids:
+        for dep in tasks[tid].get("deps") or ():
+            if dep not in wave_set and dep in tasks and tasks[dep].get("status") != DONE:
+                blockers.append(f"task {tid} depends on unmerged upstream task {dep} ({tasks[dep].get('status')})")
+
+    for request in open_requests:
+        if not isinstance(request, dict):
+            continue
+        status = str(request.get("status") or "open").lower()
+        if status in ("resolved", "closed", "dismissed", "answered"):
+            continue
+        target = str(request.get("task") or request.get("node") or "")
+        blocking = bool(request.get("blocking")) or str(request.get("urgency") or "").lower() == "blocker"
+        if blocking or (target and (target in wave_set or target in wave_nodes)):
+            did = request.get("id") or "unknown"
+            title = str(request.get("title") or "")[:80]
+            blockers.append(f"open request {did} blocks wave {wave_number}: {title}")
+
+    for conflict in detect_wave_owns_conflicts(plan):
+        if conflict["wave"] == wave_number:
+            warnings.append(f"overlapping owns in wave {wave_number}: {conflict['task_a']} and {conflict['task_b']}")
+
+    if repo is not None and base_branch:
+        from . import worktrees as wt
+        if wt.head(Path(repo), base_branch) is None:
+            blockers.append(f"base branch {base_branch!r} has no commit in {repo}")
+
+    for tool in required_tools:
+        if isinstance(tool, str) and tool.strip() and shutil.which(tool.strip()) is None:
+            blockers.append(f"required tool {tool.strip()!r} is missing from PATH")
+
+    return {"ok": not blockers, "wave": wave_number, "blockers": blockers, "warnings": warnings}
 
 
 def _stage_wall_seconds(stage: rigor.Stage) -> int:

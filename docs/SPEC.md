@@ -112,7 +112,7 @@ Stage meanings:
 - **security scan / audit**: an agent checks the diff for injection, secrets, authentication, and unsafe patterns. The audit also checks dependencies.
 - **train merge**: a CI lane tests the combined tree on a pinned base and squash-merges a verified head.
 
-A FAIL in any stage sends the task back to `implement` with the findings. After two FAILs the next attempt uses the next larger model tier. After four FAILs the task opens a decision for the user.
+A FAIL in any stage sends the task back to `implement` with the findings. After two FAILs the next attempt uses the next larger model tier. After four FAILs the task opens a request for the user.
 
 ## 8. Model profiles
 
@@ -149,7 +149,7 @@ The compiler computes waves as Kahn topological levels in plan order.
 A cycle is refused with its path named, for example `a -> b -> c -> a`.
 A wave is a display group only. A task starts when its own dependencies are merged. It never waits for its wave.
 
-Task status values: `blocked`, `ready`, `running`, `verifying`, `queued`, `merging`, `merged`, `failed`, `paused`, `decision`, `skipped`.
+Task status values: `blocked`, `ready`, `running`, `verifying`, `queued`, `merging`, `merged`, `failed`, `paused`, `request`, `skipped`, `waiting-model`.
 A skipped task never counts as merged. Its dependents stay `blocked` and show the reason.
 
 ## 10. Execution
@@ -223,6 +223,8 @@ Telemetry is local only. It lives in the run database.
 - `GET /api/v1/state` returns `{protocol, seq, state}`.
 - `GET /api/v1/events?after=<seq>` is a Server-Sent Events stream. Each event carries JSON Patch operations (RFC 6902) on the state document.
 - `POST /api/v1/commands` takes `{id, type, payload}` and returns `202 {accepted, seq}` or an error object.
+- `GET /api/v1/fleet` returns `{protocol, fleet}`. `fleet` lists sessions, tasks, dispatches, leases, ci_submissions, merges, messages, and costs.
+- `message.send` with `{target, text, all_sessions}` sends one message. `request.answer` with `{request, answer}` answers an open request.
 - `GET /api/v1/schema` returns the command and event catalog, so a machine client can discover the contract.
 - The CLI uses the same HTTP contract as the browser. There is no second channel.
 
@@ -281,3 +283,13 @@ skills/                  agent skills installed into each worktree
 tests/                   unittest suites
 docs/                    SPEC, PROTOCOL, WORKFLOW
 ```
+
+## 18. Standalone runtime
+
+`SPEC.md` at the repository root is the standalone specification, and `docs/STANDALONE-DESIGN.md` defines its contracts. This section states only the API-facing parts.
+
+- All agent execution uses the neutral `claude-mux-lite` process.
+- The CI transport runs `ci-conductor ready PR --head SHA` directly, with no indirect wrapper.
+- A new task starts a fresh history. A correction continues only the history of the same task.
+- The cache rate is `read / (read + write + uncached_input)`. The rate is null when the denominator is zero.
+- The installer checks only internal filesystem conventions under `JBI_HOME`.

@@ -1,4 +1,4 @@
-/* The main board: summary, DAG, architecture, sessions, lanes, decisions, timeline, task drawer. */
+/* The main board: summary, DAG, architecture, sessions, lanes, requests, timeline, task drawer. */
 
 .phase-board { padding-top: var(--space-6); }
 .phase-board > * { max-width: 1480px; margin-left: auto; margin-right: auto; }
@@ -196,7 +196,7 @@ body[data-phase="complete"] .progress span { background: var(--green); }
 
 /* ---- side cards -------------------------------------------------------------------- */
 
-.lanes, .decisions { display: grid; gap: var(--space-3); }
+.lanes, .requests { display: grid; gap: var(--space-3); }
 .lane { padding: 12px; border-radius: 12px; background: var(--surface-2); box-shadow: var(--shadow-card); display: grid; gap: 6px; }
 .lane-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .lane-name { font-size: var(--text-xs); font-weight: 650; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; flex: none; }
@@ -212,16 +212,16 @@ body[data-phase="complete"] .progress span { background: var(--green); }
 .check[data-status="failed"] i { background: var(--red); }
 .lane-detail { font-size: var(--text-xs); }
 
-.decisions-count.is-alert { color: var(--amber); font-weight: 650; }
-.decision { padding: 14px; border-radius: 12px; background: var(--surface-2); box-shadow: var(--shadow-card); display: grid; gap: 8px; }
-.decision[data-status="open"] { background: linear-gradient(180deg, var(--amber-soft), transparent 80%), var(--surface-2); box-shadow: 0 0 0 1px color-mix(in srgb, var(--amber) 30%, transparent), var(--shadow-card); }
-.decision-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--text-xs); }
-.decision-title { font-size: var(--text-md); }
-.decision-body { font-size: var(--text-sm); }
-.decision-options { display: flex; flex-wrap: wrap; gap: 6px; }
-.decision-option { white-space: normal; height: auto; min-height: 28px; padding: 5px 10px; text-align: left; }
-.decision-free .input { height: 30px; font-size: var(--text-sm); }
-.decision-answer { font-size: var(--text-sm); color: var(--green); display: flex; align-items: center; gap: 4px; }
+.requests-count.is-alert { color: var(--amber); font-weight: 650; }
+.request { padding: 14px; border-radius: 12px; background: var(--surface-2); box-shadow: var(--shadow-card); display: grid; gap: 8px; }
+.request[data-status="open"] { background: linear-gradient(180deg, var(--amber-soft), transparent 80%), var(--surface-2); box-shadow: 0 0 0 1px color-mix(in srgb, var(--amber) 30%, transparent), var(--shadow-card); }
+.request-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--text-xs); }
+.request-title { font-size: var(--text-md); }
+.request-body { font-size: var(--text-sm); }
+.request-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.request-option { white-space: normal; height: auto; min-height: 28px; padding: 5px 10px; text-align: left; }
+.request-free .input { height: 30px; font-size: var(--text-sm); }
+.request-answer { font-size: var(--text-sm); color: var(--green); display: flex; align-items: center; gap: 4px; }
 
 .timeline-card { padding-bottom: var(--space-3); }
 .timeline { list-style: none; margin: 0; padding: 0 0 0 4px; max-height: 420px; overflow-y: auto; position: relative; }
@@ -232,7 +232,7 @@ body[data-phase="complete"] .progress span { background: var(--green); }
 .tl-dot { position: relative; z-index: 1; width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); box-shadow: 0 0 0 3px var(--surface); align-self: start; margin-top: 6px; }
 .tl-task .tl-dot, .tl-stage .tl-dot { background: var(--blue); }
 .tl-lane .tl-dot { background: var(--violet); }
-.tl-decision .tl-dot { background: var(--amber); }
+.tl-request .tl-dot { background: var(--amber); }
 .tl-error .tl-dot { background: var(--red); }
 .tl-phase .tl-dot, .tl-wave .tl-dot { background: var(--green); }
 .tl-text { color: var(--text); line-height: 1.4; overflow-wrap: anywhere; }

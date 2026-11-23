@@ -79,7 +79,7 @@ function body(ctx, state, task) {
     task.receipt ? h('section', null, h('div', { class: 'drawer-section-title', text: 'Receipt' }), h('pre', { class: 'code-block receipt', text: typeof task.receipt === 'string' ? task.receipt : JSON.stringify(task.receipt, null, 2) })) : null,
     h('section', null, h('div', { class: 'drawer-section-title', text: 'Control' }),
       h('div', { class: 'row-wrap' },
-        control('task.retry', 'Retry', 'retry', ['failed', 'paused', 'decision'].includes(task.status)),
+        control('task.retry', 'Retry', 'retry', ['failed', 'paused', 'request'].includes(task.status)),
         control('task.pause', 'Pause', 'pause', ['running', 'verifying', 'queued', 'ready', 'blocked'].includes(task.status)),
         control('task.resume', 'Resume', 'play', task.status === 'paused')),
       controlSlot));

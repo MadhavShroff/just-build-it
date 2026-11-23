@@ -17,7 +17,7 @@ from .protocol import TASK_ID, ProtocolError
 DETAIL_RULES = {
     "user": "The user gives the details. Ask very little. Summarise what you understood in two or three lines.",
     "guided": "Ask one to three focused questions about the most important unknowns. Summarise first, in one line.",
-    "delegate": "Decide the open choices yourself. State each decision in one line. Ask at most one question.",
+    "delegate": "Decide open choices yourself. State each choice in one line. Ask at most one question.",
 }
 CHAT_SYSTEM = (
     "You are the planning chat of a tool that turns an idea into working software. "

@@ -21,6 +21,7 @@ BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TZ", "T
             "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMUX_TMPDIR")
 BASE_PREFIXES = ("LC_",)
 PROVIDER_ENV: dict[str, tuple[str, ...]] = {
+    "claude-mux-lite": ("CLAUDE_MUX_BASE_URL", "CLAUDE_MUX_API_KEY", "CLAUDE_MUX_HEADERS"),
     "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR"),
     "codex": ("OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"),
     "agy": ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"),
@@ -41,6 +42,7 @@ class AgentJob:
     receipt: Path
     attempt: int = 0
     owns: tuple[str, ...] = ()
+    spec_path: Path | None = None
 
 
 def prompt(job: AgentJob) -> str:
@@ -51,14 +53,10 @@ def prompt(job: AgentJob) -> str:
 def command(job: AgentJob) -> list[str]:
     """The argument list that starts the agent for `job`."""
     text = prompt(job)
-    if job.provider == "claude":
-        return ["claude", "-p", "--model", job.model, "--permission-mode", "acceptEdits",
-                "--output-format", "stream-json", "--verbose", text]
-    if job.provider == "codex":
-        return ["codex", "exec", "-m", job.model, "--json", "--skip-git-repo-check",
-                "-s", "workspace-write", text]
-    if job.provider == "agy":
-        return ["agy", "-p", "--model", job.model, "--output-format", "stream-json", text]
+    if job.provider != "simulator":
+        if job.spec_path is None:
+            raise ValueError("a neutral agent job needs its spec path")
+        return [sys.executable, "-m", "claude_mux_lite", str(job.spec_path)]
     if job.provider == "simulator":
         argv = [sys.executable, "-m", "jbi.simulator", "--task", job.task, "--role", job.role,
                 "--cwd", str(job.cwd), "--receipt", str(job.receipt), "--attempt", str(job.attempt)]
@@ -94,21 +92,31 @@ class Usage:
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_usd: float | None = None
+    cache_read: int | None = None
+    cache_write: int | None = None
     _seen: bool = field(default=False, repr=False)
 
-    def add(self, tokens_in: int | None, tokens_out: int | None, cost: float | None) -> None:
+    def add(self, tokens_in: int | None, tokens_out: int | None, cost: float | None,
+            cache_read: int | None = None, cache_write: int | None = None) -> None:
         if tokens_in is not None:
             self.tokens_in = (self.tokens_in or 0) + tokens_in
         if tokens_out is not None:
             self.tokens_out = (self.tokens_out or 0) + tokens_out
         if cost is not None:
             self.cost_usd = (self.cost_usd or 0.0) + cost
+        for name, new in (("cache_read", cache_read), ("cache_write", cache_write)):
+            old = getattr(self, name)
+            if new is not None:
+                setattr(self, name, (old or 0) + new)
         self._seen = True
 
     def as_dict(self) -> dict | None:
         if not self._seen:
             return None
-        return {"tokens_in": self.tokens_in, "tokens_out": self.tokens_out, "cost_usd": self.cost_usd}
+        self.cache_read = self.cache_read if isinstance(self.cache_read, int) else None
+        self.cache_write = self.cache_write if isinstance(self.cache_write, int) else None
+        return {"tokens_in": self.tokens_in, "tokens_out": self.tokens_out, "cost_usd": self.cost_usd,
+                "cache_read": self.cache_read, "cache_write": self.cache_write}
 
 
 def _int(value: object) -> int | None:
@@ -138,7 +146,8 @@ def parse_usage(provider: str, line: str, usage: Usage) -> None:
         if isinstance(data, dict):
             cost = event.get("total_cost_usd")
             usage.add(_sum(data, "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"),
-                      _sum(data, "output_tokens"), cost if isinstance(cost, (int, float)) else None)
+                      _sum(data, "output_tokens"), cost if isinstance(cost, (int, float)) else None,
+                      _int(data.get("cache_read_input_tokens")), _int(data.get("cache_creation_input_tokens")))
     elif provider == "codex" and kind == "turn.completed":
         data = event.get("usage") or {}
         if isinstance(data, dict):

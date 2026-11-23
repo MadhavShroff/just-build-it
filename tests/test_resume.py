@@ -19,6 +19,7 @@ from pathlib import Path
 
 from jbi import cli, protocol, resume, waves, worktrees as wt
 from jbi.store import Store
+from jbi.tracking import Tracking
 
 HAS_TMUX = shutil.which("tmux") is not None
 
@@ -188,6 +189,48 @@ class WorktreeReclaim(unittest.TestCase):
         self.assertEqual(report.worktrees_removed, [], report.as_dict())
         self.assertTrue(wt_path.exists())
 
+
+    def _lease(self, task, *, commit=True):
+        base = wt.head(self.repo, "main")
+        wt_path = wt.create_worktree(self.repo, task, "main", self.run_dir / "worktrees")
+        if commit:
+            (wt_path / "foo").write_text("hello\n")
+            wt.commit_all(wt_path, f"{task} work")
+        tracking = Tracking(self.run_dir / "fleet.db")
+        self.addCleanup(tracking.close)
+        tracking.create_task(title=task, owns=["foo"], branch=f"jbi/{task}",
+                             worktree=wt_path, base_commit=base, task_id=task)
+        tracking.dispatch(task, session_id=f"s-{task}", owns=["foo"], branch=f"jbi/{task}",
+                          worktree=wt_path)
+        return tracking, wt_path, base
+
+    def test_live_lease_worktree_is_kept_when_clean_and_committed(self):
+        _, wt_path, _ = self._lease("l1")
+        report = resume.orphaned("t-resume-wt4", self.run_dir, target_repo=self.repo)
+        self.assertEqual(report.worktrees_removed, [], report.as_dict())
+        self.assertTrue(wt_path.exists())
+        self.assertTrue(any(e["reason"] == "live lease for task l1"
+                            for e in report.worktrees_kept), report.as_dict())
+
+    def test_released_parked_worktree_is_kept(self):
+        tracking, wt_path, base = self._lease("l2", commit=False)
+        # Nothing committed: the branch stays at base, so release parks cleanly.
+        tracking.release("l2", reason="abandoned", abandon=True, repository=self.repo)
+        self.assertEqual(wt.head(wt_path, "HEAD"), base)
+        report = resume.orphaned("t-resume-wt5", self.run_dir, target_repo=self.repo)
+        self.assertEqual(report.worktrees_removed, [], report.as_dict())
+        self.assertTrue(wt_path.exists())
+        self.assertTrue(any(e["reason"] == "parked lease for task l2"
+                            for e in report.worktrees_kept), report.as_dict())
+
+    def test_lease_with_foreign_path_does_not_protect_other_tree(self):
+        tracking, wt_path, _ = self._lease("l3")
+        other = wt.create_worktree(self.repo, "l4", "main", self.run_dir / "worktrees")
+        (other / "bar").write_text("x\n")
+        wt.commit_all(other, "l4 work")
+        report = resume.orphaned("t-resume-wt6", self.run_dir, target_repo=self.repo)
+        self.assertTrue(wt_path.exists())
+        self.assertFalse(other.exists(), report.as_dict())
 
 class GateReclaim(unittest.TestCase):
     """2.4 — stop a GATE job only through gatectl stop."""

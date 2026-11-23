@@ -5,7 +5,7 @@ Subcommands:
   - `add-task`      Add a task or node and validate the resulting DAG.
   - `add-dep`       Add a dependency edge between two tasks and validate.
   - `remove-task`   Remove a task (and clean explicit wave groups) and validate.
-  - `set-wave`      Assign tasks to a 1-based explicit wave group and validate.
+  - `set-wave`      Place tasks to a 1-based explicit wave group and validate.
   - `add-subtask`   Add a subtask/batch under a parent node and validate expansion.
   - `list-subtasks` List subtasks/batches defined on one or all nodes.
   - `validate`      Validate a DAG file and report wave count and task count.
@@ -433,7 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rem.add_argument("--prune-deps", action="store_true")
     p_rem.set_defaults(func=cmd_remove_task)
 
-    p_wave = sub.add_parser("set-wave", help="Assign tasks to an explicit 1-based wave")
+    p_wave = sub.add_parser("set-wave", help="Place tasks to an explicit 1-based wave")
     p_wave.add_argument("file")
     p_wave.add_argument("--wave", type=int, required=True)
     p_wave.add_argument("--tasks", action="append", required=True)
