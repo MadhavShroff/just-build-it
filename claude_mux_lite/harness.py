@@ -502,8 +502,8 @@ class BashGuard:
             if xy != "!!" or not rel.endswith("/") or not any(item.startswith(rel) for item in self.baseline):
                 continue
             rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", rel)
-            if rc != 0 or raw.count(b"\0") > 10000:
-                continue
+            if rc != 0:
+                raise GuardError("ignored baseline discovery failed")
             for item in raw.split(b"\0"):
                 child = item.decode("utf-8", "surrogateescape") if item else ""
                 if child != rel:
@@ -537,8 +537,8 @@ class BashGuard:
         for directory in directories:
             # Enumerate real ignored leaves, not the aggregate directory status.
             rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", directory)
-            if rc != 0 or raw.count(b"\0") > 10000:
-                continue
+            if rc != 0:
+                raise GuardError("ignored baseline discovery failed")
             for item in raw.split(b"\0"):
                 if item:
                     child = item.decode("utf-8", "surrogateescape")
@@ -586,9 +586,10 @@ class BashGuard:
             safe = re.sub(r'(?<!\\)\$TMPDIR(?:/[\w.-]+)*', "", word)
             if "$" in safe:
                 return "expanded shell commands and command options are refused"
+        if any(os.path.basename(word) in WRAPPERS for word in words):
+            return "command wrappers are refused"
         i = 0
-        while i < len(words) and (("=" in words[i] and not words[i].startswith("-")) or words[i] in WRAPPERS
-                                  or words[i].startswith("-") or words[i].isdigit()):
+        while i < len(words) and "=" in words[i] and not words[i].startswith("-"):
             i += 1
         if i >= len(words):
             return None
@@ -612,12 +613,23 @@ class BashGuard:
             if any(argument in ("-c", "--config-env") or argument.startswith(("-c", "--config-env="))
                    for argument in args):
                 return "Git configuration is reserved for the runtime"
-            gargs = [a for a in args if not a.startswith("-")]
-            verb = next((i for i, a in enumerate(args) if not a.startswith("-")
-                         and (i == 0 or args[i - 1] not in ("-C", "--git-dir", "--work-tree", "--exec-path", "-c"))), None)
-            if any(a in ("--exec-path", "--work-tree", "--git-dir", "-C") for a in args):
+            forbidden = ("--exec-path", "--work-tree", "--git-dir", "-C",
+                         "--exec-path=", "--work-tree=", "--git-dir=")
+            if any(arg in ("--namespace", "--super-prefix") or arg.startswith(("--namespace=", "--super-prefix="))
+                   for arg in args):
+                return "Git repository selection is reserved for the runtime"
+            if not args or any(a == flag or (flag.endswith("=") and a.startswith(flag))
+                               for flag in forbidden for a in args):
                 return "Git directory and execution options are reserved for the runtime"
+            verb = 0
+            while verb < len(args) and args[verb].startswith("-"):
+                if args[verb] not in ("--no-pager", "-p"):
+                    return "Git global options are confined to the runtime"
+                verb += 1
+            if verb >= len(args):
+                return "a Git subcommand is required"
             subcommand = args[verb] if verb is not None else ""
+            gargs = [a for a in args[verb:] if not a.startswith("-")]
             read_commands = {"add", "commit", "diff", "log", "show", "status", "ls-files", "rev-list",
                              "rev-parse", "cat-file", "checkout", "grep", "rm", "blame",
                              "describe", "shortlog", "show-ref", "for-each-ref", "branch", "reset", "clean"}
@@ -625,7 +637,7 @@ class BashGuard:
                 return "git clean is refused because deletion is not recoverable by the task transaction"
             if subcommand not in read_commands:
                 return f"git {subcommand or '<unspecified>'} is confined to the private task index"
-            if subcommand == "branch" and (not gargs or len(gargs) > 1 or any(a.startswith("-") for a in args)):
+            if subcommand == "branch" and (not gargs or len(gargs) > 1 or any(a.startswith("-") for a in args[verb + 1:])):
                 return "git branch mutations are confined to the runtime"
             if subcommand in ("commit", "rm") and not self.allow_commits:
                 return "this task does not allow shell Git mutations"
@@ -638,11 +650,11 @@ class BashGuard:
                 return "a shell cannot create or detach a leased branch"
             if any(a in ("--global", "--system", "--file", "-f") for a in args if subcommand == "config"):
                 return "only local leased config is permitted"
-            if subcommand == "reset" and any(a not in ("HEAD", "--") for a in args[1:]):
+            if subcommand == "reset" and any(a not in ("HEAD", "--") for a in args[verb + 1:]):
                 return "a shell reset may restore only HEAD paths"
             if subcommand == "checkout" and any(
                     (a.startswith("-") or re.fullmatch(r"[0-9a-fA-F]{4,64}", a))
-                    and a not in ("HEAD", "--") for a in args[1:]):
+                    and a not in ("HEAD", "--") for a in args[verb + 1:]):
                 return "a shell checkout may restore only current HEAD paths"
             if subcommand in ("add", "rm", "checkout", "reset") and "--" in args:
                 for path in args[args.index("--") + 1:]:
@@ -679,18 +691,34 @@ class BashGuard:
                     bad = self._bad_path(arg)
                 if bad:
                     return f"{cmd} argument refused: {bad}"
+        if cmd in ("bash", "sh", "zsh"):
+            positionals = [a for a in args if not a.startswith("-")]
+            command_flag = next((a for a in args if a == "-c" or re.fullmatch(r"-[A-Za-z]*c", a)), None)
+            if command_flag is not None:
+                after = args[args.index(command_flag) + 1:]
+                if len(after) != 1 or after[0].startswith("-"):
+                    return "a shell command string needs exactly one checked word"
+                return self.check(after[0])
+            if not positionals:
+                return "a bare shell interpreter may read unchecked input"
+            if len(positionals) > 1:
+                return "a shell script may take no positional arguments"
+            script = self._safe(positionals[0])
+            if script is None or not script.is_file():
+                return "shell script cannot be read safely"
+            return self.check(script.read_text(encoding="utf-8", errors="replace"))
         if cmd.startswith("python") or cmd in INTERPRETERS:
-            for arg in args:
-                if arg.startswith("-") and len(arg) < 4:
-                    continue
-                if ABS_IN_CODE.search(arg):
-                    for m in ABS_IN_CODE.finditer(arg):
-                        if not inside(self.root, Path(os.path.realpath(m.group(0)))):
-                            return f"{cmd} code names a path outside the workspace: {m.group(0)}"
-                if DOTDOT_IN_CODE.search(arg):
-                    return f"{cmd} code uses parent traversal"
-            if cmd in ("bash", "sh", "zsh") and "-c" in args and args.index("-c") + 1 < len(args):
-                return self.check(args[args.index("-c") + 1])
+            if any(a == "-c" or re.fullmatch(r"-[A-Za-z]*[cer]", a) for a in args):
+                return "interpreter inline code cannot be checked"
+            module_flag = next((a for a in args if a == "-m"), None)
+            if module_flag is not None:
+                after = args[args.index(module_flag) + 1:]
+                if len(after) != 1 or not re.fullmatch(r"[A-Za-z_][\w.]*", after[0]):
+                    return "an interpreter module must be one plain identifier"
+                return None
+            if any(not a.startswith("-") for a in args):
+                return "interpreter script files cannot be checked; use shell commands"
+            return None
         return None
 
     def check(self, command: str) -> str | None:
@@ -698,7 +726,9 @@ class BashGuard:
         if STASH.search(command):
             return "git stash is refused"
         try:
-            text = _plain_newlines(_strip_heredocs(command))
+            if re.search(r"<<-?\s*['\"]?", command):
+                return "shell heredocs are refused"
+            text = _plain_newlines(command)
             lex = shlex.shlex(text, posix=True, punctuation_chars=True)
             lex.whitespace_split = True
             tokens = list(lex)
@@ -767,13 +797,20 @@ class BashGuard:
                     full.unlink()
                     return True
                 if rel.endswith("/") and full.is_dir():
-                    # Directory mtimes are not file identities. Inspect new leaves only.
+                    base = rel.rstrip("/")
+                    protected = any(pattern == base or pattern.startswith(base + "/")
+                                    for pattern in self.owns)
+                    if protected:
+                        return False
                     if self.baseline and any(name.startswith(rel) for name in self.baseline):
-                        for child in sorted(full.iterdir(), key=lambda p: p.name, reverse=True):
+                        for child in full.iterdir():
                             rel_child = child.relative_to(self.root).as_posix()
-                            reserved = any(name == rel_child or name.startswith(rel_child + "/") or self.owned(name)
-                                           for name in self.baseline)
-                            if not self.owned(rel_child) and not reserved:
+                            reserved = any(name == rel_child or name.startswith(rel_child + "/")
+                                           or self.owned(name) for name in self.baseline)
+                            leased = (self.owned(rel_child)
+                                      or any(pattern == rel_child or pattern.startswith(rel_child + "/")
+                                             for pattern in self.owns))
+                            if not leased and not reserved:
                                 if child.is_dir() and not child.is_symlink():
                                     shutil.rmtree(child)
                                 else:
@@ -821,6 +858,12 @@ class BashGuard:
         for xy, path, orig in entries:
             for rel, is_orig in ((path, False), (orig, True)):
                 if not rel or self.owned(rel):
+                    continue
+                if rel.endswith("/") and (any(name.startswith(rel) for name in self.baseline)
+                                          or any(p == rel.rstrip("/") or p.startswith(rel.rstrip("/") + "/")
+                                                 for p in self.owns)):
+                    # An aggregate ignored-directory entry changes signature when any
+                    # leaf appears. Its leaves and owned descendants are judged alone.
                     continue
                 known = self.baseline.get(rel)
                 if known == (xy, self._signature(rel)):

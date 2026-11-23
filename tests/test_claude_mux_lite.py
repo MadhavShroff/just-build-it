@@ -391,6 +391,88 @@ class NeonFenceRegressions(GitFence):
             with self.subTest(command=command):
                 self.assertIsNotNone(guard.check(command))
 
+    def test_fifth_review_global_options_wrappers_and_heredocs_are_refused(self):
+        guard = self.guarded()
+        commands = (
+            "git --namespace status clean -fdx --", "git --namespace=status stash",
+            "env -u FOO g''it st''ash", "timeout 5s git stash", "xargs -I X git stash",
+            "bash <<'EOF'\ngit clean -fdx\nEOF", "bash <<'EOF'\ng''it st''ash\nEOF",
+            "git --git-dir=./fake status", "git --exec-path=./fake status",
+            "git status --namespace clean -fdx --",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.check(command))
+        for command in ("git --no-pager status", "git status", "git commit -qm allowed"):
+            self.assertIsNone(guard.check(command), command)
+
+    def test_global_option_driver_keeps_unowned_and_ignored_files(self):
+        ignored = self.work / "build"
+        ignored.mkdir()
+        (ignored / "keep.txt").write_text("keep\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / ".gitignore").write_text("build/\n")
+        done = self.shell_owned("git --namespace status clean -fdx --")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
+        self.assertEqual((ignored / "keep.txt").read_text(), "keep\n")
+
+    def test_wrapper_quoted_stash_preserves_owned_working_edits(self):
+        (self.work / "src" / "a.py").write_text("preserve\n")
+        done = self.shell_owned("env -u FOO g''it st''ash")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.work / "src" / "a.py").read_text(), "preserve\n")
+
+    def test_sixth_review_wrapper_and_interpreter_escapes_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        evil = self.work / "evil.sh"
+        evil.write_text("git clean -fdx\n")
+        for command in ("timeout 5 g''it -p st''ash", "command -p bash -c \"g''it st''ash\"",
+                        "/usr/bin/time g''it st''ash", "printf 'git clean -fdx\\n' | bash",
+                        "bash -ec 'git clean -fdx' src/a.py", "bash evil.sh src/a.py",
+                        "python3 -c \"import subprocess; subprocess.run(['git', 'clean', '-fdx'])\"",
+                        "bash", "python3 script.py", "awk '{print}' src/a.py"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        done = self.shell_owned("timeout 5 g''it -p st''ash")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.work / "src" / "a.py").read_text(), "owned edit\n")
+        piped = self.shell_owned("printf 'git clean -fdx\\n' | bash")
+        self.assertNotEqual(piped.returncode, 0)
+        self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
+        inline = self.shell_owned("python3 -c \"import subprocess; subprocess.run(['git', 'clean', '-fdx'])\"")
+        self.assertNotEqual(inline.returncode, 0)
+        self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
+        self.assertIsNone(self.guarded().check("bash -c 'git status'"))
+        self.assertIsNone(self.guarded().check("python3 -m unittest"))
+
+    def test_a_new_ignored_directory_cannot_delete_an_owned_leaf(self):
+        build = self.work / "build"
+        build.mkdir()
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("build/allowed.txt",), lambda p: p == "build/allowed.txt", allow_commits=True)
+        (build / "allowed.txt").write_text("owned\n")
+        self.assertFalse(guard.reconcile()[1])
+        self.assertEqual((build / "allowed.txt").read_text(), "owned\n")
+
+    def test_an_owned_subdirectory_under_a_baseline_ignored_dir_survives(self):
+        build = self.work / "build"
+        (build / "sub").mkdir(parents=True)
+        (build / "sub" / "base.txt").write_text("baseline\n")
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("build/owned_sub/out.txt",),
+                          lambda p: p == "build/owned_sub/out.txt", allow_commits=True)
+        owned = build / "owned_sub"
+        owned.mkdir()
+        (owned / "out.txt").write_text("owned\n")
+        (build / "unowned_new.txt").write_text("new\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(errors, [])
+        self.assertEqual((owned / "out.txt").read_text(), "owned\n")
+        self.assertEqual((build / "sub" / "base.txt").read_text(), "baseline\n")
+        self.assertFalse((build / "unowned_new.txt").exists())
+
     def test_nested_preexisting_ignored_directories_survive_owned_writes(self):
         build = self.work / "build"
         (build / "sub").mkdir(parents=True)
@@ -402,6 +484,15 @@ class NeonFenceRegressions(GitFence):
         guard.reconcile()
         self.assertTrue((build / "sub" / "big.bin").is_file())
         self.assertEqual((build / "allowed.txt").read_text(), "after\n")
+
+    def test_large_baseline_ignored_directories_keep_leaf_guard_state(self):
+        path = self.work / "ignored"
+        path.mkdir()
+        (path / "keep.txt").write_text("preserve")
+        (self.work / ".gitignore").write_text("ignored/\n")
+        guard = BashGuard(self.work, ("ignored/owned.txt",), lambda p: p == "ignored/owned.txt", allow_commits=True)
+        self.assertIn("ignored/keep.txt", guard.baseline)
+        self.assertIn("ignored/keep.txt", guard._ignored_backup)
 
     def test_writes_in_a_preexisting_ignored_directory_are_reconciled(self):
         ignored = self.work / "build" / "sub"
