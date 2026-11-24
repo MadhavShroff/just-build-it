@@ -339,7 +339,8 @@ WRITERS = frozenset({"sed", "cp", "mv", "mkdir", "touch", "rm", "rmdir", "ln", "
                      "pushd", "git", "tar", "unzip", "curl", "wget"})
 WRAPPERS = frozenset({"env", "nohup", "nice", "time", "timeout", "exec", "command", "builtin", "xargs",
                       "stdbuf", "setsid", "taskset", "ionice", "chrt", "schedtool", "numactl", "setpriv",
-                      "strace", "ltrace", "watch", "script", "parallel"})
+                      "strace", "ltrace", "watch", "script", "parallel",
+                      "prlimit", "setarch", "linux64", "flock", "choom"})
 INTERPRETERS = frozenset({"node", "perl", "ruby", "bash", "sh", "zsh", "php", "lua", "awk"})
 SAFE_DEV = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "|&"})
@@ -347,6 +348,17 @@ REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", ">&"})
 ABS_IN_CODE = re.compile(r"(?<![\w.:/])/(?!dev/(?:null|stdout|stderr)\b)[A-Za-z0-9_.~-]+")
 DOTDOT_IN_CODE = re.compile(r"(?:^|[\s'\"=(,\[])\.\.(?:/|$|[\s'\")\],])")
 STASH = re.compile(r"\bgit\b[^\n;&|]*\bstash\b")
+FIND_TERM = ""  # stands in for the escaped `\\;` find terminator
+
+
+def _first_command(words: list[str]) -> str:
+    """The basename of the first word that is not an assignment or a flag."""
+    i = 0
+    while i < len(words) and "=" in words[i] and not words[i].startswith("-"):
+        i += 1
+    if i >= len(words):
+        return ""
+    return os.path.basename(words[i])
 
 
 SAFE_GIT = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=")
@@ -484,7 +496,7 @@ class BashGuard:
         rc, out = self._git("rev-parse", "--verify", "-q", "HEAD")
         return out.decode().strip() if rc == 0 else ""
 
-    def _status(self) -> list[tuple[str, str, str | None]]:
+    def _status(self, expand_ignored: bool = True) -> list[tuple[str, str, str | None]]:
         # Ignored dependency trees remain compact at their first matched directory.
         rc, out = self._git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching")
         if rc != 0:
@@ -495,17 +507,21 @@ class BashGuard:
             raise GuardError("Git ignored-file discovery failed")
         ignored = [("!!", item.decode("utf-8", "surrogateescape"), None)
                    for item in ignored_raw.split(b"\0") if item]
-        return self._ignored_entries(parse_status(out) + ignored)
+        entries = parse_status(out) + ignored
+        # Reconcile needs every ignored leaf. The snapshot expansion reads the
+        # compact aggregates itself, because it also backs the leaves up.
+        return self._ignored_entries(entries) if expand_ignored else entries
 
     def _ignored_entries(self, entries: list[tuple[str, str, str | None]]) -> list[tuple[str, str, str | None]]:
-        """Enumerate known ignored trees. Other ignored files stay explicit entries."""
+        """Replace every non-empty ignored directory with its leaves.
+
+        Reconcile judges the leaves alone. A leftover aggregate would let
+        reconcile delete owned leaves under a glob own, or double-revert the
+        directory after its leaves are judged."""
         current = {rel: (xy, rel, orig) for xy, rel, orig in entries}
         for xy, rel, original in entries:
             if xy != "!!" or not rel.endswith("/"):
                 continue
-            # Every ignored directory, old or new, is enumerated into leaves. The
-            # aggregate entry would hide an unowned leaf from reconcile, so the
-            # directory entry itself is replaced.
             rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", rel)
             if rc != 0:
                 raise GuardError("ignored baseline discovery failed")
@@ -513,6 +529,8 @@ class BashGuard:
             for child in children:
                 if child != rel:
                     current[child] = ("!!", child, None)
+            if children:
+                current.pop(rel, None)
         return list(current.values())
 
     def _signature(self, path: str) -> str:
@@ -533,7 +551,7 @@ class BashGuard:
     def snapshot(self) -> dict[str, tuple[str, str]]:
         """Map each dirty path to (status, content signature)."""
         snap: dict[str, tuple[str, str]] = {}
-        entries = self._status()
+        entries = self._status(expand_ignored=False)
         for xy, path, orig in entries:
             for p in (path, orig):
                 if p:
@@ -584,7 +602,7 @@ class BashGuard:
             return f"{arg!r} is outside the workspace"
         return None
 
-    def _segment(self, words: list[str]) -> str | None:
+    def _segment(self, words: list[str], script_ok: bool = True) -> str | None:
         for word in words:
             if any(ch in word for ch in "`~"):
                 return "expanded shell commands and command options are refused"
@@ -599,8 +617,12 @@ class BashGuard:
         if i >= len(words):
             return None
         cmd, args = os.path.basename(words[i]), words[i + 1:]
+        if "$" in words[i] or "`" in words[i]:
+            return "the command word may expand into an unchecked path"
         if cmd in ("sudo", "su", "doas", "eval"):
             return "privilege escalation is refused"
+        if cmd in (".", "source"):
+            return "shell sourcing is refused"
         if cmd in ("mkdir", "rmdir"):
             for arg in (a for a in args if not a.startswith("-")):
                 bad = self._bad_path(arg)
@@ -676,7 +698,7 @@ class BashGuard:
                 if bad:
                     return f"git target refused: {bad}"
         elif cmd == "find":
-            if any(a in ("-delete", "-fprint", "-fprintf", "-fls") for a in args):
+            if any(a in ("-delete", "-fprint", "-fprintf", "-fls", "-fprint0") for a in args):
                 return "find deletion and file writes are refused"
             index = 0
             while index < len(args):
@@ -685,7 +707,7 @@ class BashGuard:
                     cursor = index + 1
                     closed = False
                     while cursor < len(args):
-                        if args[cursor] in (";", "+"):
+                        if args[cursor] in (";", "+", FIND_TERM):
                             closed = True
                             cursor += 1
                             break
@@ -694,10 +716,11 @@ class BashGuard:
                         cursor += 1
                     if not closed:
                         return "a find exec section needs a closing ; or +"
-                    reason = self._segment(payload)
+                    reason = self._segment(payload, script_ok=script_ok)
                     if reason:
                         return f"find exec is refused: {reason}"
                     index = cursor
+                    continue
                 index += 1
             for arg in (a for a in args if not a.startswith("-") and a not in ("(", ")", "!", "{}")):
                 if "/" in arg or arg == "..":
@@ -720,10 +743,9 @@ class BashGuard:
                     return f"{cmd} argument refused: {bad}"
         if cmd == "busybox" and args:
             # The multi-call binary reaches every applet, including shells.
-            return self._segment(args)
+            rest = args[1:] if args[0] == "--" else args
+            return self._segment(rest, script_ok=script_ok)
         if cmd in ("bash", "sh", "zsh", "dash", "ash", "ksh", "mksh", "yash", "csh", "tcsh", "fish"):
-            if any(a == "-s" or re.fullmatch(r"-[A-Za-z]*s", a) for a in args):
-                return "a shell may read commands from standard input"
             positionals = [a for a in args if not a.startswith("-")]
             command_flag = next((a for a in args if a == "-c" or re.fullmatch(r"-[A-Za-z]*c", a)), None)
             if command_flag is not None:
@@ -731,6 +753,12 @@ class BashGuard:
                 if len(after) != 1 or after[0].startswith("-"):
                     return "a shell command string needs exactly one checked word"
                 return self.check(after[0])
+            if any(re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", a) for a in args):
+                return "a shell may read commands from standard input"
+            if any(a.startswith("--") for a in args):
+                return "shell long options are refused"
+            if not script_ok:
+                return "a shell script may not follow a writing segment"
             if not positionals:
                 return "a bare shell interpreter may read unchecked input"
             if len(positionals) > 1:
@@ -742,21 +770,33 @@ class BashGuard:
         if cmd.startswith("python") or cmd in INTERPRETERS:
             # Attached forms (`-c"code"`) tokenize as one word, so the prefix
             # carries the check. A bare interpreter executes piped input, and a
-            # script argument is unchecked content.
+            # script argument is unchecked content. The module name after `-m`
+            # is the only non-flag word a module form may carry.
+            module_flag = next((a for a in args if a == "-m"), None)
+            head = args[:args.index(module_flag)] if module_flag is not None else args
+            if any(not a.startswith("-") for a in head):
+                return "interpreter script files cannot be checked; use shell commands"
             if any(a == "-" or a.startswith(("-c", "-e", "-p", "-r")) or a.startswith(("--eval", "--print"))
                    for a in args):
                 return "interpreter inline code cannot be checked"
-            module_flag = next((a for a in args if a == "-m"), None)
+            if any((m := re.match(r"-([A-Za-z]+)", a)) and set(m.group(1)) & set("cepr") for a in args):
+                return "interpreter inline code cannot be checked"
+            if not script_ok:
+                return "an interpreter module may not follow a writing segment"
             if module_flag is not None:
                 after = args[args.index(module_flag) + 1:]
                 if len(after) != 1 or not re.fullmatch(r"[A-Za-z_][\w.]*", after[0]):
                     return "an interpreter module must be one plain identifier"
+                for j in range(i):
+                    if words[j].startswith("PYTHONPATH="):
+                        for part in words[j].split("=", 1)[1].split(":"):
+                            if part and inside(self.root, Path(os.path.realpath(self.root / part))):
+                                return "an interpreter module path may not point inside the workspace"
                 stem = self.root / after[0].replace(".", "/")
-                if stem.with_suffix(".py").exists() or (stem / "__init__.py").exists():
+                if stem.with_suffix(".py").exists() or (stem / "__init__.py").exists() \
+                        or (stem / "__main__.py").exists():
                     return "an interpreter module must not resolve inside the workspace"
                 return None
-            if any(not a.startswith("-") for a in args):
-                return "interpreter script files cannot be checked; use shell commands"
             return "an interpreter without a script or module may read unchecked input"
         return None
 
@@ -767,7 +807,7 @@ class BashGuard:
         try:
             if re.search(r"<<-?\s*['\"]?", command):
                 return "shell heredocs are refused"
-            text = _plain_newlines(command)
+            text = _plain_newlines(command).replace("\\;", FIND_TERM)
             lex = shlex.shlex(text, posix=True, punctuation_chars=True)
             lex.whitespace_split = True
             tokens = list(lex)
@@ -775,10 +815,12 @@ class BashGuard:
             return "command is unparseable"
         segment: list[str] = []
         segments: list[list[str]] = []
+        redirect_seen = False
         for i, tok in enumerate(tokens):
             if tok in REDIRECTS and i + 1 < len(tokens):
                 target = tokens[i + 1]
                 if not (tok == ">&" and (target.isdigit() or target == "-")):
+                    redirect_seen = True
                     bad = self._bad_path(target)
                     if bad:
                         return f"redirect refused: {bad}"
@@ -788,8 +830,11 @@ class BashGuard:
             elif not set(tok) <= set("<>&|;()"):
                 segment.append(tok)
         segments.append(segment)
+        # A script or module read is only safe when nothing in the same command
+        # can rewrite the file between the read here and the run.
+        script_ok = not redirect_seen and not any(_first_command(w) in WRITERS for w in segments)
         for words in segments:
-            reason = self._segment(words)
+            reason = self._segment(words, script_ok=script_ok)
             if reason:
                 return reason
         return None

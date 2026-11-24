@@ -505,6 +505,59 @@ class NeonFenceRegressions(GitFence):
         self.assertNotEqual(executed.returncode, 0)
         self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
 
+    def test_eighth_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        pkg = self.work / "src" / "pkg"
+        pkg.mkdir()
+        (pkg / "__main__.py").write_text("import subprocess\n")
+        refused = (
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && . "$TMPDIR/x"',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && source "$TMPDIR/x"',
+            'printf "git clean -fdx\\n" | bash -se other/b.txt',
+            'printf "git clean -fdx\\n" | bash --rcfile other/b.txt',
+            'printf "git clean -fdx\\n" > src/a.py && bash src/a.py',
+            "busybox -- sh -c 'git clean -fdx'",
+            "bash -c '$TMPDIR/x'",
+            "find . -maxdepth 0 -exec true {} + -exec git clean -fdx {} +",
+            "find . -maxdepth 0 -fprint0 other/b.txt",
+            'python3 -Bc"import subprocess; subprocess.run([\'git\', \'clean\', \'-fdx\'])" -m unittest',
+            "python3 src/evil.py -m unittest",
+            "python3 -m src.pkg",
+            "PYTHONPATH=src python3 -m evil",
+            "printf x > src/evil.py && python3 -m src.evil",
+            "prlimit git clean -fdx", "setarch -R git clean -fdx",
+            "flock other/b.txt git clean -fdx", "choom -n 0 -- git clean -fdx",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        self.assertIsNone(self.guarded().check('find src -name "*.py" -exec echo {} \\;'))
+
+    def test_a_new_ignored_directory_judges_leaves_alone(self):
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
+        (build / "unowned.txt").write_text("stray\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(errors, [])
+        self.assertTrue(any("build/unowned.txt" in item for item in reverted))
+        self.assertFalse((build / "unowned.txt").exists())
+
+    def test_glob_owned_leaves_survive_a_new_ignored_directory(self):
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("*.txt",), lambda p: p.endswith(".txt"), allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
+        (build / "allowed.txt").write_text("owned\n")
+        (build / "unowned.dat").write_text("stray\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(errors, [])
+        self.assertEqual((build / "allowed.txt").read_text(), "owned\n")
+        self.assertFalse((build / "unowned.dat").exists())
+
     def test_an_owned_subdirectory_under_a_baseline_ignored_dir_survives(self):
         build = self.work / "build"
         (build / "sub").mkdir(parents=True)
