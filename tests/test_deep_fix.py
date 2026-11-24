@@ -284,5 +284,72 @@ class Defect2CascadeReachesDispatch(unittest.TestCase):
         self.assertNotIn("gemini-4-argon-high", seen_models)
 
 
+class Defect3CascadeEnablesClaude(unittest.TestCase):
+    """Defect 3: a cascade-named provider is enabled so the claude rung can fire."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-d3-"))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.repo, self.base = _make_repo(self.tmp)
+        self.run_dir = self.tmp / "run"
+        self.run_dir.mkdir()
+
+    def test_install_cascade_enables_disabled_claude_and_fires_opus_rung(self):
+        state = protocol.initial_state("r-d3-a", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["config"]["rigor"] = "vibe"
+        state["accounts"] = {
+            "claude": {"label": "Claude", "enabled": False, "status": "unknown", "detail": "", "checked": None, "models": []},
+            "agy": {"label": "Google Antigravity", "enabled": True, "status": "unknown", "detail": "", "checked": None, "models": []},
+            "simulator": {"label": "Offline simulator", "enabled": True, "status": "ok", "detail": "", "checked": None, "models": []},
+        }
+        state["plan"] = waves.compile_plan([
+            {"id": "T1", "title": "A", "goal": "Do task", "deps": [],
+             "owns": ["src/a.txt"], "acceptance": "true"},
+        ], 1)
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        self.assertFalse(store.read("/accounts/claude/enabled"))
+        cli.install_cascade(store, "founder")
+        self.assertTrue(store.read("/accounts/claude/enabled"))
+        self.assertTrue(store.read("/accounts/agy/enabled"))
+
+        sup = Supervisor(store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+        worktree = wt.create_worktree(self.repo, "T1", self.base, self.run_dir / "worktrees")
+        with FakeEndpoint([final("BRIEF T1 | uncommitted | PASS")]) as ep:
+            with mock.patch.dict(os.environ, {"CLAUDE_MUX_BASE_URL": ep.url, "CLAUDE_MUX_API_KEY": SECRET}):
+                ok, detail, model = sup._agent_stage(
+                    store.read("/plan/tasks/T1"), rigor.stage("vibe", "implement"), worktree, [])
+        self.assertTrue(ok, detail)
+        self.assertEqual(model, "claude-opus-5-5")
+        self.assertEqual(ep.requests[0]["body"]["model"], "claude-opus-5-5")
+
+    def test_install_cascade_respects_offline_and_dry_run(self):
+        state = protocol.initial_state("r-d3-b", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["accounts"] = {
+            "claude": {"label": "Claude", "enabled": False, "status": "unknown", "detail": "", "checked": None, "models": []},
+            "simulator": {"label": "Offline simulator", "enabled": True, "status": "ok", "detail": "", "checked": None, "models": []},
+        }
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        cli.install_cascade(store, "founder", offline=True)
+        self.assertFalse(store.read("/accounts/claude/enabled"))
+
+    def test_mixed_case_cascade_provider_enables_catalog_account(self):
+        state = protocol.initial_state("r-d3-c", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["accounts"] = {
+            "claude": {"label": "Claude", "enabled": False, "status": "unknown", "detail": "", "checked": None, "models": []},
+        }
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        cli.install_cascade(store, '[{"provider": "Claude", "model": "claude-opus-5-5"}]')
+        self.assertTrue(store.read("/accounts/claude/enabled"))
+        choice = models.select(store.snapshot()[1], "implement")
+        self.assertEqual((choice.provider, choice.model), ("claude", "claude-opus-5-5"))
+
+
 if __name__ == "__main__":
     unittest.main()

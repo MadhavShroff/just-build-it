@@ -190,7 +190,7 @@ def cascade_providers(cascade: str | None) -> set[str]:
     """
     if cascade == "founder":
         from . import models
-        return {entry["provider"] for entry in models.FOUNDER_CASCADE}
+        return {str(entry["provider"]).strip().lower() for entry in models.FOUNDER_CASCADE}
     if not cascade:
         return set()
     try:
@@ -199,11 +199,33 @@ def cascade_providers(cascade: str | None) -> set[str]:
         return set()
     if not isinstance(entries, list):
         return set()
-    return {str(entry.get("provider")) for entry in entries
-            if isinstance(entry, dict) and entry.get("provider")}
+    return {str(entry.get("provider")).strip().lower() for entry in entries
+            if isinstance(entry, dict) and str(entry.get("provider") or "").strip()}
 
 
-def install_cascade(store: Store, cascade: str | None) -> None:
+def _enable_cascade_accounts(store: Store, entries: list[dict], *, offline: bool = False) -> None:
+    """Enable every catalog provider named by `entries`, unless the run is offline or dry-run."""
+    if offline or store.read("/config/dry_run"):
+        return
+    from . import providers
+    from .store import Changes
+    known = providers.catalog()["providers"]
+    changes = Changes()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("provider") or "").strip().lower()
+        if name not in known:
+            continue
+        account = store.read(f"/accounts/{name}") or providers.blank_account(name)
+        if not account.get("enabled"):
+            account = {**account, "enabled": True}
+            changes.set("accounts", name, account)
+    if changes:
+        store.commit("account.status", changes, {})
+
+
+def install_cascade(store: Store, cascade: str | None, *, offline: bool = False) -> None:
     """Store the run's cascade override in `provider_cascade`. 'founder' installs the founder order.
 
     The cascade is an ordered list of {provider, model} entries. `models.select` walks
@@ -231,6 +253,7 @@ def install_cascade(store: Store, cascade: str | None) -> None:
             raise SystemExit(f"morph_refused: cascade entry {name!r} is a morph "
                              "model; morph answers 401 and nothing in jbi may depend on it")
     store.commit("config", Changes().set("config", "provider_cascade", entries), {})
+    _enable_cascade_accounts(store, entries, offline=offline)
     order = ", ".join(f"{entry.get('provider')}/{entry.get('model')}" for entry in entries)
     store.log("config", f"Cascade installed: {order}", etype="run.config")
 
@@ -251,13 +274,16 @@ def latest_run_dir() -> Path:
     return runs[-1]
 
 
-def prepare_resume(store: Store) -> list[str]:
+def prepare_resume(store: Store, *, offline: bool = False) -> list[str]:
     """Reconcile stored task states so an interrupted run continues cleanly on reopen."""
     from . import resume as resume_mod
     from . import rigor
     from .store import Changes
 
     _reclaim_orphans_on_resume(store, resume_mod)
+    cascade = store.read("/config/provider_cascade")
+    if isinstance(cascade, list) and cascade:
+        _enable_cascade_accounts(store, cascade, offline=offline)
 
     changes = Changes()
     if store.read("/run/stopping") is not None:
@@ -349,9 +375,10 @@ class Run:
                 raise SystemExit(f"No stored run database at {self.dir / 'run.db'}.")
             self.store = Store(self.dir / "run.db")
             self.run_id = str(self.store.read("/run/id") or self.dir.name)
-            if getattr(args, "offline", False):
+            is_offline = bool(getattr(args, "offline", False))
+            if is_offline:
                 self._seed_accounts(True)
-            prepare_resume(self.store)
+            prepare_resume(self.store, offline=is_offline)
         else:
             self.run_id = "r-" + datetime.now().strftime("%Y%m%d-%H%M%S")
             self.dir = HOME / "runs" / self.run_id
@@ -398,7 +425,8 @@ class Run:
                                    getattr(args, "base", None), getattr(args, "branch", None),
                                    dry_run=bool(getattr(args, "dry_run", False)))
             if getattr(args, "cascade", None):
-                install_cascade(self.store, getattr(args, "cascade"))
+                is_offline = bool(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False))
+                install_cascade(self.store, getattr(args, "cascade"), offline=is_offline)
 
         completer = make_completer(
             self.store,
