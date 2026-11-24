@@ -29,12 +29,28 @@ export function mountTaskDrawer(ctx) {
     const focusedName = document.activeElement?.dataset?.focusKey;
     const live = body(ctx, state, task);
     live.append(shown.form);
+    const refusals = refusalsCard(ctx);
+    if (refusals) live.append(refusals);
     drawer.replaceChildren(head(task), live);
     if (focusedName) drawer.querySelector(`[data-focus-key="${focusedName}"]`)?.focus();
   }
 
   ctx.store.subscribe(['plan', 'sessions', '$selectedTask', 'run'], (state) => { if (ctx.store.local.selectedTask) render(state); });
   return { open };
+}
+
+// Refusal visibility (audit 4.4.1): the drawer names the CI notice identity and
+// every lane that is still cooling, so a stalled stage answers "why is nothing
+// running" without a trip to the timeline. Empty when nothing is cooling.
+function refusalsCard(ctx) {
+  const info = ctx.store.info || {};
+  const cooling = Object.entries(info.cooldowns || {}).filter(([, s]) => Number(s) > 0)
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  if (!cooling.length) return null;
+  return h('section', { class: 'card drawer-refusals' },
+    h('h3', { class: 'card-title', text: 'Routing and cooldowns' }),
+    h('p', { class: 'faint', text: info.ci_notice_slot ? `CI notice identity: ${info.ci_notice_slot}` : '' }),
+    ...cooling.map(([lane, secs]) => h('p', { class: 'mono', text: `${lane} — cooling ${Number(secs).toFixed(0)}s remaining` })));
 }
 
 function head(task) {

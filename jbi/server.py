@@ -295,6 +295,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 doc.get("plan") or {},
                 doc.get("config") or {},
                 doc.get("sessions") or {},
+                accounts=doc.get("accounts") or {},
             )
             self._json(200, {
                 "protocol": PROTOCOL_VERSION,

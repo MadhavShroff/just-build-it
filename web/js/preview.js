@@ -19,6 +19,7 @@ const OWNS_FILE_ETA_SECONDS = 15;
 
 const PIPELINES_BY_RIGOR = {
   vibe: [['implement', 'implement'], ['merge', 'merge']],
+  fast: [['implement', 'implement'], ['merge', 'merge']],
   medium: [
     ['implement', 'implement'], ['acceptance', 'acceptance'],
     ['review-cascade', 'review'], ['review-ds-1', 'review'], ['review-ds-2', 'review'], ['review-ds-3', 'review'],
@@ -58,7 +59,12 @@ function stageWallSeconds(name, role) {
 
 export function estimateTaskEta(task, config = {}) {
   const rigor = task.override?.rigor || config.rigor || 'high';
-  const stages = PIPELINES_BY_RIGOR[rigor] || PIPELINES_BY_RIGOR.high;
+  // The served pipeline is the truth: the preview endpoint sends each task's
+  // stage list resolved through jbi/rigor, so a client table never disagrees
+  // with the run (audit M4). This table is the fallback for older payloads.
+  const stages = (Array.isArray(task.pipeline) && task.pipeline.length)
+    ? task.pipeline
+    : (PIPELINES_BY_RIGOR[rigor] || PIPELINES_BY_RIGOR.high);
   const ownsBonus = Math.min(120, (task.owns || []).length * OWNS_FILE_ETA_SECONDS);
   const explicit = task.eta_s || task.estimated_seconds;
   const total = typeof explicit === 'number' && explicit > 0

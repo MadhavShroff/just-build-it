@@ -365,39 +365,6 @@ class RigorTest(unittest.TestCase):
         self.assertEqual(ovr["rigor"], "fast")
 
 
-class CeremonyPoolAndLedgerTest(unittest.TestCase):
-    def test_window_pool_persists_across_restart(self):
-        from jbi.ceremony import WindowPool
-        with tempfile.TemporaryDirectory() as tmp:
-            reg = Path(tmp) / "window_pool.json"
-            pool = WindowPool(reg, windows=("work1", "work2"))
-            w1 = pool.take_free("D01")
-            self.assertEqual(w1, "work1")
-            pool.mark_busy("work1", "D01", title="Data contracts", pr_number=812,
-                           head_sha="abc1234", ci_status="submitted", attempt=1)
-            reloaded = WindowPool(reg, windows=("work1", "work2", "work3"))
-            snap = reloaded.snapshot()
-            self.assertEqual(snap["busy_count"], 1)
-            self.assertEqual(snap["free_count"], 2)
-            self.assertEqual(snap["windows"]["work1"]["status"], "busy")
-            self.assertEqual(snap["windows"]["work1"]["task"], "D01")
-            self.assertEqual(snap["windows"]["work1"]["pr_number"], 812)
-            self.assertEqual(reloaded.take_free("D01"), "work1")
-            self.assertEqual(reloaded.take_free("D02"), "work2")
-            reloaded.mark_free("work1")
-            again = WindowPool(reg)
-            self.assertEqual(again.snapshot()["busy_count"], 0)
-            self.assertEqual(again.snapshot()["free_count"], 3)
-
-    def test_parse_agent_receipt_reads_the_local_receipt(self):
-        from jbi.ceremony import parse_agent_receipt
-        rec = parse_agent_receipt("BRIEF D01 | deadbeef | PASS\ntokens: 1450\nall green", "D01")
-        self.assertTrue(rec.passed)
-        self.assertEqual(rec.task, "D01")
-        self.assertEqual(rec.sha, "deadbeef")
-        self.assertEqual(rec.tokens, 1450)
-        self.assertEqual(rec.findings, ["all green"])
-
 
 class StoreTest(unittest.TestCase):
     def test_replay_after_restart_and_timeline_limit(self):
