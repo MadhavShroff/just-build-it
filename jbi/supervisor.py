@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -22,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, briefs, ci_adapter as ci_mod, guards, models, rigor, taskkey, waves, worktrees as wt
+from . import agents, briefs, ci_adapter as ci_mod, guards, models, providers, rigor, taskkey, waves, worktrees as wt
 from .contracts import Hooks
 from .lanes import MergeJob
 from .shim import Groups, alive, process_start, run_command
@@ -30,6 +31,19 @@ from .store import Changes, Store, now
 from .tracking import Tracking
 
 ACCEPTANCE_TIMEOUT = 900.0
+# A provider that refuses a model as unknown ("model not recognized",
+# "invalid_model") never serves that model again. Its lane cools for the whole run
+# and the same stage re-runs on the next lane without an attempt penalty. The
+# reroute bound keeps a run whose every lane is retired from spinning: past it, the
+# failure counts like any other and the task escalates to a request.
+PERMANENT_MODEL_TOKENS = ("model not recognized", "invalid_model")
+PERMANENT_REROUTE_LIMIT = 6
+
+
+def _permanent_model_error(detail: str) -> bool:
+    """True when a dispatch failure text says the provider does not know the model."""
+    lower = str(detail).lower()
+    return any(token in lower for token in PERMANENT_MODEL_TOKENS)
 STANDDOWN_WAIT = 20.0
 TICK = 1.0
 CLOSE_WAIT = 10.0                 # a window close is verified within this time, not assumed
@@ -190,6 +204,15 @@ class Supervisor:
         self.ci_adapter = ci_adapter or ci_mod.CIAdapter()
         self.active_dispatch: dict[str, int] = {}
         run_id = store.read("/run/id")
+        # The CI service learns this run's identity on every service call, so its
+        # completion notices route to this run (and never to the caller's pane).
+        self.ci_adapter.env = {
+            "ILLM_SLOT": str(store.read("/config/ci_notice_slot") or f"jbi-{run_id or 'run'}"),
+            "JBI_RUN_ID": str(run_id or ""),
+        }
+        notice_url = str(store.read("/config/ci_notice_url") or "").strip()
+        if notice_url:
+            self.ci_adapter.env["JBI_CI_NOTICE_URL"] = notice_url
         self.tmux = Tmux(f"jbi-{run_id}", self.run_dir, self.parent_pid)
         self.tmux.available = self.tmux.available and use_tmux
         self.groups = Groups()
@@ -312,13 +335,16 @@ class Supervisor:
         return grant["lease"]
 
     def _stage_dispatch(self, sid: str, task_id: str, cwd: Path, model: str,
-                        brief: Path | None = None, attempt: int = 0) -> dict:
+                        brief: Path | None = None, attempt: int = 0, provider: str = "") -> dict:
         """Renew a dispatch. Only a prior dispatch in this same task supplies history."""
         lease = self._task_lease(task_id, cwd)
         stage_key = re.sub(r"-\d+$", "", sid)
-        history_key = f"h-{lease['session_id']}-{stage_key}"
+        # The history key names the provider: a cross-provider failover starts a fresh
+        # transcript, because one provider's content blocks never replay into another's.
+        history_key = f"h-{lease['session_id']}-{stage_key}-{provider}"
         if len(history_key) > 64:
-            digest = hashlib.sha256(f"{lease['session_id']}\0{stage_key}".encode()).hexdigest()
+            digest = hashlib.sha256(
+                f"{lease['session_id']}\0{stage_key}\0{provider}".encode()).hexdigest()
             history_key = f"h-{digest[:32]}-{lease['task_id'][-12:]}-{stage_key[-12:]}"
         self.tracking.start_history_session(history_key, node=self.dag_name())
         history = self.tracking.session_history(history_key) if attempt > 0 else []
@@ -335,7 +361,7 @@ class Supervisor:
                          brief: Path, receipt: Path, base: Path, timeout_sec: float, *,
                          provider: str = "") -> Path:
         dispatch = self._stage_dispatch(f"s-{task_id}-{role}-{attempt + 1}", task_id, cwd, model, brief,
-                                        attempt=attempt)
+                                        attempt=attempt, provider=provider)
         task = self.store.read(f"/plan/tasks/{task_id}") or {}
         lease = self._task_lease(task_id, cwd)
         spec = {"tracking": str(self.tracking.path), "workdir": str(cwd), "model": model,
@@ -667,12 +693,73 @@ class Supervisor:
 
     # ---- the scheduler ---------------------------------------------------------------
 
+    def _refresh_base_from_origin(self) -> None:
+        """Fast-forward the local base from origin before any worktree is cut.
+
+        A stale base cuts every task branch from yesterday's commit. A failed fetch
+        keeps the current base: an offline host still starts, and a rewritten origin
+        never moves this host's branch."""
+        before = wt.head(self.repo, self.base_branch)
+        fetched = wt.fetch_branch(self.repo, self.base_branch, update_local=True)
+        if fetched is None:
+            self.store.log("run", f"could not refresh base {self.base_branch} from origin; "
+                                  "the run starts from the local base")
+        elif fetched != before:
+            self.store.log("run", f"base {self.base_branch} fast-forwarded to {fetched[:10]}")
+        elif before:
+            self.store.log("run", f"origin holds no fast-forward for {self.base_branch}; "
+                                  "the run starts from the local base")
+
+    def _preflight_models(self) -> None:
+        """Probe every provider the run's named models depend on before dispatch (H1).
+
+        A provider whose probe fails loses its account now, so the first task never
+        burns an attempt discovering a dead lane. A cascade, pin, or preference model
+        the provider no longer lists cools for the whole run: a retired model never
+        starts an agent."""
+        state = self.store.snapshot()[1]
+        wanted: dict[str, set[str]] = {}
+        for entry in (state.get("config") or {}).get("provider_cascade") or []:
+            if isinstance(entry, dict) and entry.get("provider") and entry.get("model"):
+                wanted.setdefault(str(entry["provider"]).strip().lower(), set()).add(str(entry["model"]))
+        for task in ((state.get("plan") or {}).get("tasks") or {}).values():
+            override = task.get("override") or {}
+            pin = override.get("pin")
+            if isinstance(pin, dict) and pin.get("provider") and pin.get("model"):
+                wanted.setdefault(str(pin["provider"]).strip().lower(), set()).add(str(pin["model"]))
+            for want in override.get("prefer") or []:
+                if isinstance(want, dict) and want.get("provider") and want.get("model"):
+                    wanted.setdefault(str(want["provider"]).strip().lower(), set()).add(str(want["model"]))
+        for provider, named in wanted.items():
+            if provider not in providers.catalog()["providers"]:
+                continue
+            result = providers.probe(provider)
+            if result.status in ("failed", "missing"):
+                account = self.store.read(f"/accounts/{provider}") or providers.blank_account(provider)
+                account.update(status=result.status, detail=result.detail)
+                self.store.commit("account.status", Changes().set("accounts", provider, account),
+                                  {"provider": provider})
+                self.store.log("account", f"preflight: {provider} probe failed, the account is "
+                                          f"disabled until a probe passes: {result.detail}")
+                continue
+            live = set(result.models or ())
+            for model in sorted(named):
+                if live and model not in live:
+                    lane = f"{provider}/{model}"
+                    self.cooldowns.mark(lane, math.inf)
+                    self.store.log("cascade", f"preflight: {lane} is not in the provider's live "
+                                              "model list; the lane cools for the whole run")
+
     def start_execution(self) -> None:
         self.branch = self.store.read("/bootstrap/branch") or self.branch
         self.base_branch = self.store.read("/bootstrap/base_branch") or self.branch
         if not self.store.read("/config/dry_run") and (self.repo / ".git").exists():
+            self._preflight_models()
+            self._refresh_base_from_origin()
             from . import resume as resume_mod
-            reclaimed = resume_mod.reclaim_start_orphans(self.repo, current_run_dir=self.run_dir)
+            runs_root = Path(os.environ.get("JBI_HOME", Path.home() / ".just-build-it")) / "runs"
+            reclaimed = resume_mod.reclaim_start_orphans(self.repo, current_run_dir=self.run_dir,
+                                                         runs_root=runs_root)
             if reclaimed.worktrees_removed or reclaimed.branches_removed:
                 self.store.log(
                     "run",
@@ -798,6 +885,7 @@ class Supervisor:
         self._task_lease(tid, worktree)
         findings: list[str] = task.get("findings") or []
         stage_name: str | None = task.get("resume_after")
+        permanent_reroutes = 0
         while not self._stopping or self._stopping == "finish":
             task = self.store.read(f"/plan/tasks/{tid}")
             if task.get("status") == "paused":     # stop after the current stage; keep progress
@@ -849,6 +937,15 @@ class Supervisor:
                     self._task_update(tid, resume_after=stage_name)
                     return
                 continue
+            if _permanent_model_error(detail) and permanent_reroutes < PERMANENT_REROUTE_LIMIT:
+                # A retired model is a run defect, not task work: `_maybe_cool_lane`
+                # already cooled the lane for the whole run, so the same stage re-runs
+                # on the next lane. The attempt budget, the findings, and the resume
+                # point stay untouched, because the failover must never read as task
+                # failure. Past the bound the failure counts like any other, so a run
+                # whose every lane is retired still escalates.
+                permanent_reroutes += 1
+                continue
             attempts = task.get("attempts", 0) + 1
             findings = detail.splitlines()[:20]
             history = [*(task.get("attempt_history") or []), {"stage": stage.name, "findings": findings}]
@@ -884,10 +981,15 @@ class Supervisor:
 
     def _taskkey(self, tid: str, stage: rigor.Stage, base: str,
                  findings: list[str]) -> str | None:
-        """The key of one stage of `tid` (REQUIREMENT-task-keys 2.1)."""
+        """The key of one stage of `tid` (REQUIREMENT-task-keys 2.1).
+
+        The pool and the cooldowns ride along, so the key's model input is the same
+        choice the dispatch will make: a cooled lane hashes to its own key instead of
+        reading a hit recorded by a different lane."""
         tasks = (self.store.read("/plan") or {}).get("tasks") or {}
         return self._task_cache.key_for(self.repo, tasks, tid, stage, base=base,
-                                        state=self.store.snapshot()[1], findings=findings)
+                                        state=self.store.snapshot()[1], findings=findings,
+                                        pool=self.provider_pool, cooldowns=self.cooldowns)
 
     def _record_hit(self, tid: str, key: str | None, stage: rigor.Stage, ok: bool,
                     detail: str, model: str | None, worktree: Path) -> None:
@@ -931,32 +1033,66 @@ class Supervisor:
                        findings: list[str]) -> tuple[bool, str, str | None]:
         """FOUNDER RULE 2026-11-16: run the four reviews at the same time.
 
-        One review on the model the cascade service names as active, and three
-        independent DeepSeek agents. The three are not coordinated with each
+        One review on the model the cascade names as active, and the named reviewers
+        of `data/models.json` beside it. The reviewers are not coordinated with each
         other or with the first. Every review must pass; the findings of every
-        failing review are returned together, so the implementer sees all four
-        reads at once.
+        failing review are returned together, so the implementer sees all the reads
+        at once.
+
+        A reviewer stage that resolved to a model an earlier reviewer already runs
+        adds no independent read: four identical reads burn four times the quota for
+        one opinion. The duplicate is skipped and its stage record says so, unless
+        `data/models.json` names a distinct model for it.
         """
         stages = rigor.review_stages()
+        state = self.store.snapshot()[1]
+        attempt = task.get("attempts", 0)
+        reviewers = models.reviewer_overrides()
+        choices: dict[str, models.Choice] = {}
+        for stage in stages:
+            choice = models.select(state, stage.role, task=task, attempts=attempt,
+                                   pool=self.provider_pool, cooldowns=self.cooldowns)
+            override = reviewers.get(stage.name)
+            if override is not None and override[0] in models.usable(state) \
+                    and not self.cooldowns.cooling(f"{override[0]}/{override[1]}"):
+                choice = models.Choice(override[0], override[1], choice.tier)
+            choices[stage.name] = choice
+        lanes: dict[tuple[str, str], str] = {}
+        run_stages: list[rigor.Stage] = []
+        duplicate_of: dict[str, str] = {}
+        for stage in stages:
+            mark = (choices[stage.name].provider, choices[stage.name].model)
+            if mark in lanes:
+                duplicate_of[stage.name] = lanes[mark]
+                continue
+            lanes[mark] = stage.name
+            run_stages.append(stage)
         results: dict[str, tuple[bool, str, str | None]] = {}
         lock = threading.Lock()
 
         def one(stage: rigor.Stage) -> None:
             try:
-                got = self._agent_stage(task, stage, worktree, findings, discard=False)
+                got = self._agent_stage(task, stage, worktree, findings, discard=False,
+                                        forced_choice=choices[stage.name])
             except Exception as error:          # one review failing never hides the others
                 got = (False, f"{type(error).__name__}: {error}", None)
             with lock:
                 results[stage.name] = got
 
         threads = [threading.Thread(target=one, args=(s,), name=f"jbi-{task['id']}-{s.name}",
-                                    daemon=True) for s in stages]
+                                    daemon=True) for s in run_stages]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
         wt.discard_changes(worktree)
-        ordered = [results.get(s.name, (False, "review did not report", None)) for s in stages]
+        ordered: list[tuple[bool, str, str | None]] = []
+        for s in stages:
+            if s.name in duplicate_of:
+                ordered.append((True, f"skipped: the same reviewer model as {duplicate_of[s.name]} "
+                                      "(name a distinct model in data/models.json)", None))
+            else:
+                ordered.append(results.get(s.name, (False, "review did not report", None)))
         if self._stopping not in ("quit", "kill", "standdown"):
             tid = task["id"]
             recorded = dict(self.store.read(f"/plan/tasks/{tid}/stages") or {})
@@ -973,15 +1109,16 @@ class Supervisor:
         detail = "\n".join(
             "%s: %s" % (s.name, d) for s, (ok, d, _m) in zip(stages, ordered) if not ok
         ) or "all four reviews passed"
-        models = ",".join(sorted({m for _ok, _d, m in ordered if m}))
-        return passed, detail, models or None
+        reviewer_models = ",".join(sorted({m for _ok, _d, m in ordered if m}))
+        return passed, detail, reviewer_models or None
 
     def _agent_stage(self, task: dict, stage: rigor.Stage, worktree: Path,
-                     findings: list[str], *, discard: bool = True) -> tuple[bool, str, str | None]:
+                     findings: list[str], *, discard: bool = True,
+                     forced_choice: models.Choice | None = None) -> tuple[bool, str, str | None]:
         tid, attempt = task["id"], task.get("attempts", 0)
         state = self.store.snapshot()[1]
-        choice = models.select(state, stage.role, task=task, attempts=attempt,
-                               pool=self.provider_pool, cooldowns=self.cooldowns)
+        choice = forced_choice or models.select(state, stage.role, task=task, attempts=attempt,
+                                                pool=self.provider_pool, cooldowns=self.cooldowns)
         shared = briefs.discover_shared_helpers(worktree) if stage.role == "implement" else None
         limits = rigor.task_timeouts(task)
         ckpt_path = worktree / ".jbi_checkpoint.json"
@@ -1062,17 +1199,28 @@ class Supervisor:
         return result.passed, "\n".join(result.findings), choice.model
 
     def _maybe_cool_lane(self, tid: str, choice: models.Choice, session: Session, detail: str) -> None:
-        """Cool a provider/model lane when dispatch failed before productive work or hit a provider limit."""
+        """Cool a provider/model lane when dispatch failed before productive work or hit a provider limit.
+
+        A provider that no longer knows the model ("model not recognized",
+        "invalid_model") lost the lane for the whole run, not for two minutes: a
+        120-second cooldown just re-burns an attempt every time it thaws."""
         if choice.provider == "simulator":
             return
         code = session.status.get("exit_code")
-        if code in (None, 0):
+        permanent = _permanent_model_error(detail)
+        if code in (None, 0) and not permanent:
             return
         lower = detail.lower()
         # A before_run refusal ("workdir is not clean", a live lease) is the
         # environment's fault, never the provider's: cooling its lane would flip
         # the whole run onto the next rung for nothing.
         if "before_run refused" in lower:
+            return
+        lane_key = f"{choice.provider}/{choice.model}"
+        if permanent:
+            self.cooldowns.mark(lane_key, math.inf)
+            self.store.log("cascade", f"{tid}: {lane_key} is retired by its provider; "
+                                      "the lane cools for the whole run", task=tid)
             return
         provider_error = any(tok in lower for tok in (
             "429", "529", "401", "403", "502", "503", "504",
@@ -1083,7 +1231,6 @@ class Supervisor:
         ))
         zero_turn_error = session.status.get("turns") == 0
         if provider_error or zero_turn_error:
-            lane_key = f"{choice.provider}/{choice.model}"
             self.cooldowns.mark(lane_key, 120.0)
             self.store.log("cascade", f"{tid}: {lane_key} cooled after dispatch error", task=tid)
 
@@ -1103,8 +1250,13 @@ class Supervisor:
         self._merge_ok.pop(tid, None)
         target_branch = self.store.read("/config/epic_branch") if level == "wave-epic" else None
         job = MergeJob(tid, f"jbi/{tid}", level, worktree, target_branch=target_branch)
-        with self._handover_lock:
-            try:
+        handover: ci_mod.HandoverResult | None = None
+        try:
+            # The handover lock covers creation, lookup, and the dict write only. The
+            # CI wait below never holds it: a poll runs 20-60 minutes, and a lock held
+            # across that wait serializes every other lane's merge behind it and
+            # deadlocks `ci_notice`, which needs the same lock to deliver its answer.
+            with self._handover_lock:
                 task = self.store.read(f"/plan/tasks/{tid}")
                 handover = self._handovers.get(tid)
                 if handover is None:
@@ -1131,22 +1283,28 @@ class Supervisor:
                     self._handovers[tid] = handover
                 self._task_update(tid, status="merging", pr_number=handover.pr_number,
                                   commit=handover.head_sha)
-                while not done.is_set() and self._stopping not in ("quit", "kill", "standdown"):
-                    if self.ci_adapter.pending(self.repo, handover):
-                        time.sleep(self.ci_poll_interval)
-                        continue
-                    with self._ci_lock:
-                        evidence = self.ci_adapter.confirm_merge(self.repo, handover, tracking=self.tracking)
-                        if not self._finish_verified_merge(job, handover, evidence["squash_sha"]):
-                            break
+            while not done.is_set() and self._stopping not in ("quit", "kill", "standdown"):
+                if self.ci_adapter.pending(self.repo, handover):
                     time.sleep(self.ci_poll_interval)
-            except (ci_mod.CIAdapterError, OSError, ValueError, KeyError) as error:
-                if self.store.read(f"/plan/tasks/{tid}/status") == "merged":
-                    return True
-                bound = self._handovers.pop(tid, None)
-                if bound is not None and (self.tracking.get_task(tid) or {}).get("state") != "merged":
-                    self._record_ci_failure(bound, str(error))
-                self._merge_failed(job, [str(error)])
+                    continue
+                # The wait stays parallel, but the confirm and the landing
+                # serialize: two lanes confirming sibling squashes against one
+                # moving base would diverge, and the service sequences trains.
+                # Both locks are held for subprocess reads and one fast-forward.
+                with self._handover_lock, self._ci_lock:
+                    if done.is_set():        # a notice answered while we polled
+                        break
+                    evidence = self.ci_adapter.confirm_merge(self.repo, handover, tracking=self.tracking)
+                    if not self._finish_verified_merge(job, handover, evidence["squash_sha"]):
+                        break
+                time.sleep(self.ci_poll_interval)
+        except (ci_mod.CIAdapterError, OSError, ValueError, KeyError) as error:
+            if self.store.read(f"/plan/tasks/{tid}/status") == "merged":
+                return True
+            bound = self._handovers.pop(tid, None)
+            if bound is not None and (self.tracking.get_task(tid) or {}).get("state") != "merged":
+                self._record_ci_failure(bound, str(error))
+            self._merge_failed(job, [str(error)])
         return self._merge_ok.pop(tid, False)
 
     def _record_ci_failure(self, handover: ci_mod.HandoverResult, detail: str) -> None:

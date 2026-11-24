@@ -139,17 +139,19 @@ class NeutralDispatch(unittest.TestCase):
 
     def test_same_task_correction_retains_history(self):
         self.sup._task_lease("t1", self.worktree)
-        session = self.sup._stage_dispatch("s-t1-implement-1", "t1", self.worktree, "m", attempt=0)["session_id"]
-        self.sup.tracking.record_session_history(f"h-{session}-s-t1-implement",
+        dispatch = self.sup._stage_dispatch("s-t1-implement-1", "t1", self.worktree, "m",
+                                            attempt=0, provider="agy")
+        self.sup.tracking.record_session_history(dispatch["history_session_id"],
                                                [{"role": "user", "content": "first task"}])
         path = self.sup._store_lite_spec(
             "t1", "implement", self.worktree, "model", 1,
             *briefs.write(self.run_dir, task=self.store.read("/plan/tasks/t1"), role="implement", stage="implement", attempt=1),
-            self.run_dir / "sessions/s-t1-implement-2", 300)
+            self.run_dir / "sessions/s-t1-implement-2", 300, provider="agy")
         spec = json.loads(path.read_text())
         self.assertTrue(spec["continuation"])
         self.assertIn("t1", spec["session_id"])
-        self.assertTrue(spec["history_session_id"].endswith("-implement"))
+        # The history key names the provider (H3), so a failover never replays it.
+        self.assertTrue(spec["history_session_id"].endswith("-implement-agy"))
 
     def test_each_stage_has_a_distinct_history_session(self):
         self.sup._task_lease("t1", self.worktree)

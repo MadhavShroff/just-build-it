@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from jbi import briefs, ci_adapter as ci_mod, protocol, waves, worktrees as wt
+from jbi import briefs, ci_adapter as ci_mod, models, protocol, waves, worktrees as wt
 from jbi.lanes import run_checks
 from jbi.shim import Groups
 from jbi.store import Changes, Store
@@ -124,7 +124,11 @@ class FakeCI:
             return (f"prs: #{number}@{head[:9]}\nstarted 1  finished 2\n"
                     "verdict RED  failed gates: backend-unit, authority\n"
                     "FAIL src/auth/authority.spec.ts")
-        if job["squash"] is None:
+        # The service lands a green train onto the base as it stands at landing
+        # time: a squash built before another train moved the base is re-landed
+        # on the moved base, the way a real train rebases onto a moving develop.
+        current_base = wt.head(self.repo, self.prs[number]["base"])
+        if job["squash"] is None or not wt.is_ancestor(self.repo, current_base, job["squash"]):
             job["squash"] = self._land(self.prs[number])
         return (f"prs: #{number}@{head[:9]}\nstarted 1  finished 2\n"
                 f"verdict GREEN  failed gates: none\nmerge: #{number}->{job['squash']}; stopped=None")
@@ -402,8 +406,14 @@ class Runs(RunFixture):
 
     def test_high_run_merges(self):
         sup = self.make([task("a"), task("b")], rigor="high")
-        sup.start_execution()
-        self.assertTrue(self.hooks.merged_event.wait(90), self.store.read("/timeline"))
+        # Distinct reviewer models keep all four reviews in the run (the shipped
+        # data/models.json names agy/claude models; the offline test names sim ones).
+        reviewers = {"review-ds-1": ("simulator", "sim-s"),
+                     "review-ds-2": ("simulator", "sim-xs"),
+                     "review-ds-3": ("simulator", "sim-xl")}
+        with mock.patch.object(models, "reviewer_overrides", lambda: reviewers):
+            sup.start_execution()
+            self.assertTrue(self.hooks.merged_event.wait(90), self.store.read("/timeline"))
         stages = self.store.read("/plan/tasks/a/stages")
         # FOUNDER RULE 2026-11-16: the review step is four reviews run together,
         # followed by security, test-audit, methodology-audit, and dry-run before merge.
@@ -411,12 +421,14 @@ class Runs(RunFixture):
                                         "review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
                                         "security", "test-audit", "methodology-audit", "dry-run", "merge"])
         self.assertTrue(all(s["status"] == "passed" for s in stages.values()))
+        models_by_stage = {"review-ds-1": "sim-s", "review-ds-2": "sim-xs", "review-ds-3": "sim-xl"}
         for rname in ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3",
                       "test-audit", "methodology-audit", "dry-run"):
-            # The stage record names the provider that ran the stage, so a reader
-            # can see which one ran each step (founder order 2026-11-17).
+            # The stage record names the provider and the model that ran the step
+            # (founder order 2026-11-17): every reviewer ran a distinct model.
             self.assertEqual(stages[rname], {"status": "passed", "detail": "simulated result",
-                                             "model": "sim-l", "provider": "simulator"})
+                                             "model": models_by_stage.get(rname, "sim-l"),
+                                             "provider": "simulator"})
 
 
 class ReviewFanout(RunFixture):
@@ -432,12 +444,18 @@ class ReviewFanout(RunFixture):
 
     def test_all_four_reviews_are_in_flight_at_once(self):
         sup = self.make([task("a")], rigor="high")
+        # The reviewers read four ways only when data/models.json names distinct
+        # models for them; identical lanes read as duplicates and are skipped. The
+        # names below keep every reviewer on the offline simulator.
+        reviewers = {"review-ds-1": ("simulator", "sim-s"),
+                     "review-ds-2": ("simulator", "sim-xs"),
+                     "review-ds-3": ("simulator", "sim-xl")}
         FANOUT = ("review-cascade", "review-ds-1", "review-ds-2", "review-ds-3")
         barrier = threading.Barrier(4, timeout=20)
         arrived, lock = [], threading.Lock()
         original = sup._agent_stage
 
-        def agent_stage(task_, stage, worktree, findings, *, discard=True):
+        def agent_stage(task_, stage, worktree, findings, *, discard=True, forced_choice=None):
             # Only the four fan-out stages, not the later audits that also carry
             # role "review": those are separate sequential steps, not this group.
             if stage.name in FANOUT:
@@ -446,11 +464,13 @@ class ReviewFanout(RunFixture):
                 # Blocks until FOUR reviews have reached this point. If the reviews
                 # ran one at a time, the first would time out here and the test fails.
                 barrier.wait()
-            return original(task_, stage, worktree, findings, discard=discard)
+            return original(task_, stage, worktree, findings, discard=discard,
+                            forced_choice=forced_choice)
 
         sup._agent_stage = agent_stage
-        sup.start_execution()
-        self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
+        with mock.patch.object(models, "reviewer_overrides", lambda: reviewers):
+            sup.start_execution()
+            self.assertTrue(self.hooks.merged_event.wait(120), self.store.read("/timeline"))
         self.assertEqual(sorted(set(arrived)), sorted(FANOUT),
                          "not all four review stages ran: %r" % arrived)
 

@@ -195,8 +195,13 @@ class WorkCache:
 
     def key_for(self, repo: Path | str, tasks: dict, tid: str, stage, *, base: str,
                 state: dict, findings: list[str] | None = None,
+                pool: models.ProviderPool | None = None,
+                cooldowns: models.ProviderCooldowns | None = None,
                 _memo: dict | None = None) -> str | None:
-        """The key of `stage` for task `tid`, with each dependency's key of that stage."""
+        """The key of `stage` for task `tid`, with each dependency's key of that stage.
+
+        `pool` and `cooldowns` are the same routing state the dispatch passes to
+        `models.select`, so the key's model input matches the model that will run."""
         memo = {} if _memo is None else _memo
         if tid in memo:
             return memo[tid]
@@ -205,8 +210,10 @@ class WorkCache:
             return None
         memo[tid] = None                     # a cycle reads as unknown, never as a key
         level, _profile = rigor.effective(task, state.get("config") or {})
-        choice = models.select(state, stage.role, task=task, attempts=task.get("attempts", 0))
-        dep_keys = {dep: self.key_for(repo, tasks, dep, stage, base=base, state=state, _memo=memo)
+        choice = models.select(state, stage.role, task=task, attempts=task.get("attempts", 0),
+                               pool=pool, cooldowns=cooldowns)
+        dep_keys = {dep: self.key_for(repo, tasks, dep, stage, base=base, state=state,
+                                      pool=pool, cooldowns=cooldowns, _memo=memo)
                     for dep in (task.get("deps") or ())}
         memo[tid] = task_key(repo, task, base, choice, level=level, stage=stage,
                              dep_keys=dep_keys, findings=findings)
