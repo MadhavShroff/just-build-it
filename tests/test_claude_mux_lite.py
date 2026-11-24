@@ -448,13 +448,284 @@ class NeonFenceRegressions(GitFence):
         self.assertIsNone(self.guarded().check("python3 -m unittest"))
 
     def test_a_new_ignored_directory_cannot_delete_an_owned_leaf(self):
-        build = self.work / "build"
-        build.mkdir()
         (self.work / ".gitignore").write_text("build/\n")
         guard = BashGuard(self.work, ("build/allowed.txt",), lambda p: p == "build/allowed.txt", allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
         (build / "allowed.txt").write_text("owned\n")
         self.assertFalse(guard.reconcile()[1])
         self.assertEqual((build / "allowed.txt").read_text(), "owned\n")
+
+    def test_a_new_ignored_directory_reconciles_owned_and_unowned_leaves(self):
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("build/allowed.txt",), lambda p: p == "build/allowed.txt", allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
+        (build / "allowed.txt").write_text("owned\n")
+        (build / "unowned.txt").write_text("stray\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(errors, [])
+        self.assertTrue(any("build/unowned.txt" in item for item in reverted))
+        self.assertFalse((build / "unowned.txt").exists())
+        self.assertEqual((build / "allowed.txt").read_text(), "owned\n")
+
+    def test_seventh_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text(
+            "import subprocess; subprocess.run(['git', 'clean', '-fdx'])\n")
+        refused = (
+            "dash -c 'git clean -fdx'", 'dash -c "g\'\'it st\'\'ash"',
+            "stdbuf -oL git clean -fdx", "setsid git clean -fdx",
+            "taskset -c 0 git clean -fdx", "ionice git clean -fdx",
+            "chrt -r 1 git clean -fdx",
+            "find . -maxdepth 0 -exec git clean -fdx {} +",
+            "find . -name unowned.txt -delete",
+            "printf 'git clean -fdx\\n' | bash -s src/a.py",
+            'python3 -c"import subprocess; subprocess.run([\'git\', \'clean\', \'-fdx\'])"',
+            'perl -e"system(qw(git clean -fdx))"',
+            'node --eval="require(\'child_process\').execSync(\'git clean -fdx\')"',
+            "printf 'git clean -fdx\\n' | python3",
+            "printf 'git clean -fdx\\n' | python3 -",
+            "python3 -m src.evil",
+            "busybox sh -c 'git clean -fdx'",
+            "python3 -", "node", "bash -s",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        self.assertIsNone(self.guarded().check("python3 -m unittest"))
+        done = self.shell_owned("dash -c 'git clean -fdx'")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
+        stashed = self.shell_owned('dash -c "g\'\'it st\'\'ash"')
+        self.assertNotEqual(stashed.returncode, 0)
+        self.assertEqual((self.work / "src" / "a.py").read_text(), "owned edit\n")
+        executed = self.shell_owned("find . -maxdepth 0 -exec git clean -fdx {} +")
+        self.assertNotEqual(executed.returncode, 0)
+        self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
+
+    def test_eighth_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        pkg = self.work / "src" / "pkg"
+        pkg.mkdir()
+        (pkg / "__main__.py").write_text("import subprocess\n")
+        refused = (
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && . "$TMPDIR/x"',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && source "$TMPDIR/x"',
+            'printf "git clean -fdx\\n" | bash -se other/b.txt',
+            'printf "git clean -fdx\\n" | bash --rcfile other/b.txt',
+            'printf "git clean -fdx\\n" > src/a.py && bash src/a.py',
+            "busybox -- sh -c 'git clean -fdx'",
+            "bash -c '$TMPDIR/x'",
+            "find . -maxdepth 0 -exec true {} + -exec git clean -fdx {} +",
+            "find . -maxdepth 0 -fprint0 other/b.txt",
+            'python3 -Bc"import subprocess; subprocess.run([\'git\', \'clean\', \'-fdx\'])" -m unittest',
+            "python3 src/evil.py -m unittest",
+            "python3 -m src.pkg",
+            "PYTHONPATH=src python3 -m evil",
+            "printf x > src/evil.py && python3 -m src.evil",
+            "prlimit git clean -fdx", "setarch -R git clean -fdx",
+            "flock other/b.txt git clean -fdx", "choom -n 0 -- git clean -fdx",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        self.assertIsNone(self.guarded().check('find src -name "*.py" -exec echo {} \\;'))
+
+    def test_ninth_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        (self.work / "src" / "evil_mod.py").write_text("import subprocess\n")
+        refused = (
+            "/usr/bin/g[i]t clean -fdx", "/bin/b[a]sh -c 'git clean -fdx'",
+            "{git,clean,-fdx}", "rbash -c 'git clean -fdx'",
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/a.py && chmod +x src/a.py && src/a.py',
+            "printf 'git clean -fdx\\n' | zsh -s0 other/b.txt",
+            "printf 'git clean -fdx\\n' | zsh -osh_in_stdin other/b.txt",
+            "printf 'git clean -fdx\\n' | zsh -o wait",
+            'printf "git clean -fdx\\n#" 1<> src/a.py && bash src/a.py',
+            'bash -c "printf \'git clean -fdx\\n\' > src/a.py" && bash src/a.py',
+            'bash -c "printf \'git clean -fdx\\n\' > \\"$TMPDIR/x\\"" && find "$TMPDIR/x" -exec {} +',
+            'bash -c "printf \'git clean -fdx\\n\' > \\"$TMPDIR/x\\"" && find "$TMPDIR/x" -exec bash {} other/b.txt +',
+            "export PYTHONPATH=src && python3 -m evil_mod",
+            'PYTHONPATH=src bash -c "python3 -m evil_mod"',
+            'bash -c "printf \'import subprocess\\n\' > \\"$TMPDIR/evil.py\\"" && PYTHONPATH="$TMPDIR" python3 -m evil',
+            "awk '--source=BEGIN{system(\"git clean -fdx\")}' -m unittest",
+            'awk -f"$TMPDIR/x" -m unittest',
+            'capsh -- -c "git clean -fdx"',
+            "/lib/ld-linux-aarch64.so.1 /usr/bin/git clean -fdx",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        (self.work / "ok.sh").write_text("echo ok\n")
+        allowed = (
+            'find src -name "*.py" -exec sh -c \'echo\' {} \\;',
+            'printf x > "$TMPDIR/log" && bash ok.sh',
+            "git status && python3 -m unittest",
+            "python3 -m unittest && git status",
+            "/usr/bin/git status",
+            'find src -name "*.py" -exec echo {} \\;',
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertIsNone(self.guarded().check(command), command)
+
+    def test_tenth_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        refused = (
+            'printf "git clean -fdx\\n" | bash -s -- -c "git status"',
+            'printf "g\'\'it st\'\'ash\\n" | bash -s -- -c "git status"',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && bash "$TMPDIR/x" -c "git status"',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/new.sh && chmod +x src/new.sh && src/new.sh',
+            'printf "#!/bin/sh\\ng\'\'it st\'\'ash\\n" > src/new.sh && chmod +x src/new.sh && src/new.sh',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/curl && chmod +x src/curl && src/curl',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/a.py && chmod +x src/a.py && PATH=src:/usr/bin:/bin a.py',
+            'printf "git clean -fdx\\n" > src/a.py 2> "$TMPDIR/err" && bash src/a.py',
+            'printf "git clean -fdx\\n" | busybox tee src/a.py && bash src/a.py',
+            "cd src && python3 -m evil",
+            'printf "import subprocess\\n" > "$TMPDIR/evil.py" && printf -v PYTHONPATH "%s" "$TMPDIR" '
+            '&& export PYTHONPATH && python3 -m evil',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > "$TMPDIR/x" && chmod +x "$TMPDIR/x" '
+            '&& find "$TMPDIR/x" -exec {} 1 \\;',
+            "unshare git clean -fdx", "aa-exec -- git clean -fdx",
+            'printf "" > src/__init__.py && printf "import subprocess\\n" > src/test_evil.py && python3 -m unittest',
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        (self.work / "ok.sh").write_text("echo ok\n")
+        allowed = (
+            "python3 -m pytest tests/ -q",
+            "python3 -m unittest -v",
+            "python3 -m unittest 2>/dev/null",
+            'python3 -m unittest > "$TMPDIR/test.log"',
+            "grep time src/a.py", 'git commit -m "watch"', "pytest -k timeout",
+            'find src -name "*.py" -exec sh -c \'echo "$1"\' sh {} \\;',
+            'printf x > "${TMPDIR}/log" && bash ok.sh',
+            "/usr/bin/git status",
+            "git status && python3 -m unittest",
+            'find src -name "*.py" -exec echo {} ";"',
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertIsNone(self.guarded().check(command), command)
+
+    def test_eleventh_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        refused = (
+            "true;(git clean -fdx)",
+            'true;(g\'\'it st\'\'ash)',
+            '(printf "git clean -fdx\\n")> src/a.py && bash src/a.py',
+            'python3 -m timeit -n 1 "__import__(\'subprocess\').run([\'git\', \'clean\', \'-fdx\'])"',
+            "python3 -m runpy src.evil",
+            'printf "import subprocess\\n" > "$TMPDIR/evil.py" && python3 -m trace -t "$TMPDIR/evil.py"',
+            'printf "import subprocess\\n" > "$TMPDIR/evil.py" && python3 -m unittest discover -s "$TMPDIR"',
+            'trap "git clean -fdx" EXIT',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && BASH_ENV="$TMPDIR/x" bash -c "git status"',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/a.py && chmod +x src/a.py '
+            '&& export PATH="src:/usr/bin:/bin" && a.py',
+            'PATH="/$TMPDIR:/usr/bin:/bin" x',
+            'sed "1e git clean -fdx" src/a.py',
+            'sed "s/a/b/e" src/a.py',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && sort -o src/a.py "$TMPDIR/x" && bash src/a.py',
+            'git log -1 --format="tformat:x" --output=src/a.py && bash src/a.py',
+            'printf "import subprocess\\n" > "$TMPDIR/evil.py" && printf -v PYTHONPATH "%s" "$TMPDIR" '
+            '&& typeset -x PYTHONPATH && python3 -m evil',
+            'printf "import subprocess\\n" > "$TMPDIR/evil.py" && set -a && printf -v PYTHONPATH "%s" "$TMPDIR" '
+            '&& python3 -m evil',
+            'printf "" > "$TMPDIR/sh" && find "$TMPDIR/sh" -exec busybox {} -c "git clean -fdx" \\;',
+            "eatmydata git clean -fdx", "fakeroot git clean -fdx",
+            "dbus-run-session -- git clean -fdx", "cmake -E env git clean -fdx",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        allowed = (
+            "python3 -m pytest -ra", "python3 -m pytest -p no:warnings", "python3 -m unittest -f",
+            "/bin/ls src", "/bin/cat src/a.py", "/usr/bin/grep a src/a.py",
+            "/usr/bin/diff src/a.py other/b.txt",
+            'mkdir -p "${TMPDIR}/scratch-task"', 'rmdir "$TMPDIR/scratch-task"',
+            "python3 -m pytest tests/ -q", 'find src -name "*.py" -exec echo {} \\;',
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertIsNone(self.guarded().check(command), command)
+
+    def test_twelfth_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        refused = (
+            "true # '\ngit clean -fdx",
+            "true # '\ng''it st''ash",
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && export BASH_ENV="$TMPDIR/x" && bash -c "git status"',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && BASH_ENV="$TMPDIR/x" && export BASH_ENV '
+            '&& bash -c "git status"',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/a.py && chmod +x src/a.py '
+            '&& printf -v PATH "%s" "src:/usr/bin:/bin" && a.py',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > "$TMPDIR/../../x" && chmod +x "$TMPDIR/../../x" && /tmp/x',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && chmod +x "$TMPDIR/x" '
+            '&& find "$TMPDIR/x" -exec sh -c "{}" \\;',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && chmod +x "$TMPDIR/x" '
+            '&& find "$TMPDIR/x" -exec ssh-agent {} \\;',
+            'printf "1e git clean -fdx\\n" > "$TMPDIR/s" && find "$TMPDIR/s" -exec sed -f {} src/a.py \\;',
+            'printf "all:\\n\\tgit clean -fdx\\n" > "$TMPDIR/M" && find "$TMPDIR/M" -exec make -f {} \\;',
+            "python3 -m pydoc src.evil", "python3 -m unittest src.evil", "python3 -m pytest src/evil.py",
+            'printf "import subprocess\\n" > "$TMPDIR/../../evil.py" && python3 -m pydoc /tmp/evil.py',
+            'printf "import subprocess\\n" > "$TMPDIR/../../test_evil.py" && python3 -m unittest discover -s /tmp',
+            'sed "/./e git clean -fdx" src/a.py',
+            'printf "1e git clean -fdx\\n" > "$TMPDIR/s" && sed -f "$TMPDIR/s" src/a.py',
+            'sed -e"1e git clean -fdx" src/a.py',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && uniq "$TMPDIR/x" src/a.py && bash src/a.py',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && iconv -o src/a.py "$TMPDIR/x" && bash src/a.py',
+            'tar -cf /dev/null --checkpoint=1 --checkpoint-action=exec="git clean -fdx" src/a.py',
+            'shopt -s expand_aliases\nalias x="git clean -fdx"\nx',
+            'history -s "git clean -fdx" && fc -s',
+            "ssh-agent git clean -fdx", "systemd-cat git clean -fdx",
+            'printf "all:\\n\\tgit clean -fdx\\n" > "$TMPDIR/M" && make -f "$TMPDIR/M"',
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        allowed = (
+            "python3 -m pytest tests/ -q", "python3 -m pytest -p no:warnings",
+            "/bin/ls src", 'mkdir -p "${TMPDIR}/scratch-task"',
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertIsNone(self.guarded().check(command), command)
+
+    def test_a_new_ignored_directory_judges_leaves_alone(self):
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
+        (build / "unowned.txt").write_text("stray\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(errors, [])
+        self.assertTrue(any("build/unowned.txt" in item for item in reverted))
+        self.assertFalse((build / "unowned.txt").exists())
+
+    def test_glob_owned_leaves_survive_a_new_ignored_directory(self):
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("*.txt",), lambda p: p.endswith(".txt"), allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
+        (build / "allowed.txt").write_text("owned\n")
+        (build / "unowned.dat").write_text("stray\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(errors, [])
+        self.assertEqual((build / "allowed.txt").read_text(), "owned\n")
+        self.assertFalse((build / "unowned.dat").exists())
 
     def test_an_owned_subdirectory_under_a_baseline_ignored_dir_survives(self):
         build = self.work / "build"
