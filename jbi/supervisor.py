@@ -664,6 +664,15 @@ class Supervisor:
     def start_execution(self) -> None:
         self.branch = self.store.read("/bootstrap/branch") or self.branch
         self.base_branch = self.store.read("/bootstrap/base_branch") or self.branch
+        if not self.store.read("/config/dry_run") and (self.repo / ".git").exists():
+            from . import resume as resume_mod
+            reclaimed = resume_mod.reclaim_start_orphans(self.repo, current_run_dir=self.run_dir)
+            if reclaimed.worktrees_removed or reclaimed.branches_removed:
+                self.store.log(
+                    "run",
+                    f"Reclaimed {len(reclaimed.worktrees_removed)} orphan worktree(s) and "
+                    f"{len(reclaimed.branches_removed)} jbi/* branch(es) before dispatch",
+                )
         self._restore_handovers()
         self._scheduler = threading.Thread(target=self._schedule, name="jbi-scheduler", daemon=True)
         self._scheduler.start()

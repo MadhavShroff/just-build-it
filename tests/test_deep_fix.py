@@ -469,5 +469,107 @@ class Defect4TrackerStormAndLiveness(unittest.TestCase):
         self.assertGreaterEqual(calls["n"], 2)
 
 
+class Defect5StartReclaimOrphans(unittest.TestCase):
+    """Defect 5: dead worktrees and orphan jbi/* branches are reclaimed at START."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-d5-"))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.repo, self.base = _make_repo(self.tmp)
+
+    def _dead_pid(self) -> int:
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(5)
+        return proc.pid
+
+    def test_corpse_worktree_holding_jbi_branch_does_not_block_fresh_start(self):
+        dead_run = self.tmp / "runs" / "r-dead-1"
+        dead_run.mkdir(parents=True)
+        (dead_run / "control.json").write_text(json.dumps({
+            "url": "http://127.0.0.1:0", "token": "x", "run_id": "r-dead-1", "pid": self._dead_pid(),
+        }))
+        corpse = wt.create_worktree(self.repo, "T1", self.base, dead_run / "worktrees")
+        self.assertTrue(corpse.is_dir())
+        self.assertIsNotNone(wt.head(self.repo, "jbi/T1"))
+
+        # Fresh run targeting the same task T1 must reclaim the corpse before dispatch
+        fresh_run = self.tmp / "runs" / "r-fresh-2"
+        fresh_run.mkdir(parents=True)
+        state = protocol.initial_state("r-fresh-2", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["config"]["rigor"] = "vibe"
+        state["accounts"] = {"simulator": {"label": "Offline simulator", "enabled": True, "status": "ok"}}
+        state["plan"] = waves.compile_plan([
+            {"id": "T1", "title": "A", "goal": "Create file", "deps": [],
+             "owns": ["src/t1.txt"], "acceptance": "true"},
+        ], 1)
+        store = Store(fresh_run / "run.db", state)
+        self.addCleanup(store.close)
+        sup = Supervisor(store, _NoopHooks(), fresh_run, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+        sup.start_execution()
+        sup._stopping = "quit"
+
+        self.assertFalse(corpse.exists(), "corpse worktree survived fresh start")
+        self.assertIsNone(wt.head(self.repo, "jbi/T1"), "orphan jbi/T1 branch survived fresh start")
+        # Creating fresh worktree for T1 now succeeds cleanly without 'already used by worktree'
+        new_wt = wt.create_worktree(self.repo, "T1", self.base, fresh_run / "worktrees")
+        self.assertTrue((new_wt / ".git").is_file())
+
+    def test_sigkill_supervisor_leaves_zero_registrations_and_zero_jbi_branches_after_reclaim(self):
+        import signal
+        holder = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (holder.kill(), holder.wait()) if holder.poll() is None else None)
+
+        dead_run = self.tmp / "runs" / "r-killed"
+        dead_run.mkdir(parents=True)
+        (dead_run / "control.json").write_text(json.dumps({
+            "url": "http://127.0.0.1:0", "token": "x", "run_id": "r-killed", "pid": holder.pid,
+        }))
+        wt1 = wt.create_worktree(self.repo, "X1", self.base, dead_run / "worktrees")
+        wt2 = wt.create_worktree(self.repo, "X2", self.base, dead_run / "worktrees")
+        # Also create a parked ref (must survive!) and a non-jbi user worktree (must survive!)
+        wt.git(self.repo, "branch", "jbi-parked/keep-me", self.base)
+        user_wt = self.tmp / "user-wt"
+        wt.git(self.repo, "worktree", "add", "-q", "-b", "feature/user", str(user_wt), self.base)
+
+        # SIGKILL the simulated supervisor and reap
+        os.kill(holder.pid, signal.SIGKILL)
+        holder.wait(5)
+
+        next_run = self.tmp / "runs" / "r-next"
+        next_run.mkdir(parents=True)
+        report = resume.reclaim_start_orphans(self.repo, current_run_dir=next_run, runs_root=self.tmp / "runs")
+        self.assertEqual(sorted(report.branches_removed), ["jbi/X1", "jbi/X2"])
+        self.assertFalse(wt1.exists())
+        self.assertFalse(wt2.exists())
+
+        # Zero jbi/* branches remain and zero jbi worktree registrations remain
+        remaining_jbi_branches = [b for b in wt.git(
+            self.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/jbi/", check=False).splitlines() if b]
+        self.assertEqual(remaining_jbi_branches, [])
+        remaining_wts = [e["path"] for e in resume._list_repo_worktrees(self.repo)]
+        self.assertNotIn(str(wt1), remaining_wts)
+        self.assertNotIn(str(wt2), remaining_wts)
+        # User worktree and parked ref survived untouched
+        self.assertTrue(user_wt.is_dir())
+        self.assertIsNotNone(wt.head(self.repo, "jbi-parked/keep-me"))
+
+    def test_live_run_worktree_and_branch_are_not_reclaimed(self):
+        live_run = self.tmp / "runs" / "r-live"
+        live_run.mkdir(parents=True)
+        (live_run / "control.json").write_text(json.dumps({
+            "url": "http://127.0.0.1:0", "token": "x", "run_id": "r-live", "pid": os.getpid(),
+        }))
+        live_wt = wt.create_worktree(self.repo, "LIVE", self.base, live_run / "worktrees")
+        next_run = self.tmp / "runs" / "r-other"
+        next_run.mkdir(parents=True)
+        report = resume.reclaim_start_orphans(self.repo, current_run_dir=next_run, runs_root=self.tmp / "runs")
+        self.assertEqual(report.worktrees_removed, [])
+        self.assertEqual(report.branches_removed, [])
+        self.assertTrue(live_wt.is_dir())
+        self.assertIsNotNone(wt.head(self.repo, "jbi/LIVE"))
+
+
 if __name__ == "__main__":
     unittest.main()

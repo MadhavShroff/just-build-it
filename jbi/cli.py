@@ -443,6 +443,17 @@ class Run:
             if getattr(args, "cascade", None):
                 is_offline = bool(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False))
                 install_cascade(self.store, getattr(args, "cascade"), offline=is_offline)
+            if flag_repo is not None and not getattr(args, "dry_run", False) and (flag_repo / ".git").exists():
+                from . import resume as resume_mod
+                reclaimed = resume_mod.reclaim_start_orphans(
+                    flag_repo, current_run_dir=self.dir, runs_root=HOME / "runs")
+                if reclaimed.worktrees_removed or reclaimed.branches_removed:
+                    self.store.log(
+                        "run",
+                        f"Reclaimed {len(reclaimed.worktrees_removed)} orphan worktree(s) and "
+                        f"{len(reclaimed.branches_removed)} jbi/* branch(es) at start",
+                        etype="run.config",
+                    )
 
         completer = make_completer(
             self.store,
