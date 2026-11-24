@@ -79,15 +79,20 @@ def neutral_launch(spec: dict, source: dict[str, str]) -> tuple[list[str], dict[
     a credential name in the spec env is ignored. The bootstrap strips every credential and
     gives the child a random token instead."""
     from .agents import BASE_ENV, BASE_PREFIXES, PROVIDER_ENV
-    allowed = set(BASE_ENV) | set(PROVIDER_ENV["claude-mux-lite"])
+    provider = str(spec.get("provider") or "")
+    provider_vars = set(PROVIDER_ENV.get(provider, ())) if provider != "simulator" else set()
+    allowed = set(BASE_ENV) | set(PROVIDER_ENV["claude-mux-lite"]) | provider_vars
+    blocked_spec = set(PROVIDER_ENV["claude-mux-lite"]) | provider_vars | {"CLAUDE_MUX_PROVIDER"}
     env = {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
     for name, value in (spec.get("env") or {}).items():
-        if name not in PROVIDER_ENV["claude-mux-lite"]:
+        if name not in blocked_spec:
             env[name] = value
+    if provider and provider != "claude-mux-lite":
+        env["CLAUDE_MUX_PROVIDER"] = provider
     if not env.get("CLAUDE_MUX_API_KEY"):
         try:
             from .providers import KEY_ENV
-            variable = KEY_ENV.get(spec.get("provider") or "")
+            variable = KEY_ENV.get(provider)
         except Exception:
             variable = None
         if variable and source.get(variable):

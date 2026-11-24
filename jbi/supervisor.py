@@ -332,7 +332,8 @@ class Supervisor:
                 "session_id": lease["session_id"]}
 
     def _store_lite_spec(self, task_id: str, role: str, cwd: Path, model: str, attempt: int,
-                         brief: Path, receipt: Path, base: Path, timeout_sec: float) -> Path:
+                         brief: Path, receipt: Path, base: Path, timeout_sec: float, *,
+                         provider: str = "") -> Path:
         dispatch = self._stage_dispatch(f"s-{task_id}-{role}-{attempt + 1}", task_id, cwd, model, brief,
                                         attempt=attempt)
         task = self.store.read(f"/plan/tasks/{task_id}") or {}
@@ -347,6 +348,8 @@ class Supervisor:
                 "repo_context": json.dumps(self.store.read("/plan/prd") or {}, sort_keys=True),
                 "frozen_contracts": json.dumps(task.get("contracts") or [], sort_keys=True),
                 "usage_path": str(base / "usage.json")}
+        if provider:
+            spec["provider"] = provider
         base.mkdir(parents=True, exist_ok=True)
         path = base / "spec.json"
         path.write_text(json.dumps(spec), encoding="utf-8")
@@ -404,7 +407,19 @@ class Supervisor:
             ident = self.identities.pop(sid, {})            # an ended session leaves the kill set
         self._end_session(session)
         if lite_usage_path.is_file():
-            session.status.update(json.loads(lite_usage_path.read_text(encoding="utf-8")))
+            try:
+                session.status.update(json.loads(lite_usage_path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass
+        log_path = Path(f"{base}.log")
+        if log_path.is_file():
+            try:
+                from . import providers as _providers
+                raw_log = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                if raw_log:
+                    session.status["stderr_excerpt"] = _providers.redact(raw_log[-2000:])
+            except OSError:
+                pass
         self._record_lite_usage(sid)
         session.finished = True
         self._reclaim_window(session)
@@ -558,7 +573,8 @@ class Supervisor:
             job = agents.AgentJob(choice.provider, choice.model, "bootstrap", "bootstrap", self.repo, brief, receipt)
             if choice.provider != "simulator":
                 path = self._store_lite_spec("bootstrap", "bootstrap", self.repo, choice.model, 0, brief, receipt,
-                                             self.run_dir / "sessions" / "s-bootstrap-bootstrap-1", 1800)
+                                             self.run_dir / "sessions" / "s-bootstrap-bootstrap-1", 1800,
+                                             provider=choice.provider)
                 job = agents.AgentJob(**{**job.__dict__, "spec_path": path})
             self.run_session("bootstrap", "bootstrap", agents.command(job), self.repo, choice.provider,
                              choice.model, 0)
@@ -896,7 +912,8 @@ class Supervisor:
             self._task_lease(tid, worktree)
             lite_spec = self._store_lite_spec(
                 tid, stage.name, worktree, choice.model, attempt, brief, receipt,
-                self.run_dir / "sessions" / f"s-{tid}-{stage.name}-{attempt + 1}", limits["agent_timeout_s"])
+                self.run_dir / "sessions" / f"s-{tid}-{stage.name}-{attempt + 1}", limits["agent_timeout_s"],
+                provider=choice.provider)
             job = agents.AgentJob(**{**job.__dict__, "spec_path": lite_spec})
         limits = rigor.task_timeouts(task)
         use_watchdog = choice.provider != "simulator" or bool(state.get("config", {}).get("enforce_timeouts"))
@@ -941,7 +958,14 @@ class Supervisor:
         elif discard:
             wt.discard_changes(worktree)        # verifiers and reviewers never edit code
         if result is None:
-            return False, f"no valid receipt (exit {session.status.get('exit_code')}, reason {reason or 'none'})", choice.model
+            excerpt = str(session.status.get("final_text") or session.status.get("stderr_excerpt") or "").strip()
+            code = session.status.get("exit_code")
+            if excerpt:
+                suffix = f" (exit {code}, {reason})" if reason else f" (exit {code})"
+                return False, f"{excerpt[:1500]}{suffix}", choice.model
+            if reason:
+                return False, f"no valid receipt (exit {code}, {reason})", choice.model
+            return False, f"no valid receipt (exit {code}, agent produced no stderr)", choice.model
         return result.passed, "\n".join(result.findings), choice.model
 
     # ---- merging ---------------------------------------------------------------------

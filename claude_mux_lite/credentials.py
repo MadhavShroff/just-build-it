@@ -20,29 +20,54 @@ import http.server
 import json
 import os
 import secrets
+import shutil
 import signal
 import socket
 import socketserver
 import struct
+import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 BROKER_ENV = "CLAUDE_MUX_BROKER"
 TOKEN_ENV = "CLAUDE_MUX_API_KEY"
+PROVIDER_ENV_VAR = "CLAUDE_MUX_PROVIDER"
 TIMEOUT_HEADER = "X-Broker-Timeout"
 UPSTREAM_TIMEOUT_HEADER = "X-Broker-Upstream-Timeout"
 TRANSPORT_HEADER = "X-Broker-Transport-Error"
 MAX_SOCKET_PATH = 100
 MAX_BODY = 64 * 1024 * 1024
 # Real credential variables. The bootstrap removes every one of them from the child.
-STRIPPED = ("CLAUDE_MUX_API_KEY", "CLAUDE_MUX_HEADERS", "CLAUDE_MUX_BASE_URL", "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-            "GOOGLE_APPLICATION_CREDENTIALS")
+STRIPPED = ("CLAUDE_MUX_API_KEY", "CLAUDE_MUX_HEADERS", "CLAUDE_MUX_BASE_URL", PROVIDER_ENV_VAR,
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+            "CLAUDE_CONFIG_DIR", "OPENAI_API_KEY", "OPENAI_BASE_URL", "JBI_OPENAI_BASE_URL",
+            "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS")
 DEFAULT_BASE_URL = "http://127.0.0.1:8788"
+ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+AGY_CLI_UPSTREAM = "agy://cli"
+_AGY_TURN_SCHEMA = json.dumps({
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "tool_calls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "input": {"type": "object"},
+                },
+                "required": ["name", "input"],
+            },
+        },
+    },
+    "required": ["text", "tool_calls"],
+}, separators=(",", ":"))
 
 
 class BrokerError(RuntimeError):
@@ -63,6 +88,190 @@ def _peer(connection: socket.socket) -> tuple[int, int]:
     return pid, uid
 
 
+class _AgyBridge:
+    """Serve Anthropic-shaped /v1/messages turns through the local `agy` CLI.
+
+    The CLI runs in an empty private directory with slash commands disabled and
+    structured JSON output enforced. It never touches the repository worktree;
+    the neutral harness executes every tool call inside its lease fence.
+    """
+
+    def __init__(self, secret_values: list[str]):
+        self._workdir = Path(tempfile.mkdtemp(prefix="jbi-agy-"))
+        os.chmod(self._workdir, 0o700)
+        self._conversation_id: str | None = None
+        self._sent_count = 0
+        self._secrets = list(secret_values)
+
+    def close(self) -> None:
+        shutil.rmtree(self._workdir, ignore_errors=True)
+
+    @staticmethod
+    def _flatten_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return json.dumps(content, sort_keys=True)
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                parts.append(str(block))
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(str(block.get("text") or ""))
+            elif btype == "tool_use":
+                parts.append(f"[tool_use {block.get('name')} id={block.get('id')}]: "
+                             f"{json.dumps(block.get('input') or {}, sort_keys=True)}")
+            elif btype == "tool_result":
+                prefix = "ERROR " if block.get("is_error") else ""
+                parts.append(f"[tool_result {prefix}for {block.get('tool_use_id')}]: "
+                             f"{_AgyBridge._flatten_content(block.get('content'))}")
+            else:
+                parts.append(json.dumps(block, sort_keys=True))
+        return "\n".join(p for p in parts if p)
+
+    @staticmethod
+    def _render_full_prompt(payload: dict) -> str:
+        system_text = _AgyBridge._flatten_content(payload.get("system") or "")
+        tools = payload.get("tools") or []
+        tool_lines = []
+        for tool in tools:
+            if isinstance(tool, dict):
+                schema = tool.get("input_schema") or {}
+                props = list((schema.get("properties") or {}).keys())
+                req = list(schema.get("required") or [])
+                tool_lines.append(f"- {tool.get('name')}({', '.join(props)}; required: {', '.join(req)}): "
+                                  f"{tool.get('description', '')}")
+        parts = [
+            "JSON API BRIDGE MODE: Do NOT call any built-in agent tools or shell commands yourself. "
+            "Respond ONLY with JSON matching the schema {\"text\": string, \"tool_calls\": [{\"name\": string, \"input\": object}]}. "
+            "To execute one or more tools in the fenced workspace, put them in tool_calls and wait for their tool_result. "
+            "When the task is complete and verified, return tool_calls=[] and put your final receipt response in text.",
+        ]
+        if system_text:
+            parts.append("SYSTEM:\n" + system_text)
+        if tool_lines:
+            parts.append("AVAILABLE TOOLS:\n" + "\n".join(tool_lines))
+        for msg in payload.get("messages") or []:
+            if isinstance(msg, dict):
+                role = str(msg.get("role") or "user").upper()
+                parts.append(f"{role}:\n{_AgyBridge._flatten_content(msg.get('content'))}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _render_delta_prompt(messages: list[dict], start_index: int) -> str:
+        parts = [
+            "Continue in JSON API bridge mode. Do NOT invoke built-in tools; return ONLY JSON "
+            "matching {\"text\": string, \"tool_calls\": [{\"name\": string, \"input\": object}]}."
+        ]
+        for msg in messages[start_index:]:
+            if isinstance(msg, dict):
+                role = str(msg.get("role") or "user").upper()
+                parts.append(f"{role}:\n{_AgyBridge._flatten_content(msg.get('content'))}")
+        return "\n\n".join(parts)
+
+    def _invoke(self, model: str, prompt: str, timeout: float, *, conversation_id: str | None) -> subprocess.CompletedProcess:
+        binary = shutil.which("agy")
+        if not binary:
+            raise FileNotFoundError("agy CLI is not installed on PATH")
+        argv = [binary, "--model", model, "--output-format", "json",
+                "--disable-slash-commands", "--json-schema", _AGY_TURN_SCHEMA]
+        if conversation_id:
+            argv += ["--conversation", conversation_id]
+        argv.append(f"-p={prompt}")
+        return subprocess.run(argv, cwd=str(self._workdir), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+
+    def handle(self, body: bytes, timeout: float) -> tuple[int, bytes, dict[str, str]]:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            return 400, f"invalid request JSON: {exc}".encode("utf-8"), {}
+        model = str(payload.get("model") or "gemini-4-neon-high")
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        use_conv = bool(self._conversation_id and self._sent_count > 0 and len(messages) > self._sent_count)
+        prompt = (self._render_delta_prompt(messages, self._sent_count) if use_conv
+                  else self._render_full_prompt(payload))
+        try:
+            proc = self._invoke(model, prompt, timeout, conversation_id=self._conversation_id if use_conv else None)
+            if proc.returncode != 0 and use_conv:
+                self._conversation_id = None
+                proc = self._invoke(model, self._render_full_prompt(payload), timeout, conversation_id=None)
+        except subprocess.TimeoutExpired:
+            return 504, b"", {TIMEOUT_HEADER: "1"}
+        except FileNotFoundError as exc:
+            return 502, b"", {TRANSPORT_HEADER: _redact(str(exc), self._secrets)[:300]}
+        except OSError as exc:
+            return 502, b"", {TRANSPORT_HEADER: _redact(f"agy launch failed: {exc}", self._secrets)[:300]}
+        if proc.returncode != 0:
+            raw_err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+            clean = _redact(raw_err, self._secrets)[:500]
+            lower = clean.lower()
+            if any(tok in lower for tok in ("429", "rate limit", "rate_limit", "quota", "resource_exhausted", "capacity")):
+                return 429, clean.encode("utf-8"), {}
+            return 502, b"", {TRANSPORT_HEADER: f"agy exited {proc.returncode}: {clean}"[:300]}
+        try:
+            doc = json.loads(proc.stdout)
+        except ValueError:
+            clean = _redact((proc.stderr or proc.stdout).strip(), self._secrets)[:300]
+            return 502, b"", {TRANSPORT_HEADER: f"agy returned non-JSON output: {clean}"[:300]}
+        if isinstance(doc, dict) and isinstance(doc.get("conversation_id"), str) and doc["conversation_id"]:
+            self._conversation_id = doc["conversation_id"]
+            self._sent_count = len(messages)
+        structured = doc.get("structured_output") if isinstance(doc, dict) else None
+        if not isinstance(structured, dict):
+            raw_resp = doc.get("response") if isinstance(doc, dict) else ""
+            if isinstance(raw_resp, str) and raw_resp.strip():
+                try:
+                    parsed = json.loads(raw_resp)
+                    structured = parsed if isinstance(parsed, dict) else {"text": raw_resp, "tool_calls": []}
+                except ValueError:
+                    structured = {"text": raw_resp, "tool_calls": []}
+            else:
+                structured = {"text": "", "tool_calls": []}
+        text = str(structured.get("text") or "")
+        raw_calls = structured.get("tool_calls") if isinstance(structured.get("tool_calls"), list) else []
+        content: list[dict[str, Any]] = []
+        if text.strip():
+            content.append({"type": "text", "text": text})
+        has_tools = False
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name")
+            inp = call.get("input")
+            if isinstance(name, str) and name.strip() and isinstance(inp, dict):
+                has_tools = True
+                content.append({
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid.uuid4().hex[:12]}",
+                    "name": name.strip(),
+                    "input": inp,
+                })
+        if not content:
+            content.append({"type": "text", "text": text})
+        raw_usage = doc.get("usage") if isinstance(doc, dict) and isinstance(doc.get("usage"), dict) else {}
+        usage: dict[str, int] = {}
+        for dst, src in (("input_tokens", "input_tokens"),
+                         ("output_tokens", "output_tokens"),
+                         ("cache_read_input_tokens", "cache_read_tokens")):
+            val = raw_usage.get(src)
+            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+                usage[dst] = val
+        answer: dict[str, Any] = {
+            "id": f"msg_{uuid.uuid4().hex[:12]}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": "tool_use" if has_tools else "end_turn",
+        }
+        if usage:
+            answer["usage"] = usage
+        return 200, json.dumps(answer, separators=(",", ":")).encode("utf-8"), {}
+
+
 class _Server(socketserver.UnixStreamServer):
     """One request at a time. One client process only."""
 
@@ -77,6 +286,11 @@ class _Server(socketserver.UnixStreamServer):
         self.token, self.upstream, self.key, self.extra = token, upstream.rstrip("/"), key, headers
         self.client_pid: int | None = None
         self.secret_values = [key, *headers.values()]
+        self.agy_bridge = _AgyBridge(self.secret_values) if self.upstream == AGY_CLI_UPSTREAM else None
+
+    def close_bridge(self) -> None:
+        if self.agy_bridge is not None:
+            self.agy_bridge.close()
 
     def server_bind(self) -> None:          # bound by the caller
         pass
@@ -130,30 +344,63 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             timeout = min(float(self.headers.get(UPSTREAM_TIMEOUT_HEADER, "1200")), 3600.0)
         except ValueError:
             timeout = 1200.0
-        request = urllib.request.Request(f"{self.server.upstream}/v1/messages", data=body, headers=headers,
-                                         method="POST")
         status, payload, extra = 200, b"", {}
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                status, payload = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            status = error.code
-            payload = _redact(error.read().decode("utf-8", "replace")[:500], self.server.secret_values).encode()
-            retry = error.headers.get("Retry-After") if error.headers else None
-            if retry:
-                extra["Retry-After"] = retry
-        except (TimeoutError, urllib.error.URLError, ConnectionError, OSError) as error:
-            if isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError):
-                status, extra = 504, {TIMEOUT_HEADER: "1"}
-            else:
-                status = 502
-                extra = {TRANSPORT_HEADER: _redact(f"transport failure: {error}", self.server.secret_values)[:300]}
+        if self.server.agy_bridge is not None:
+            status, payload, extra = self.server.agy_bridge.handle(body, timeout)
+        else:
+            request = urllib.request.Request(f"{self.server.upstream}/v1/messages", data=body, headers=headers,
+                                             method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    status, payload = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                status = error.code
+                payload = _redact(error.read().decode("utf-8", "replace")[:500], self.server.secret_values).encode()
+                retry = error.headers.get("Retry-After") if error.headers else None
+                if retry:
+                    extra["Retry-After"] = retry
+            except (TimeoutError, urllib.error.URLError, ConnectionError, OSError) as error:
+                if isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError):
+                    status, extra = 504, {TIMEOUT_HEADER: "1"}
+                else:
+                    status = 502
+                    extra = {TRANSPORT_HEADER: _redact(f"transport failure: {error}", self.server.secret_values)[:300]}
         self.send_response(status)
         self.send_header("Content-Length", str(len(payload)))
         for name, value in extra.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
+
+
+def _parse_custom_headers(raw: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        name, value = name.strip(), value.strip()
+        if name and value:
+            headers[name] = value
+    return headers
+
+
+def _claude_oauth_token(environ: Mapping[str, str]) -> str:
+    config_dir = environ.get("CLAUDE_CONFIG_DIR")
+    base = Path(config_dir) if config_dir else (Path(environ.get("HOME") or str(Path.home())) / ".claude")
+    cred_path = base / ".credentials.json"
+    try:
+        st = cred_path.stat()
+        if not cred_path.is_file() or st.st_uid != os.getuid():
+            return ""
+        data = json.loads(cred_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    oauth = data.get("claudeAiOauth")
+    token = oauth.get("accessToken") if isinstance(oauth, dict) else ""
+    return token.strip() if isinstance(token, str) else ""
 
 
 def take_from_environment(environ: Mapping[str, str]) -> tuple[str, dict[str, str], str]:
@@ -169,7 +416,29 @@ def take_from_environment(environ: Mapping[str, str]) -> tuple[str, dict[str, st
         if not isinstance(headers, dict) or not all(isinstance(k, str) and isinstance(v, str)
                                                     for k, v in headers.items()):
             raise BrokerError("CLAUDE_MUX_HEADERS must be a JSON object of strings")
-    return key, headers, environ.get("CLAUDE_MUX_BASE_URL") or DEFAULT_BASE_URL
+    explicit_base = environ.get("CLAUDE_MUX_BASE_URL")
+    if explicit_base:
+        return key, headers, explicit_base
+    provider = (environ.get(PROVIDER_ENV_VAR) or "").strip().lower()
+    if provider == "agy":
+        return key, headers, AGY_CLI_UPSTREAM
+    if provider == "claude":
+        custom = _parse_custom_headers(environ.get("ANTHROPIC_CUSTOM_HEADERS") or "")
+        merged_headers = {**custom, **headers}
+        if not key:
+            key = (environ.get("ANTHROPIC_API_KEY")
+                   or environ.get("ANTHROPIC_AUTH_TOKEN")
+                   or _claude_oauth_token(environ))
+        if key.startswith("sk-ant-oat"):
+            merged_headers.setdefault("anthropic-beta", "oauth-2025-04-20")
+        upstream = environ.get("ANTHROPIC_BASE_URL") or ANTHROPIC_BASE_URL
+        return key, merged_headers, upstream
+    if provider == "openai-compatible":
+        upstream = environ.get("JBI_OPENAI_BASE_URL") or environ.get("OPENAI_BASE_URL") or DEFAULT_BASE_URL
+        if not key:
+            key = environ.get("OPENAI_API_KEY") or ""
+        return key, headers, upstream
+    return key, headers, DEFAULT_BASE_URL
 
 
 def _pdeathsig() -> None:
@@ -246,8 +515,11 @@ def start_broker(session_dir: Path, environ: Mapping[str, str]) -> dict[str, str
         signal.signal(signal.SIGTERM, stop)
         server = _Server(sock, _Handler, token=token, upstream=upstream, key=key, headers=headers)
         server.timeout = 0.5
-        while os.getppid() == parent:
-            server.handle_request()
+        try:
+            while os.getppid() == parent:
+                server.handle_request()
+        finally:
+            server.close_bridge()
     except SystemExit:
         pass
     except BaseException:

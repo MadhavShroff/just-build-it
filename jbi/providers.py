@@ -295,7 +295,7 @@ def _cli_call(provider: str, model: str, prompt: Prompt, timeout: int) -> tuple[
     elif provider == "codex":
         argv, stdin, parse = ["codex", "exec", "--json", "-m", model], text, _parse_codex
     else:
-        argv, stdin, parse = ["agy", "-p", "--model", model, "--output-format", "json", text], None, _parse_agy
+        argv, stdin, parse = ["agy", "-p", text, "--model", model, "--output-format", "json"], None, _parse_agy
     done = _run(argv, stdin, timeout, env)
     if done.returncode != 0:
         raise CallFailed(done.returncode, done.stderr or "", done.stdout or "")

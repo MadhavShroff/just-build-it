@@ -66,6 +66,7 @@ def main(arguments: list[str]) -> int:
         usage_path.parent.mkdir(parents=True, exist_ok=True)
         usage_path.write_text(json.dumps({"exit_code": 3,
                                          "final_text": "internal store is missing", "ended_at": now()}))
+        print("internal store is missing", file=sys.stderr, flush=True)
         return 3
     tracking = Tracking(tracking_path)
     history: list[dict] = []
@@ -104,10 +105,14 @@ def main(arguments: list[str]) -> int:
                  "cache_write": result.usage.cache_write, "exit_code": result.exit_code,
                  "final_text": result.final_text, "turns": result.turns, "ended_at": now()}
         usage_path.write_text(json.dumps(usage, separators=(",", ":")))
+        if result.exit_code != 0 and result.final_text:
+            print(result.final_text, file=sys.stderr, flush=True)
         return result.exit_code
     except sqlite3.Error as error:
+        msg = f"internal store error: {error}"
         usage_path.write_text(json.dumps({"dispatch_id": spec["dispatch_id"], "exit_code": 3,
-                                         "final_text": f"internal store error: {error}", "ended_at": now()}))
+                                         "final_text": msg, "ended_at": now()}))
+        print(msg, file=sys.stderr, flush=True)
         return 3
     finally:
         tracking.close()
