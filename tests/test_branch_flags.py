@@ -415,10 +415,12 @@ class CascadeOverride(unittest.TestCase):
         choice = models.select(self.state(), "implement", cooldowns=cooldowns)
         self.assertEqual((choice.provider, choice.model), ("agy", "gemini-4-neon-high"))
 
-    def test_a_task_preference_outranks_the_cascade(self):
-        task = {"id": "x", "override": {"prefer": [{"provider": "agy", "model": "gemini-4-neon-high"}]}}
+    def test_a_run_cascade_outranks_a_soft_task_preference(self):
+        task = {"id": "x", "override": {"prefer": [{"provider": "agy", "model": "gemini-4-argon-high"}]}}
         choice = models.select(self.state(), "implement", task=task)
-        self.assertEqual((choice.provider, choice.model), ("agy", "gemini-4-neon-high"))
+        self.assertEqual((choice.provider, choice.model), ("claude", "claude-opus-5-5"))
+        without_cascade = models.select(self.state(cascade=False), "implement", task=task)
+        self.assertEqual((without_cascade.provider, without_cascade.model), ("agy", "gemini-4-argon-high"))
 
     def test_a_pin_still_runs_on_its_model_alone(self):
         task = {"id": "x", "override": {"pin": {"provider": "claude", "model": "claude-opus-5-5"}}}

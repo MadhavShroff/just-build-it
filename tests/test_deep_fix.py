@@ -171,5 +171,118 @@ class Defect1DispatchRoutingAndStderr(unittest.TestCase):
         self.assertIn("transport failure", detail.lower())
 
 
+class Defect2CascadeReachesDispatch(unittest.TestCase):
+    """Defect 2: --cascade founder reaches the actual dispatched agent and cascades across rungs."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-d2-"))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.repo, self.base = _make_repo(self.tmp)
+        self.run_dir = self.tmp / "run"
+        self.run_dir.mkdir()
+
+    def test_dispatch_applies_founder_cascade_over_stale_dag_prefer(self):
+        state = protocol.initial_state("r-d2-a", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["config"]["rigor"] = "vibe"
+        state["accounts"] = {
+            "claude": {"label": "Claude", "enabled": True, "status": "ok"},
+            "agy": {"label": "Google Antigravity", "enabled": True, "status": "ok"},
+        }
+        # Exact stale override.prefer shape found in wave4-execution-dag.json
+        state["plan"] = waves.compile_plan([
+            {"id": "T1", "title": "A", "goal": "Write src/a.txt", "deps": [],
+             "owns": ["src/a.txt"], "acceptance": "true",
+             "override": {"prefer": [{"provider": "agy", "model": "gemini-4-argon-high"},
+                                     {"provider": "claude", "model": "claude-opus-5-5"}]}},
+        ], 1)
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        cli.install_cascade(store, "founder")
+        sup = Supervisor(store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+        worktree = wt.create_worktree(self.repo, "T1", self.base, self.run_dir / "worktrees")
+
+        call = write_call()
+        call["content"][0]["input"] = {"path": "src/a.txt", "content": "ok\n"}
+        with FakeEndpoint([call, final("BRIEF T1 | uncommitted | PASS")]) as ep:
+            with mock.patch.dict(os.environ, {"CLAUDE_MUX_BASE_URL": ep.url, "CLAUDE_MUX_API_KEY": SECRET}):
+                ok, detail, model = sup._agent_stage(
+                    store.read("/plan/tasks/T1"), rigor.stage("vibe", "implement"), worktree, [])
+        self.assertTrue(ok, detail)
+        self.assertEqual(model, "claude-opus-5-5")
+        self.assertEqual([r["body"]["model"] for r in ep.requests], ["claude-opus-5-5", "claude-opus-5-5"])
+        self.assertNotIn("gemini-4-argon-high", [r["body"]["model"] for r in ep.requests])
+        self.assertEqual(store.read("/sessions/s-T1-implement-1/model"), "claude-opus-5-5")
+        self.assertEqual(store.read("/sessions/s-T1-implement-1/provider"), "claude")
+
+    def test_dispatch_cascades_opus_to_neon_to_carbon_on_rate_limit(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        seen_models: list[str] = []
+
+        class CascadeServer(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                model = body["model"]
+                seen_models.append(model)
+                if model in ("claude-opus-5-5", "gemini-4-neon-high"):
+                    err = json.dumps({"type": "error", "error": {"type": "rate_limit_error", "message": "429"}}).encode()
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Retry-After", "0")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+                ans = json.dumps(final("BRIEF T1 | uncommitted | PASS")).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(ans)))
+                self.end_headers()
+                self.wfile.write(ans)
+
+            def log_message(self, *args):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), CascadeServer)
+        url = f"http://127.0.0.1:{srv.server_address[1]}"
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close(), t.join(5)))
+
+        state = protocol.initial_state("r-d2-b", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["config"]["rigor"] = "vibe"
+        state["accounts"] = {
+            "claude": {"label": "Claude", "enabled": True, "status": "ok"},
+            "agy": {"label": "Google Antigravity", "enabled": True, "status": "ok"},
+        }
+        state["plan"] = waves.compile_plan([
+            {"id": "T1", "title": "A", "goal": "Do task", "deps": [],
+             "owns": ["src/a.txt"], "acceptance": "true"},
+        ], 1)
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        cli.install_cascade(store, "founder")
+        sup = Supervisor(store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+        worktree = wt.create_worktree(self.repo, "T1", self.base, self.run_dir / "worktrees")
+
+        dispatched: list[str] = []
+        with mock.patch.dict(os.environ, {"CLAUDE_MUX_BASE_URL": url, "CLAUDE_MUX_API_KEY": SECRET}):
+            for attempt in range(3):
+                store.commit("t", Changes().set("plan", "tasks", "T1", "attempts", attempt), {})
+                ok, detail, model = sup._agent_stage(
+                    store.read("/plan/tasks/T1"), rigor.stage("vibe", "implement"), worktree, [])
+                dispatched.append(model)
+                if ok:
+                    break
+        self.assertTrue(ok, detail)
+        self.assertEqual(dispatched, ["claude-opus-5-5", "gemini-4-neon-high", "gemini-4-carbon-high"])
+        self.assertNotIn("gemini-4-argon-high", seen_models)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -962,11 +962,34 @@ class Supervisor:
             code = session.status.get("exit_code")
             if excerpt:
                 suffix = f" (exit {code}, {reason})" if reason else f" (exit {code})"
-                return False, f"{excerpt[:1500]}{suffix}", choice.model
-            if reason:
-                return False, f"no valid receipt (exit {code}, {reason})", choice.model
-            return False, f"no valid receipt (exit {code}, agent produced no stderr)", choice.model
+                detail = f"{excerpt[:1500]}{suffix}"
+            elif reason:
+                detail = f"no valid receipt (exit {code}, {reason})"
+            else:
+                detail = f"no valid receipt (exit {code}, agent produced no stderr)"
+            self._maybe_cool_lane(tid, choice, session, detail)
+            return False, detail, choice.model
         return result.passed, "\n".join(result.findings), choice.model
+
+    def _maybe_cool_lane(self, tid: str, choice: models.Choice, session: Session, detail: str) -> None:
+        """Cool a provider/model lane when dispatch failed before productive work or hit a provider limit."""
+        if choice.provider == "simulator":
+            return
+        code = session.status.get("exit_code")
+        if code in (None, 0):
+            return
+        lower = detail.lower()
+        provider_error = any(tok in lower for tok in (
+            "429", "529", "401", "403", "502", "503", "504",
+            "rate limit", "rate_limit", "quota", "overloaded", "capacity",
+            "authentication_error", "transport failure", "connection refused",
+            "resource_exhausted", "credential broker failed",
+        ))
+        zero_turn_error = session.status.get("turns") == 0
+        if provider_error or zero_turn_error:
+            lane_key = f"{choice.provider}/{choice.model}"
+            self.cooldowns.mark(lane_key, 120.0)
+            self.store.log("cascade", f"{tid}: {lane_key} cooled after dispatch error", task=tid)
 
     # ---- merging ---------------------------------------------------------------------
 
