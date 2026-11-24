@@ -164,42 +164,43 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     # brief, store, or command arguments. A direct provider CLI is not a fallback.
     up = [name for name in up if name in AGENT_PROVIDERS]
 
-    # A PIN runs on one model only, and waits for it.
+    # A PIN runs on one model only, and waits for it. The provider name is
+    # normalized the same way the cascade and prefer paths normalize it.
     pinned = override.get("pin")
     if isinstance(pinned, dict) and pinned.get("provider") and pinned.get("model"):
-        return _choice(str(pinned["provider"]), str(pinned["model"]), tier)
+        return _choice(str(pinned["provider"]).strip().lower(), str(pinned["model"]), tier)
 
-    # A PREFERENCE list is tried in order, then the pool, then the account preference.
-    # Without a task preference, the run's cascade (`--cascade founder`) is the order.
+    # An explicit run cascade (`--cascade founder`) overrides soft task preferences
+    # baked into a DAG file. Only a hard PIN outranks the run cascade.
     # One entry is skipped while its provider is cooling, or while its own lane key
-    # `provider/model` cools: that is how Neon falls back to Carbon.
-    prefer = override.get("prefer")
-    if not (isinstance(prefer, list) and prefer):
-        prefer = (state.get("config") or {}).get("provider_cascade")
+    # `provider/model` cools: that is how Opus falls back to Neon and Neon to Carbon.
+    cascade = (state.get("config") or {}).get("provider_cascade")
+    prefer = cascade if (isinstance(cascade, list) and cascade) else override.get("prefer")
     if isinstance(prefer, list) and prefer:
         def lane_burned(want: dict, respect_provider_cooldown: bool) -> bool:
-            provider, model = want.get("provider"), want.get("model")
+            provider = str(want.get("provider") or "").strip().lower()
+            model = want.get("model")
             if model and cooldowns is not None and cooldowns.cooling(f"{provider}/{model}"):
                 return True
             return bool(respect_provider_cooldown and cooldowns is not None
-                        and cooldowns.cooling(str(provider)))
+                        and cooldowns.cooling(provider))
 
         for want in prefer:
             if not isinstance(want, dict):
                 continue
-            provider = want.get("provider")
+            provider = str(want.get("provider") or "").strip().lower()
             model = want.get("model")
             if provider and provider in up and not lane_burned(want, True):
                 model = model or catalog()["providers"][provider]["models"][tier]
-                return _choice(str(provider), str(model), tier)
+                return _choice(provider, str(model), tier)
         for want in prefer:
             if not isinstance(want, dict):
                 continue
-            provider = want.get("provider")
+            provider = str(want.get("provider") or "").strip().lower()
             model = want.get("model")
             if provider and provider in up and not lane_burned(want, False):
                 model = model or catalog()["providers"][provider]["models"][tier]
-                return _choice(str(provider), str(model), tier)
+                return _choice(provider, str(model), tier)
         # None of the preferred providers is usable. Fall through to the pool or the account preference.
 
     if pool:
@@ -222,7 +223,7 @@ def blocked(state: dict, task: dict | None = None) -> str | None:
     pinned = override.get("pin")
     if not (isinstance(pinned, dict) and pinned.get("provider")):
         return None
-    provider = str(pinned["provider"])
+    provider = str(pinned["provider"]).strip().lower()
     if provider in usable(state):
         return None
     return "pinned to %s / %s, which is not available" % (provider, pinned.get("model") or "?")

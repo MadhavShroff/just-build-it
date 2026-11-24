@@ -72,6 +72,7 @@ class Store:
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._db = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
+        self._db.execute("PRAGMA busy_timeout=10000")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
@@ -81,6 +82,19 @@ class Store:
             if initial is None:
                 raise ValueError(f"{self.path} holds no run and no initial state was given")
             self.commit("run.created", [jp.replace("", initial)])
+
+    @staticmethod
+    def _retry_db(fn):
+        """Retry transient SQLite lock contention so a failure storm never kills the writer."""
+        for attempt in range(10):
+            try:
+                return fn()
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < 9:
+                    time.sleep(min(0.5, 0.02 * (1.5 ** attempt)))
+                    continue
+                raise
 
     # ---- reading -------------------------------------------------------------------
 
@@ -102,9 +116,9 @@ class Store:
 
     def events_after(self, seq: int, limit: int = 500) -> list[dict]:
         with self._lock:
-            rows = self._db.execute(
+            rows = self._retry_db(lambda: self._db.execute(
                 "SELECT seq, ts, type, ops, meta FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
-                (seq, limit)).fetchall()
+                (seq, limit)).fetchall())
         return [{"seq": s, "ts": ts, "type": t, "ops": json.loads(o), "meta": json.loads(m)}
                 for s, ts, t, o, m in rows]
 
@@ -127,12 +141,14 @@ class Store:
         with self._lock:
             candidate = jp.apply(copy.deepcopy(self.state), ops)
             event = {"seq": self.seq + 1, "ts": now(), "type": etype, "ops": ops, "meta": meta}
-            self._db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-                             (event["seq"], event["ts"], etype, json.dumps(ops), json.dumps(meta)))
+            self._retry_db(lambda: self._db.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+                (event["seq"], event["ts"], etype, json.dumps(ops), json.dumps(meta))))
             self.state, self.seq = candidate, event["seq"]
             if self.seq % SNAPSHOT_EVERY == 0:
-                self._db.execute("INSERT OR REPLACE INTO snapshots VALUES (?, ?)",
-                                 (self.seq, json.dumps(self.state)))
+                self._retry_db(lambda: self._db.execute(
+                    "INSERT OR REPLACE INTO snapshots VALUES (?, ?)",
+                    (self.seq, json.dumps(self.state))))
             self._changed.notify_all()
             return event
 
@@ -158,8 +174,9 @@ class Store:
 
     def record_command(self, cid: str, ctype: str, payload: dict, result: dict) -> None:
         with self._lock:
-            self._db.execute("INSERT OR IGNORE INTO commands VALUES (?, ?, ?, ?, ?)",
-                             (cid, ctype, json.dumps(payload), json.dumps(result), now()))
+            self._retry_db(lambda: self._db.execute(
+                "INSERT OR IGNORE INTO commands VALUES (?, ?, ?, ?, ?)",
+                (cid, ctype, json.dumps(payload), json.dumps(result), now())))
 
     @property
     def lock(self) -> threading.RLock:
@@ -170,7 +187,8 @@ class Store:
             self._closed = True
             self._changed.notify_all()
         with self._lock:
-            self._db.execute("INSERT OR REPLACE INTO snapshots VALUES (?, ?)", (self.seq, json.dumps(self.state)))
+            self._retry_db(lambda: self._db.execute(
+                "INSERT OR REPLACE INTO snapshots VALUES (?, ?)", (self.seq, json.dumps(self.state))))
             self._db.close()
 
 

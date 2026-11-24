@@ -190,7 +190,7 @@ def cascade_providers(cascade: str | None) -> set[str]:
     """
     if cascade == "founder":
         from . import models
-        return {entry["provider"] for entry in models.FOUNDER_CASCADE}
+        return {str(entry["provider"]).strip().lower() for entry in models.FOUNDER_CASCADE}
     if not cascade:
         return set()
     try:
@@ -199,11 +199,33 @@ def cascade_providers(cascade: str | None) -> set[str]:
         return set()
     if not isinstance(entries, list):
         return set()
-    return {str(entry.get("provider")) for entry in entries
-            if isinstance(entry, dict) and entry.get("provider")}
+    return {str(entry.get("provider")).strip().lower() for entry in entries
+            if isinstance(entry, dict) and str(entry.get("provider") or "").strip()}
 
 
-def install_cascade(store: Store, cascade: str | None) -> None:
+def _enable_cascade_accounts(store: Store, entries: list[dict], *, offline: bool = False) -> None:
+    """Enable every catalog provider named by `entries`, unless the run is offline or dry-run."""
+    if offline or store.read("/config/dry_run"):
+        return
+    from . import providers
+    from .store import Changes
+    known = providers.catalog()["providers"]
+    changes = Changes()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("provider") or "").strip().lower()
+        if name not in known:
+            continue
+        account = store.read(f"/accounts/{name}") or providers.blank_account(name)
+        if not account.get("enabled"):
+            account = {**account, "enabled": True}
+            changes.set("accounts", name, account)
+    if changes:
+        store.commit("account.status", changes, {})
+
+
+def install_cascade(store: Store, cascade: str | None, *, offline: bool = False) -> None:
     """Store the run's cascade override in `provider_cascade`. 'founder' installs the founder order.
 
     The cascade is an ordered list of {provider, model} entries. `models.select` walks
@@ -231,6 +253,7 @@ def install_cascade(store: Store, cascade: str | None) -> None:
             raise SystemExit(f"morph_refused: cascade entry {name!r} is a morph "
                              "model; morph answers 401 and nothing in jbi may depend on it")
     store.commit("config", Changes().set("config", "provider_cascade", entries), {})
+    _enable_cascade_accounts(store, entries, offline=offline)
     order = ", ".join(f"{entry.get('provider')}/{entry.get('model')}" for entry in entries)
     store.log("config", f"Cascade installed: {order}", etype="run.config")
 
@@ -251,19 +274,38 @@ def latest_run_dir() -> Path:
     return runs[-1]
 
 
-def prepare_resume(store: Store) -> list[str]:
+def prepare_resume(store: Store, *, offline: bool = False) -> list[str]:
     """Reconcile stored task states so an interrupted run continues cleanly on reopen."""
     from . import resume as resume_mod
     from . import rigor
     from .store import Changes
 
     _reclaim_orphans_on_resume(store, resume_mod)
+    cascade = store.read("/config/provider_cascade")
+    if isinstance(cascade, list) and cascade:
+        _enable_cascade_accounts(store, cascade, offline=offline)
 
     changes = Changes()
     if store.read("/run/stopping") is not None:
         changes.replace("run", "stopping", None)
     if store.read("/run/busy") is not None:
         changes.replace("run", "busy", None)
+
+    for sid, sess in (store.read("/sessions") or {}).items():
+        if isinstance(sess, dict) and sess.get("status") == "running":
+            changes.replace("sessions", sid, "status", "lost")
+    fleet_db = Path(store.path).parent / "fleet.db"
+    if fleet_db.is_file():
+        from .tracking import Tracking
+        tr = Tracking(fleet_db)
+        try:
+            for row in tr.fleet().get("sessions", []):
+                if row.get("status") == "busy":
+                    tr.mark_session_status(row["id"], "lost")
+        except Exception:
+            pass
+        finally:
+            tr.close()
 
     plan = store.read("/plan") or {}
     config = store.read("/config") or {"rigor": "high", "profile": "balanced"}
@@ -301,6 +343,29 @@ def prepare_resume(store: Store) -> list[str]:
     store.log("run", f"Run resumed ({len(resumed_tasks)} task(s) ready)",
               extra=changes, etype="run.config")
     return resumed_tasks
+
+
+def _refuse_resume_of_a_live_run(run_dir: Path) -> None:
+    """Refuse to open a run whose owning CLI process is still alive.
+
+    A second supervisor on the same run marks every live session "lost" and
+    re-admits running tasks for double dispatch. The owner pid lives in
+    control.json; the pid must still be the same jbi process, so a reused pid
+    never blocks a resume.
+    """
+    record = run_dir / "control.json"
+    try:
+        pid = int(json.loads(record.read_text()).get("pid") or 0)
+    except (OSError, ValueError):
+        return
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return
+    if "jbi" in cmdline:
+        raise SystemExit(f"Run {run_dir.name} is live (pid {pid}); stop it before resuming.")
 
 
 def _reclaim_orphans_on_resume(store: Store, resume_mod) -> None:
@@ -347,11 +412,13 @@ class Run:
             self.dir = Path(resume_dir).expanduser().resolve()
             if not (self.dir / "run.db").is_file():
                 raise SystemExit(f"No stored run database at {self.dir / 'run.db'}.")
+            _refuse_resume_of_a_live_run(self.dir)
             self.store = Store(self.dir / "run.db")
             self.run_id = str(self.store.read("/run/id") or self.dir.name)
-            if getattr(args, "offline", False):
+            is_offline = bool(getattr(args, "offline", False))
+            if is_offline:
                 self._seed_accounts(True)
-            prepare_resume(self.store)
+            prepare_resume(self.store, offline=is_offline)
         else:
             self.run_id = "r-" + datetime.now().strftime("%Y%m%d-%H%M%S")
             self.dir = HOME / "runs" / self.run_id
@@ -398,7 +465,19 @@ class Run:
                                    getattr(args, "base", None), getattr(args, "branch", None),
                                    dry_run=bool(getattr(args, "dry_run", False)))
             if getattr(args, "cascade", None):
-                install_cascade(self.store, getattr(args, "cascade"))
+                is_offline = bool(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False))
+                install_cascade(self.store, getattr(args, "cascade"), offline=is_offline)
+            if flag_repo is not None and not getattr(args, "dry_run", False) and (flag_repo / ".git").exists():
+                from . import resume as resume_mod
+                reclaimed = resume_mod.reclaim_start_orphans(
+                    flag_repo, current_run_dir=self.dir, runs_root=HOME / "runs")
+                if reclaimed.worktrees_removed or reclaimed.branches_removed:
+                    self.store.log(
+                        "run",
+                        f"Reclaimed {len(reclaimed.worktrees_removed)} orphan worktree(s) and "
+                        f"{len(reclaimed.branches_removed)} jbi/* branch(es) at start",
+                        etype="run.config",
+                    )
 
         completer = make_completer(
             self.store,
@@ -437,6 +516,7 @@ class Run:
                        extra_info=lambda: {"pid": os.getpid(), "run_dir": str(self.dir)},
                        link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified],
                        fleet_reader=lambda: metrics.read_tracking(self.dir),
+                       session_reconciler=getattr(self.runtime, "reconcile_sessions", None),
                        base_path=getattr(args, "base_path", "") or "",
                        public_paths=public_paths)
         self.server = Server(self.app, netinfo.hosts(tailnet), args.port).start()

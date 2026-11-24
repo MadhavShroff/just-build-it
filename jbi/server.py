@@ -66,6 +66,7 @@ class App:
     def __init__(self, store: Store, engine: Engine, auth: Auth, *, extra_info: Callable[[], dict] | None = None,
                  link_bases: Callable[[], list[dict]] | None = None,
                  fleet_reader: Callable[[], dict] | None = None,
+                 session_reconciler: Callable[[], object] | None = None,
                  base_path: str = "", public_paths: frozenset[str] = frozenset()):
         self.store, self.engine, self.auth = store, engine, auth
         self.extra_info = extra_info or (lambda: {})
@@ -73,6 +74,8 @@ class App:
         self.link_bases = link_bases or (lambda: [])
         # An optional callback that returns the fleet; the default reads the run's fleet store.
         self.fleet_reader = fleet_reader
+        # An optional callback that reconciles unbacked 'running' sessions to 'lost' before reads.
+        self.session_reconciler = session_reconciler
         # A reverse proxy may mount the dashboard under a prefix, such as
         # /jbi/preview. The prefix is stripped before routing, so every relative
         # link and every fetch() in the page keeps working unchanged.
@@ -235,6 +238,11 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             self._json(200, {"protocol": PROTOCOL_VERSION, "ok": True}, {"Set-Cookie": cookie})
 
         def state(self, query: dict) -> None:
+            if app.session_reconciler is not None:
+                try:
+                    app.session_reconciler()
+                except Exception:
+                    pass
             seq, doc = app.store.snapshot()
             self._json(200, {"protocol": PROTOCOL_VERSION, "seq": seq, "state": doc, "info": app.extra_info()})
 

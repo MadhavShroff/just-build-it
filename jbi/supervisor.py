@@ -332,7 +332,8 @@ class Supervisor:
                 "session_id": lease["session_id"]}
 
     def _store_lite_spec(self, task_id: str, role: str, cwd: Path, model: str, attempt: int,
-                         brief: Path, receipt: Path, base: Path, timeout_sec: float) -> Path:
+                         brief: Path, receipt: Path, base: Path, timeout_sec: float, *,
+                         provider: str = "") -> Path:
         dispatch = self._stage_dispatch(f"s-{task_id}-{role}-{attempt + 1}", task_id, cwd, model, brief,
                                         attempt=attempt)
         task = self.store.read(f"/plan/tasks/{task_id}") or {}
@@ -347,6 +348,8 @@ class Supervisor:
                 "repo_context": json.dumps(self.store.read("/plan/prd") or {}, sort_keys=True),
                 "frozen_contracts": json.dumps(task.get("contracts") or [], sort_keys=True),
                 "usage_path": str(base / "usage.json")}
+        if provider:
+            spec["provider"] = provider
         base.mkdir(parents=True, exist_ok=True)
         path = base / "spec.json"
         path.write_text(json.dumps(spec), encoding="utf-8")
@@ -396,22 +399,59 @@ class Supervisor:
             "status": "running", "started": now(),
             "note": None if window else "tmux is missing; the shim runs as a direct child"}),
             {"session": sid, "task": task})
-        while not session.done():
+        ident: dict[int, str] = {}
+        last_beat = time.monotonic()
+        try:
+            while not session.done():
+                self._record(session)
+                if provider != "simulator" and (time.monotonic() - last_beat) >= 15.0:
+                    last_beat = time.monotonic()
+                    self.store.commit("telemetry.sample",
+                                      Changes().set("sessions", sid, "heartbeat", now()),
+                                      {"session": sid, "task": task, "heartbeat": True})
+                time.sleep(0.1)
             self._record(session)
-            time.sleep(0.1)
-        self._record(session)
-        with self._lock:
-            ident = self.identities.pop(sid, {})            # an ended session leaves the kill set
-        self._end_session(session)
-        if lite_usage_path.is_file():
-            session.status.update(json.loads(lite_usage_path.read_text(encoding="utf-8")))
-        self._record_lite_usage(sid)
-        session.finished = True
-        self._reclaim_window(session)
-        self._stop_tree(ident)
-        self._remove_session_files(base)
-        if provider != "simulator" and base.parent.name == "sessions" and base.is_dir():
-            shutil.rmtree(base, ignore_errors=True)
+            if lite_usage_path.is_file():
+                try:
+                    session.status.update(json.loads(lite_usage_path.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    pass
+            log_path = Path(f"{base}.log")
+            if log_path.is_file():
+                try:
+                    from . import providers as _providers
+                    raw_log = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                    if raw_log:
+                        session.status["stderr_excerpt"] = _providers.redact(raw_log[-2000:])
+                except OSError:
+                    pass
+        finally:
+            with self._lock:
+                ident = self.identities.pop(sid, {})        # an ended session leaves the kill set
+            session.finished = True
+            try:
+                self._end_session(session)
+            except Exception:
+                pass
+            try:
+                self._record_lite_usage(sid, session)
+            except Exception:
+                pass
+            try:
+                self._sync_fleet_session(session)
+            except Exception:
+                pass
+            self._reclaim_window(session)
+            self._stop_tree(ident)
+            if session.direct is not None:
+                try:
+                    session.direct.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    session.direct.kill()
+                    session.direct.wait(timeout=5)
+            self._remove_session_files(base)
+            if provider != "simulator" and base.parent.name == "sessions" and base.is_dir():
+                shutil.rmtree(base, ignore_errors=True)
         return session
 
     def _reclaim_window(self, session: Session) -> None:
@@ -433,13 +473,21 @@ class Supervisor:
             self._verified_signal(pid, start, signal.SIGKILL, group=True)
             self._verified_signal(pid, start, signal.SIGKILL, group=False)
 
-    def _record_lite_usage(self, sid: str) -> None:
+    def _record_lite_usage(self, sid: str, session: Session | None = None) -> None:
         base = self.run_dir / "sessions" / sid
         usage_path = base / "usage.json"
-        if not usage_path.is_file():
-            return
-        usage = json.loads(usage_path.read_text(encoding="utf-8"))
         did = self.active_dispatch.pop(sid, None)
+        if not usage_path.is_file():
+            if did is not None:
+                code = (session.status.get("exit_code") if session else None)
+                self.tracking.finish_dispatch(did, verdict="passed" if code == 0 else "failed")
+            return
+        try:
+            usage = json.loads(usage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            if did is not None:
+                self.tracking.finish_dispatch(did, verdict="failed")
+            return
         if did is None:
             return
         self.tracking.record_cost(did, input_tokens=usage.get("input_tokens"),
@@ -447,10 +495,50 @@ class Supervisor:
                                   cache_read=usage.get("cache_read"), cache_write=usage.get("cache_write"))
         phase = "passed" if usage.get("exit_code") == 0 else "failed"
         self.tracking.finish_dispatch(did, verdict=phase)
-        session = self.sessions.get(sid)
-        if session:
+        target = session or self.sessions.get(sid)
+        if target:
             self.store.commit("session.status", Changes().set("sessions", sid, "usage", usage),
-                              {"session": sid, "task": session.task})
+                              {"session": sid, "task": target.task})
+
+    def _sync_fleet_session(self, session: Session) -> None:
+        """Update the task's fleet.db session row so finished/failed agents never stay 'busy'."""
+        lease = next((row for row in self.tracking.fleet()["leases"]
+                      if row["task_id"] == session.task and row["released_at"] is None), None)
+        if lease is None:
+            return
+        code = session.status.get("exit_code")
+        target_status = "idle" if code == 0 else "failed"
+        self.tracking.mark_session_status(lease["session_id"], target_status)
+
+    def _session_backed(self, sid: str) -> bool:
+        """True only when `sid` maps to a live, non-finished session owned by this supervisor."""
+        with self._lock:
+            sess = self.sessions.get(sid)
+            ident = dict(self.identities.get(sid, {}))
+        if sess is None or sess.finished:
+            return False
+        if sess.read().get("ended") is not None:
+            return False
+        if sess.direct is not None and sess.direct.poll() is not None:
+            return False
+        if ident and not any(alive(pid, start) for pid, start in ident.items()):
+            return False
+        return True
+
+    def reconcile_sessions(self) -> list[str]:
+        """Mark any store session stuck as 'running' with no live backing as 'lost'."""
+        recorded = self.store.read("/sessions") or {}
+        lost: list[str] = []
+        changes = Changes()
+        for sid, entry in recorded.items():
+            if not isinstance(entry, dict) or entry.get("status") != "running":
+                continue
+            if not self._session_backed(sid):
+                changes.replace("sessions", sid, "status", "lost")
+                lost.append(sid)
+        if changes:
+            self.store.commit("session.status", changes, {"reconciled": lost})
+        return lost
 
     @staticmethod
     def _remove_session_files(base: Path) -> None:
@@ -558,7 +646,8 @@ class Supervisor:
             job = agents.AgentJob(choice.provider, choice.model, "bootstrap", "bootstrap", self.repo, brief, receipt)
             if choice.provider != "simulator":
                 path = self._store_lite_spec("bootstrap", "bootstrap", self.repo, choice.model, 0, brief, receipt,
-                                             self.run_dir / "sessions" / "s-bootstrap-bootstrap-1", 1800)
+                                             self.run_dir / "sessions" / "s-bootstrap-bootstrap-1", 1800,
+                                             provider=choice.provider)
                 job = agents.AgentJob(**{**job.__dict__, "spec_path": path})
             self.run_session("bootstrap", "bootstrap", agents.command(job), self.repo, choice.provider,
                              choice.model, 0)
@@ -581,6 +670,15 @@ class Supervisor:
     def start_execution(self) -> None:
         self.branch = self.store.read("/bootstrap/branch") or self.branch
         self.base_branch = self.store.read("/bootstrap/base_branch") or self.branch
+        if not self.store.read("/config/dry_run") and (self.repo / ".git").exists():
+            from . import resume as resume_mod
+            reclaimed = resume_mod.reclaim_start_orphans(self.repo, current_run_dir=self.run_dir)
+            if reclaimed.worktrees_removed or reclaimed.branches_removed:
+                self.store.log(
+                    "run",
+                    f"Reclaimed {len(reclaimed.worktrees_removed)} orphan worktree(s) and "
+                    f"{len(reclaimed.branches_removed)} jbi/* branch(es) before dispatch",
+                )
         self._restore_handovers()
         self._scheduler = threading.Thread(target=self._schedule, name="jbi-scheduler", daemon=True)
         self._scheduler.start()
@@ -591,7 +689,15 @@ class Supervisor:
     def _schedule(self) -> None:
         seq = self.store.seq
         while self._stopping not in ("quit", "kill", "standdown"):
-            self._admit()
+            try:
+                self.reconcile_sessions()
+                self._admit()
+            except Exception as error:
+                try:
+                    self.store.log("scheduler", f"scheduler tick error: {type(error).__name__}: {error}")
+                except Exception:
+                    print(f"[jbi.supervisor] scheduler tick error: {type(error).__name__}: {error}",
+                          file=sys.stderr, flush=True)
             seq = self.store.wait(seq, TICK)
             self._wake.clear()
 
@@ -896,7 +1002,8 @@ class Supervisor:
             self._task_lease(tid, worktree)
             lite_spec = self._store_lite_spec(
                 tid, stage.name, worktree, choice.model, attempt, brief, receipt,
-                self.run_dir / "sessions" / f"s-{tid}-{stage.name}-{attempt + 1}", limits["agent_timeout_s"])
+                self.run_dir / "sessions" / f"s-{tid}-{stage.name}-{attempt + 1}", limits["agent_timeout_s"],
+                provider=choice.provider)
             job = agents.AgentJob(**{**job.__dict__, "spec_path": lite_spec})
         limits = rigor.task_timeouts(task)
         use_watchdog = choice.provider != "simulator" or bool(state.get("config", {}).get("enforce_timeouts"))
@@ -941,8 +1048,44 @@ class Supervisor:
         elif discard:
             wt.discard_changes(worktree)        # verifiers and reviewers never edit code
         if result is None:
-            return False, f"no valid receipt (exit {session.status.get('exit_code')}, reason {reason or 'none'})", choice.model
+            excerpt = str(session.status.get("final_text") or session.status.get("stderr_excerpt") or "").strip()
+            code = session.status.get("exit_code")
+            if excerpt:
+                suffix = f" (exit {code}, {reason})" if reason else f" (exit {code})"
+                detail = f"{excerpt[:1500]}{suffix}"
+            elif reason:
+                detail = f"no valid receipt (exit {code}, {reason})"
+            else:
+                detail = f"no valid receipt (exit {code}, agent produced no stderr)"
+            self._maybe_cool_lane(tid, choice, session, detail)
+            return False, detail, choice.model
         return result.passed, "\n".join(result.findings), choice.model
+
+    def _maybe_cool_lane(self, tid: str, choice: models.Choice, session: Session, detail: str) -> None:
+        """Cool a provider/model lane when dispatch failed before productive work or hit a provider limit."""
+        if choice.provider == "simulator":
+            return
+        code = session.status.get("exit_code")
+        if code in (None, 0):
+            return
+        lower = detail.lower()
+        # A before_run refusal ("workdir is not clean", a live lease) is the
+        # environment's fault, never the provider's: cooling its lane would flip
+        # the whole run onto the next rung for nothing.
+        if "before_run refused" in lower:
+            return
+        provider_error = any(tok in lower for tok in (
+            "429", "529", "401", "403", "502", "503", "504",
+            "rate limit", "rate_limit", "quota", "overloaded", "capacity",
+            "authentication_error", "transport failure", "connection refused",
+            "resource_exhausted", "credential broker failed",
+            "retries exhausted", "prompt too large",
+        ))
+        zero_turn_error = session.status.get("turns") == 0
+        if provider_error or zero_turn_error:
+            lane_key = f"{choice.provider}/{choice.model}"
+            self.cooldowns.mark(lane_key, 120.0)
+            self.store.log("cascade", f"{tid}: {lane_key} cooled after dispatch error", task=tid)
 
     # ---- merging ---------------------------------------------------------------------
 

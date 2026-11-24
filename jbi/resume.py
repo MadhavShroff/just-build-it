@@ -28,6 +28,8 @@ class OrphanReport:
     tmux_server_killed: bool = False
     worktrees_removed: list[str] = field(default_factory=list)
     worktrees_kept: list[dict] = field(default_factory=list)
+    branches_removed: list[str] = field(default_factory=list)
+    branches_kept: list[dict] = field(default_factory=list)
     gate_jobs_stopped: list[str] = field(default_factory=list)
     gate_jobs_kept: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -39,6 +41,8 @@ class OrphanReport:
             "tmux_server_killed": self.tmux_server_killed,
             "worktrees_removed": list(self.worktrees_removed),
             "worktrees_kept": list(self.worktrees_kept),
+            "branches_removed": list(self.branches_removed),
+            "branches_kept": list(self.branches_kept),
             "gate_jobs_stopped": list(self.gate_jobs_stopped),
             "gate_jobs_kept": list(self.gate_jobs_kept),
             "notes": list(self.notes),
@@ -367,4 +371,149 @@ def orphaned(run_id: str, run_dir: Path, *, target_repo: Path | None = None,
         reclaim_gate_jobs(gate_ids or [], report, gatectl_path=gatectl_path)
     except Exception as error:
         report.notes.append(f"gate reclaim failed: {type(error).__name__}: {error}")
+    return report
+
+
+def _list_repo_worktrees(repo: Path) -> list[dict]:
+    """Parse `git worktree list --porcelain` into entry dicts."""
+    raw = wt.git(repo, "worktree", "list", "--porcelain", check=False)
+    entries: list[dict] = []
+    current: dict = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            if current:
+                entries.append(current)
+                current = {}
+            current["path"] = value.strip()
+        elif key == "branch":
+            current["branch"] = value.strip()
+        elif key == "HEAD":
+            current["head"] = value.strip()
+        elif key in ("detached", "bare", "locked", "prunable"):
+            current[key] = True
+    if current:
+        entries.append(current)
+    return entries
+
+
+def _control_run_id(run_dir: Path) -> str | None:
+    path = run_dir / "control.json"
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    rid = raw.get("run_id")
+    return str(rid) if isinstance(rid, str) and rid.strip() else None
+
+
+def reclaim_start_orphans(repo: Path | None, *, current_run_dir: Path | None = None,
+                          runs_root: Path | None = None) -> OrphanReport:
+    """Reclaim dead jbi worktrees, stale registrations, and orphan jbi/* branches at START.
+
+    Never touches non-jbi worktrees, never touches worktrees or branches owned by a
+    live jbi run or `current_run_dir`, and never touches `jbi-parked/*` refs. Never raises.
+    """
+    report = OrphanReport()
+    if repo is None or not (Path(repo) / ".git").exists():
+        return report
+    repo = Path(repo)
+    repo_real = os.path.realpath(repo)
+    current_real = os.path.realpath(current_run_dir) if current_run_dir is not None else None
+    runs_real = os.path.realpath(runs_root) if runs_root is not None else None
+    live_branches: set[str] = set()
+    try:
+        main_branch = wt.current_branch_or_none(repo)
+        if main_branch and main_branch.startswith("jbi/"):
+            live_branches.add(main_branch)
+    except Exception as error:
+        report.notes.append(f"cannot read main branch: {type(error).__name__}: {error}")
+
+    try:
+        entries = _list_repo_worktrees(repo)
+    except Exception as error:
+        report.notes.append(f"cannot list worktrees: {type(error).__name__}: {error}")
+        entries = []
+
+    for entry in entries:
+        raw_path = entry.get("path")
+        if not raw_path:
+            continue
+        wt_path = Path(raw_path)
+        wt_real = os.path.realpath(wt_path)
+        if wt_real == repo_real:
+            continue
+        branch_ref = str(entry.get("branch") or "")
+        branch_short = branch_ref.removeprefix("refs/heads/") if branch_ref.startswith("refs/heads/") else ""
+        owner_run_dir = wt_path.parent.parent if wt_path.parent.name == "worktrees" else None
+        under_runs = bool(runs_real and (wt_real == runs_real or wt_real.startswith(runs_real + os.sep)))
+        has_run_meta = bool(owner_run_dir and (
+            (owner_run_dir / "run.db").exists() or (owner_run_dir / "control.json").exists()))
+        is_jbi = branch_short.startswith("jbi/") or under_runs or has_run_meta
+        if not is_jbi:
+            continue
+        if owner_run_dir is not None:
+            if current_real and os.path.realpath(owner_run_dir) == current_real:
+                if branch_short:
+                    live_branches.add(branch_short)
+                continue
+            owner_pid = control_pid(owner_run_dir)
+            if pid_alive(owner_pid):
+                report.worktrees_kept.append({"path": str(wt_path), "reason": f"live run pid {owner_pid}"})
+                if branch_short:
+                    live_branches.add(branch_short)
+                continue
+            dead_run_id = _control_run_id(owner_run_dir)
+            if dead_run_id:
+                try:
+                    reclaim_tmux(dead_run_id, owner_pid, report)
+                except Exception as error:
+                    report.notes.append(f"tmux reclaim failed for {dead_run_id}: {error}")
+        try:
+            wt.remove_worktree(repo, wt_path)
+            if wt_path.exists() and (under_runs or has_run_meta):
+                shutil.rmtree(wt_path, ignore_errors=True)
+                wt.git(repo, "worktree", "prune", check=False)
+            if wt_path.exists():
+                report.worktrees_kept.append({"path": str(wt_path), "reason": "worktree removal left files"})
+                if branch_short:
+                    live_branches.add(branch_short)
+            else:
+                report.worktrees_removed.append(str(wt_path))
+        except Exception as error:
+            report.worktrees_kept.append({"path": str(wt_path), "reason": f"{type(error).__name__}: {error}"})
+            if branch_short:
+                live_branches.add(branch_short)
+
+    try:
+        wt.git(repo, "worktree", "prune", check=False)
+    except Exception as error:
+        report.notes.append(f"git worktree prune failed: {error}")
+
+    try:
+        jbi_branches = [line.strip() for line in wt.git(
+            repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/jbi/", check=False).splitlines()
+            if line.strip()]
+    except Exception as error:
+        report.notes.append(f"cannot list jbi/* branches: {error}")
+        jbi_branches = []
+
+    for branch in jbi_branches:
+        if branch in live_branches:
+            report.branches_kept.append({"branch": branch, "reason": "held by live worktree"})
+            continue
+        try:
+            wt.git(repo, "branch", "-D", branch, check=False)
+            if wt.head(repo, f"refs/heads/{branch}") is None:
+                report.branches_removed.append(branch)
+            else:
+                report.branches_kept.append({"branch": branch, "reason": "git branch -D refused"})
+        except Exception as error:
+            report.branches_kept.append({"branch": branch, "reason": f"{type(error).__name__}: {error}"})
+
     return report
