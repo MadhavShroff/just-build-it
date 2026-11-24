@@ -400,9 +400,15 @@ class Supervisor:
             "note": None if window else "tmux is missing; the shim runs as a direct child"}),
             {"session": sid, "task": task})
         ident: dict[int, str] = {}
+        last_beat = time.monotonic()
         try:
             while not session.done():
                 self._record(session)
+                if provider != "simulator" and (time.monotonic() - last_beat) >= 15.0:
+                    last_beat = time.monotonic()
+                    self.store.commit("telemetry.sample",
+                                      Changes().set("sessions", sid, "heartbeat", now()),
+                                      {"session": sid, "task": task, "heartbeat": True})
                 time.sleep(0.1)
             self._record(session)
             if lite_usage_path.is_file():
