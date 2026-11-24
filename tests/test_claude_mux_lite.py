@@ -535,6 +535,46 @@ class NeonFenceRegressions(GitFence):
                 self.assertIsNotNone(self.guarded().check(command), command)
         self.assertIsNone(self.guarded().check('find src -name "*.py" -exec echo {} \\;'))
 
+    def test_ninth_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        (self.work / "src" / "evil_mod.py").write_text("import subprocess\n")
+        refused = (
+            "/usr/bin/g[i]t clean -fdx", "/bin/b[a]sh -c 'git clean -fdx'",
+            "{git,clean,-fdx}", "rbash -c 'git clean -fdx'",
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/a.py && chmod +x src/a.py && src/a.py',
+            "printf 'git clean -fdx\\n' | zsh -s0 other/b.txt",
+            "printf 'git clean -fdx\\n' | zsh -osh_in_stdin other/b.txt",
+            "printf 'git clean -fdx\\n' | zsh -o wait",
+            'printf "git clean -fdx\\n#" 1<> src/a.py && bash src/a.py',
+            'bash -c "printf \'git clean -fdx\\n\' > src/a.py" && bash src/a.py',
+            'bash -c "printf \'git clean -fdx\\n\' > \\"$TMPDIR/x\\"" && find "$TMPDIR/x" -exec {} +',
+            'bash -c "printf \'git clean -fdx\\n\' > \\"$TMPDIR/x\\"" && find "$TMPDIR/x" -exec bash {} other/b.txt +',
+            "export PYTHONPATH=src && python3 -m evil_mod",
+            'PYTHONPATH=src bash -c "python3 -m evil_mod"',
+            'bash -c "printf \'import subprocess\\n\' > \\"$TMPDIR/evil.py\\"" && PYTHONPATH="$TMPDIR" python3 -m evil',
+            "awk '--source=BEGIN{system(\"git clean -fdx\")}' -m unittest",
+            'awk -f"$TMPDIR/x" -m unittest',
+            'capsh -- -c "git clean -fdx"',
+            "/lib/ld-linux-aarch64.so.1 /usr/bin/git clean -fdx",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        (self.work / "ok.sh").write_text("echo ok\n")
+        allowed = (
+            'find src -name "*.py" -exec sh -c \'echo\' {} \\;',
+            'printf x > "$TMPDIR/log" && bash ok.sh',
+            "git status && python3 -m unittest",
+            "python3 -m unittest && git status",
+            "/usr/bin/git status",
+            'find src -name "*.py" -exec echo {} \\;',
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertIsNone(self.guarded().check(command), command)
+
     def test_a_new_ignored_directory_judges_leaves_alone(self):
         (self.work / ".gitignore").write_text("build/\n")
         guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)

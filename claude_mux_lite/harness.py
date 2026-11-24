@@ -340,15 +340,23 @@ WRITERS = frozenset({"sed", "cp", "mv", "mkdir", "touch", "rm", "rmdir", "ln", "
 WRAPPERS = frozenset({"env", "nohup", "nice", "time", "timeout", "exec", "command", "builtin", "xargs",
                       "stdbuf", "setsid", "taskset", "ionice", "chrt", "schedtool", "numactl", "setpriv",
                       "strace", "ltrace", "watch", "script", "parallel",
-                      "prlimit", "setarch", "linux64", "flock", "choom"})
+                      "prlimit", "setarch", "linux64", "flock", "choom", "capsh"})
+SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ash", "ksh", "mksh", "yash", "csh", "tcsh", "fish",
+                    "rbash"})
+# Writers whose execution can put content into a file the same command later runs.
+EXEC_WRITERS = WRITERS - {"cd", "pushd", "git"}
 INTERPRETERS = frozenset({"node", "perl", "ruby", "bash", "sh", "zsh", "php", "lua", "awk"})
+KNOWN_COMMANDS = WRITERS | WRAPPERS | INTERPRETERS | SHELLS | {
+    "git", "find", "tee", "mkdir", "rmdir", "busybox", ".", "source",
+    "sudo", "su", "doas", "eval"}
 SAFE_DEV = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "|&"})
-REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", ">&"})
+REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", ">&", "<>"})
 ABS_IN_CODE = re.compile(r"(?<![\w.:/])/(?!dev/(?:null|stdout|stderr)\b)[A-Za-z0-9_.~-]+")
 DOTDOT_IN_CODE = re.compile(r"(?:^|[\s'\"=(,\[])\.\.(?:/|$|[\s'\")\],])")
 STASH = re.compile(r"\bgit\b[^\n;&|]*\bstash\b")
-FIND_TERM = ""  # stands in for the escaped `\\;` find terminator
+FIND_TERM = ""  # stands in for the escaped or quoted `;` find terminator
+FIND_PLACE = ""  # stands in for a `{}` argument inside a find exec payload
 
 
 def _first_command(words: list[str]) -> str:
@@ -359,6 +367,63 @@ def _first_command(words: list[str]) -> str:
     if i >= len(words):
         return ""
     return os.path.basename(words[i])
+
+
+def _writes_inside(root: Path, command: str) -> bool:
+    """True when the command string writes into the worktree: redirects,
+    executing writers, or nested shell -c strings that write. It detects the
+    writes an outer script or module read must not trust."""
+    try:
+        lex = shlex.shlex(_token_text(command), posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return True
+    for j, tok in enumerate(tokens):
+        if tok in REDIRECTS and j + 1 < len(tokens):
+            target = tokens[j + 1]
+            if (tok == ">&" and (target.isdigit() or target == "-")) or target in SAFE_DEV:
+                continue
+            stripped = target.replace("${TMPDIR}", "").replace("$TMPDIR", "")
+            probe = Path(stripped if stripped.startswith("/") else root / stripped)
+            if inside(root, Path(os.path.realpath(probe))):
+                return True
+    for words in _split_segments(tokens):
+        if _first_command(words) in EXEC_WRITERS:
+            return True
+        inner = _inner_command_string(words)
+        if inner is not None and _writes_inside(root, inner):
+            return True
+    return False
+
+
+def _inner_command_string(words: list[str]) -> str | None:
+    """The command string a shell segment carries with -c, if any."""
+    for k, word in enumerate(words):
+        if word == "-c" or re.fullmatch(r"-[A-Za-z0-9]*c", word):
+            if k + 1 < len(words) and not words[k + 1].startswith("-"):
+                return words[k + 1]
+    return None
+
+
+def _split_segments(tokens: list[str]) -> list[list[str]]:
+    segment: list[str] = []
+    segments: list[list[str]] = []
+    for tok in tokens:
+        if tok in SEPARATORS:
+            segments.append(segment)
+            segment = []
+        elif not set(tok) <= set("<>&|;()"):
+            segment.append(tok)
+    segments.append(segment)
+    return segments
+
+
+def _token_text(command: str) -> str:
+    text = _plain_newlines(command)
+    for pattern in ("\\;", "';'", '";"'):
+        text = text.replace(pattern, FIND_TERM)
+    return text
 
 
 SAFE_GIT = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=")
@@ -602,7 +667,21 @@ class BashGuard:
             return f"{arg!r} is outside the workspace"
         return None
 
-    def _segment(self, words: list[str], script_ok: bool = True) -> str | None:
+    def _pythonpath_taints(self, word: str) -> bool:
+        """True when a PYTHONPATH assignment points the module search into
+        agent-writable space: any expansion, or a directory inside the worktree."""
+        if not word.startswith("PYTHONPATH="):
+            return False
+        value = word.split("=", 1)[1]
+        if "$" in value:
+            return True
+        for part in value.split(":"):
+            if part and inside(self.root, Path(os.path.realpath(self.root / part))):
+                return True
+        return False
+
+    def _segment(self, words: list[str], script_ok: bool = True,
+                 env_hostile: bool = False) -> str | None:
         for word in words:
             if any(ch in word for ch in "`~"):
                 return "expanded shell commands and command options are refused"
@@ -617,8 +696,12 @@ class BashGuard:
         if i >= len(words):
             return None
         cmd, args = os.path.basename(words[i]), words[i + 1:]
+        if any(ch in words[i] for ch in "*?[{"):
+            return "the command word may glob or expand into another program"
         if "$" in words[i] or "`" in words[i]:
             return "the command word may expand into an unchecked path"
+        if cmd.startswith("ld-linux") or cmd.startswith("ld-musl") or cmd == "ld.so":
+            return "the dynamic loader is refused"
         if cmd in ("sudo", "su", "doas", "eval"):
             return "privilege escalation is refused"
         if cmd in (".", "source"):
@@ -711,12 +794,13 @@ class BashGuard:
                             closed = True
                             cursor += 1
                             break
-                        if args[cursor] != "{}":
-                            payload.append(args[cursor])
+                        payload.append(FIND_PLACE if args[cursor] == "{}" else args[cursor])
                         cursor += 1
                     if not closed:
                         return "a find exec section needs a closing ; or +"
-                    reason = self._segment(payload, script_ok=script_ok)
+                    if not payload or payload == [FIND_PLACE]:
+                        return "a find exec section needs a command to run"
+                    reason = self._segment(payload, script_ok=script_ok, env_hostile=env_hostile)
                     if reason:
                         return f"find exec is refused: {reason}"
                     index = cursor
@@ -744,17 +828,21 @@ class BashGuard:
         if cmd == "busybox" and args:
             # The multi-call binary reaches every applet, including shells.
             rest = args[1:] if args[0] == "--" else args
-            return self._segment(rest, script_ok=script_ok)
-        if cmd in ("bash", "sh", "zsh", "dash", "ash", "ksh", "mksh", "yash", "csh", "tcsh", "fish"):
+            return self._segment(rest, script_ok=script_ok, env_hostile=env_hostile)
+        if cmd in SHELLS:
             positionals = [a for a in args if not a.startswith("-")]
-            command_flag = next((a for a in args if a == "-c" or re.fullmatch(r"-[A-Za-z]*c", a)), None)
+            command_flag = next((a for a in args if a == "-c" or re.fullmatch(r"-[A-Za-z0-9_]*c", a)), None)
             if command_flag is not None:
                 after = args[args.index(command_flag) + 1:]
+                if len(after) == 2 and after[1] == FIND_PLACE:
+                    after = after[:1]
                 if len(after) != 1 or after[0].startswith("-"):
                     return "a shell command string needs exactly one checked word"
-                return self.check(after[0])
-            if any(re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", a) for a in args):
+                return self.check(after[0], _script_ok=script_ok, _env_hostile=env_hostile)
+            if any(re.fullmatch(r"-[A-Za-z0-9_]*s[A-Za-z0-9_]*", a) for a in args):
                 return "a shell may read commands from standard input"
+            if any(a == "-o" for a in args):
+                return "shell option flags are refused"
             if any(a.startswith("--") for a in args):
                 return "shell long options are refused"
             if not script_ok:
@@ -766,7 +854,8 @@ class BashGuard:
             script = self._safe(positionals[0])
             if script is None or not script.is_file():
                 return "shell script cannot be read safely"
-            return self.check(script.read_text(encoding="utf-8", errors="replace"))
+            return self.check(script.read_text(encoding="utf-8", errors="replace"),
+                              _script_ok=script_ok, _env_hostile=env_hostile)
         if cmd.startswith("python") or cmd in INTERPRETERS:
             # Attached forms (`-c"code"`) tokenize as one word, so the prefix
             # carries the check. A bare interpreter executes piped input, and a
@@ -776,38 +865,42 @@ class BashGuard:
             head = args[:args.index(module_flag)] if module_flag is not None else args
             if any(not a.startswith("-") for a in head):
                 return "interpreter script files cannot be checked; use shell commands"
-            if any(a == "-" or a.startswith(("-c", "-e", "-p", "-r")) or a.startswith(("--eval", "--print"))
-                   for a in args):
+            inline_prefixes = ("-c", "-e", "-p", "-r", "-f", "--eval", "--print", "--source",
+                               "--file", "--exec", "--include")
+            if any(a == "-" or a.startswith(inline_prefixes) for a in args):
                 return "interpreter inline code cannot be checked"
             if any((m := re.match(r"-([A-Za-z]+)", a)) and set(m.group(1)) & set("cepr") for a in args):
                 return "interpreter inline code cannot be checked"
             if not script_ok:
                 return "an interpreter module may not follow a writing segment"
+            if env_hostile:
+                return "an interpreter module path may not point into agent-writable space"
             if module_flag is not None:
                 after = args[args.index(module_flag) + 1:]
                 if len(after) != 1 or not re.fullmatch(r"[A-Za-z_][\w.]*", after[0]):
                     return "an interpreter module must be one plain identifier"
-                for j in range(i):
-                    if words[j].startswith("PYTHONPATH="):
-                        for part in words[j].split("=", 1)[1].split(":"):
-                            if part and inside(self.root, Path(os.path.realpath(self.root / part))):
-                                return "an interpreter module path may not point inside the workspace"
                 stem = self.root / after[0].replace(".", "/")
                 if stem.with_suffix(".py").exists() or (stem / "__init__.py").exists() \
                         or (stem / "__main__.py").exists():
                     return "an interpreter module must not resolve inside the workspace"
                 return None
             return "an interpreter without a script or module may read unchecked input"
+        if "/" in words[i] and cmd not in KNOWN_COMMANDS \
+                and (self.root / words[i]).exists():
+            return "direct script execution is unchecked; run the interpreter"
         return None
 
-    def check(self, command: str) -> str | None:
+    def check(self, command: str, _script_ok: bool | None = None,
+              _env_hostile: bool | None = None) -> str | None:
         """Return None when the command passes the fence, else the refusal reason."""
         if STASH.search(command):
             return "git stash is refused"
         try:
             if re.search(r"<<-?\s*['\"]?", command):
                 return "shell heredocs are refused"
-            text = _plain_newlines(command).replace("\\;", FIND_TERM)
+            text = _plain_newlines(command)
+            for pattern in ("\\;", "';'", '";"'):
+                text = text.replace(pattern, FIND_TERM)
             lex = shlex.shlex(text, posix=True, punctuation_chars=True)
             lex.whitespace_split = True
             tokens = list(lex)
@@ -820,7 +913,10 @@ class BashGuard:
             if tok in REDIRECTS and i + 1 < len(tokens):
                 target = tokens[i + 1]
                 if not (tok == ">&" and (target.isdigit() or target == "-")):
-                    redirect_seen = True
+                    if target not in SAFE_DEV:
+                        stripped = target.replace("${TMPDIR}", "").replace("$TMPDIR", "")
+                        probe = Path(stripped if stripped.startswith("/") else self.root / stripped)
+                        redirect_seen = inside(self.root, Path(os.path.realpath(probe)))
                     bad = self._bad_path(target)
                     if bad:
                         return f"redirect refused: {bad}"
@@ -831,10 +927,21 @@ class BashGuard:
                 segment.append(tok)
         segments.append(segment)
         # A script or module read is only safe when nothing in the same command
-        # can rewrite the file between the read here and the run.
-        script_ok = not redirect_seen and not any(_first_command(w) in WRITERS for w in segments)
+        # can rewrite the worktree between the read here and the run. A write
+        # hidden inside a nested shell -c string counts, and so does a write
+        # by a redirected segment. /dev/null and fd dups do not taint.
+        nested_writes = False
         for words in segments:
-            reason = self._segment(words, script_ok=script_ok)
+            inner = _inner_command_string(words)
+            if inner is not None and _writes_inside(self.root, inner):
+                nested_writes = True
+        writes = redirect_seen or nested_writes \
+            or any(_first_command(w) in EXEC_WRITERS for w in segments)
+        script_ok = (_script_ok if _script_ok is not None else True) and not writes
+        env_hostile = _env_hostile or any(
+            self._pythonpath_taints(w) for words in segments for w in words)
+        for words in segments:
+            reason = self._segment(words, script_ok=script_ok, env_hostile=env_hostile)
             if reason:
                 return reason
         return None
