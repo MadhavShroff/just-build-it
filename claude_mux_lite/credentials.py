@@ -106,6 +106,10 @@ class _AgyBridge:
     def close(self) -> None:
         shutil.rmtree(self._workdir, ignore_errors=True)
 
+    # Linux caps one argv element at MAX_ARG_STRLEN (128 KiB). A prompt travels as
+    # one `-p=` argument, so no single piece may approach that bound.
+    BLOCK_MAX_CHARS = 24_000
+
     @staticmethod
     def _flatten_content(content: Any) -> str:
         if isinstance(content, str):
@@ -129,7 +133,14 @@ class _AgyBridge:
                              f"{_AgyBridge._flatten_content(block.get('content'))}")
             else:
                 parts.append(json.dumps(block, sort_keys=True))
-        return "\n".join(p for p in parts if p)
+        return _AgyBridge._cap("\n".join(p for p in parts if p))
+
+    @classmethod
+    def _cap(cls, text: str) -> str:
+        """Truncate one flattened block past the argv bound, with a visible marker."""
+        if len(text) <= cls.BLOCK_MAX_CHARS:
+            return text
+        return text[:cls.BLOCK_MAX_CHARS] + "\n... [truncated by the jbi agy bridge]"
 
     @staticmethod
     def _render_full_prompt(payload: dict) -> str:
@@ -183,6 +194,11 @@ class _AgyBridge:
         return subprocess.run(argv, cwd=str(self._workdir), stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=timeout)
 
+    # One turn travels as one `-p=` argv element. The kernel caps one element at
+    # MAX_ARG_STRLEN (128 KiB); past 100 KiB the exec would die with E2BIG, so the
+    # bridge refuses the turn first with a named error the supervisor cools on.
+    PROMPT_MAX_CHARS = 100_000
+
     def handle(self, body: bytes, timeout: float) -> tuple[int, bytes, dict[str, str]]:
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -193,11 +209,18 @@ class _AgyBridge:
         use_conv = bool(self._conversation_id and self._sent_count > 0 and len(messages) > self._sent_count)
         prompt = (self._render_delta_prompt(messages, self._sent_count) if use_conv
                   else self._render_full_prompt(payload))
+        if len(prompt) > self.PROMPT_MAX_CHARS:
+            return 400, (f"prompt too large for the agy bridge: {len(prompt)} chars "
+                         f"(max {self.PROMPT_MAX_CHARS})").encode("utf-8"), {}
         try:
             proc = self._invoke(model, prompt, timeout, conversation_id=self._conversation_id if use_conv else None)
             if proc.returncode != 0 and use_conv:
                 self._conversation_id = None
-                proc = self._invoke(model, self._render_full_prompt(payload), timeout, conversation_id=None)
+                full = self._render_full_prompt(payload)
+                if len(full) > self.PROMPT_MAX_CHARS:
+                    return 400, (f"prompt too large for the agy bridge: {len(full)} chars "
+                                 f"(max {self.PROMPT_MAX_CHARS})").encode("utf-8"), {}
+                proc = self._invoke(model, full, timeout, conversation_id=None)
         except subprocess.TimeoutExpired:
             return 504, b"", {TIMEOUT_HEADER: "1"}
         except FileNotFoundError as exc:
@@ -438,6 +461,9 @@ def take_from_environment(environ: Mapping[str, str]) -> tuple[str, dict[str, st
         if not key:
             key = environ.get("OPENAI_API_KEY") or ""
         return key, headers, upstream
+    if provider == "codex":
+        raise BrokerError("provider codex has no neutral dispatch bridge; the codex CLI "
+                          "is a completion lane, not an agent transport")
     return key, headers, DEFAULT_BASE_URL
 
 

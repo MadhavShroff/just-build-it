@@ -164,10 +164,11 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     # brief, store, or command arguments. A direct provider CLI is not a fallback.
     up = [name for name in up if name in AGENT_PROVIDERS]
 
-    # A PIN runs on one model only, and waits for it.
+    # A PIN runs on one model only, and waits for it. The provider name is
+    # normalized the same way the cascade and prefer paths normalize it.
     pinned = override.get("pin")
     if isinstance(pinned, dict) and pinned.get("provider") and pinned.get("model"):
-        return _choice(str(pinned["provider"]), str(pinned["model"]), tier)
+        return _choice(str(pinned["provider"]).strip().lower(), str(pinned["model"]), tier)
 
     # An explicit run cascade (`--cascade founder`) overrides soft task preferences
     # baked into a DAG file. Only a hard PIN outranks the run cascade.
@@ -222,7 +223,7 @@ def blocked(state: dict, task: dict | None = None) -> str | None:
     pinned = override.get("pin")
     if not (isinstance(pinned, dict) and pinned.get("provider")):
         return None
-    provider = str(pinned["provider"])
+    provider = str(pinned["provider"]).strip().lower()
     if provider in usable(state):
         return None
     return "pinned to %s / %s, which is not available" % (provider, pinned.get("model") or "?")

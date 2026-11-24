@@ -1069,11 +1069,17 @@ class Supervisor:
         if code in (None, 0):
             return
         lower = detail.lower()
+        # A before_run refusal ("workdir is not clean", a live lease) is the
+        # environment's fault, never the provider's: cooling its lane would flip
+        # the whole run onto the next rung for nothing.
+        if "before_run refused" in lower:
+            return
         provider_error = any(tok in lower for tok in (
             "429", "529", "401", "403", "502", "503", "504",
             "rate limit", "rate_limit", "quota", "overloaded", "capacity",
             "authentication_error", "transport failure", "connection refused",
             "resource_exhausted", "credential broker failed",
+            "retries exhausted", "prompt too large",
         ))
         zero_turn_error = session.status.get("turns") == 0
         if provider_error or zero_turn_error:

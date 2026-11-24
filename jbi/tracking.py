@@ -214,7 +214,16 @@ class Tracking:
                 if self._db.in_transaction:
                     self._db.execute("ROLLBACK")
                 raise
-            self._db.execute("COMMIT")
+            try:
+                self._db.execute("COMMIT")
+            except BaseException:
+                # A failed COMMIT (disk full, I/O error) must not leave the
+                # transaction open: every later BEGIN IMMEDIATE would die with
+                # "cannot start a transaction within a transaction" and the
+                # fleet writer would never recover.
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
 
     def _one(self, sql: str, args: tuple = ()) -> sqlite3.Row | None:
         with self._lock:

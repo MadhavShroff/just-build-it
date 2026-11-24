@@ -345,6 +345,29 @@ def prepare_resume(store: Store, *, offline: bool = False) -> list[str]:
     return resumed_tasks
 
 
+def _refuse_resume_of_a_live_run(run_dir: Path) -> None:
+    """Refuse to open a run whose owning CLI process is still alive.
+
+    A second supervisor on the same run marks every live session "lost" and
+    re-admits running tasks for double dispatch. The owner pid lives in
+    control.json; the pid must still be the same jbi process, so a reused pid
+    never blocks a resume.
+    """
+    record = run_dir / "control.json"
+    try:
+        pid = int(json.loads(record.read_text()).get("pid") or 0)
+    except (OSError, ValueError):
+        return
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return
+    if "jbi" in cmdline:
+        raise SystemExit(f"Run {run_dir.name} is live (pid {pid}); stop it before resuming.")
+
+
 def _reclaim_orphans_on_resume(store: Store, resume_mod) -> None:
     """Reclaim orphans of a previous run before re-opening (REQUIREMENT-resume 2).
 
@@ -389,6 +412,7 @@ class Run:
             self.dir = Path(resume_dir).expanduser().resolve()
             if not (self.dir / "run.db").is_file():
                 raise SystemExit(f"No stored run database at {self.dir / 'run.db'}.")
+            _refuse_resume_of_a_live_run(self.dir)
             self.store = Store(self.dir / "run.db")
             self.run_id = str(self.store.read("/run/id") or self.dir.name)
             is_offline = bool(getattr(args, "offline", False))
