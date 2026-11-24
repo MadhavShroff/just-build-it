@@ -70,6 +70,13 @@ class ProviderCooldowns:
         with self._lock:
             return max(0.0, self._until.get(provider, 0.0) - self._clock())
 
+    def lanes(self) -> dict[str, float]:
+        """Every lane still cooling, with its remaining seconds. Never raises."""
+        with self._lock:
+            now = self._clock()
+            return {lane: round(max(0.0, until - now), 1)
+                    for lane, until in self._until.items() if until > now}
+
 
 class ProviderPool:
     """Weighted multi-provider round-robin pool (provider retry helper).
@@ -169,7 +176,7 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     profile = state["config"]["profile"]
     override = (task or {}).get("override") or {}
     profile = override.get("profile") or profile
-    tier = rigor.tier_for(profile, role, attempts)
+    tier = rigor.tier_for(profile, role, attempts, complexity=(task or {}).get("complexity"))
 
     up = usable(state)
 

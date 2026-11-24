@@ -144,9 +144,21 @@ def stage(level: str, name: str) -> Stage:
     return next(s for s in PIPELINES[level] if s.name == name)
 
 
-def tier_for(profile: str, role: str, attempts: int = 0) -> str:
-    """The model tier for a role. Repeated failures move the implementer up one tier per step."""
+def norm_complexity(value: object) -> str:
+    """The task's complexity as "S", "M", or "L". Anything else reads as unset."""
+    text = str(value or "").strip().upper()
+    return text if text in ("S", "M", "L") else ""
+
+
+def tier_for(profile: str, role: str, attempts: int = 0, complexity: object = None) -> str:
+    """The model tier for a role. Repeated failures move the implementer up one tier per step.
+
+    An S-effort build is small work: its implementer runs the S tier of its
+    profile's ladder no matter where the profile starts it (audit 4.2), and the
+    escalation rule still applies above that floor."""
     tier = PROFILES[profile]["tiers"].get(role, "S")
+    if role == "implement" and norm_complexity(complexity) == "S":
+        tier = "S"
     if role == "implement" and attempts >= ESCALATE_AFTER:
         steps = (attempts - ESCALATE_AFTER) // ESCALATE_AFTER + 1
         tier = TIERS[max(0, TIERS.index(tier) - steps)]
@@ -154,9 +166,15 @@ def tier_for(profile: str, role: str, attempts: int = 0) -> str:
 
 
 def effective(task: dict, config: dict) -> tuple[str, str]:
-    """The (rigor, profile) pair that applies to one task after its overrides."""
+    """The (rigor, profile) pair that applies to one task after its overrides.
+
+    An S-effort task with no explicit rigor runs the fast pipeline: small work
+    does not need the full ceremony (audit 4.2)."""
     override = task.get("override") or {}
-    return override.get("rigor") or config["rigor"], override.get("profile") or config["profile"]
+    rigor_name = override.get("rigor") or config["rigor"]
+    if norm_complexity(task.get("complexity")) == "S" and not override.get("rigor"):
+        rigor_name = "fast"
+    return rigor_name, override.get("profile") or config["profile"]
 
 
 def effort_for(role: str, task: dict | None = None, attempts: int = 0) -> str:

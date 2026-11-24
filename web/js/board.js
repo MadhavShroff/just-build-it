@@ -1,13 +1,13 @@
 // The main board (execute and complete): summary, DAG and architecture tabs, sessions,
 // CI lanes, telemetry, requests and the live timeline.
 
-import { h, reconcile, setText, beat, elapsed, relativeTime, compactNumber, money, shortSha, trackOverflow } from './dom.js';
+import { h, reconcile, setText, beat, elapsed, relativeTime, compactNumber, money, trackOverflow } from './dom.js';
 import { icon } from './icons.js';
 import { mountDag } from './dag.js';
 import { mountArchitecture } from './architecture.js';
 import { mountMetrics } from './metrics.js';
 import { mountPreview } from './preview.js';
-import { LANE_TONE, TASK_TONE, act, errorSlot, payloadFor, pill, toast } from './ui.js';
+import { TASK_TONE, act, errorSlot, payloadFor, pill, toast } from './ui.js';
 
 const RECENT_ENDED = 2;   // ended sessions that stay visible after the running ones
 
@@ -46,7 +46,7 @@ export function mountBoard(ctx, root, { onOpenTask }) {
       main,
       h('div', { class: 'board-side' },
         h('section', { class: 'card requests-card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('inbox'), 'Requests', h('span', { class: 'card-count requests-count' }))), requests),
-        h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('lane'), 'CI lanes', h('span', { class: 'card-count lanes-count' }))), lanes),
+        h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('lane'), 'CI queue', h('span', { class: 'card-count lanes-count' }))), lanes),
         h('section', { class: 'card timeline-card' }, h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, icon('clock'), 'Timeline')), timeline))));
 
   // ---- view tabs ------------------------------------------------------------------
@@ -162,34 +162,34 @@ export function mountBoard(ctx, root, { onOpenTask }) {
     for (const time of root.querySelectorAll('.timeline time')) setText(time, relativeTime(time.dateTime));
   }, 1000);
 
-  // ---- lanes --------------------------------------------------------------------
-  ctx.store.subscribe(['lanes', 'plan'], (state) => {
-    const list = Object.entries(state.lanes).map(([id, lane]) => ({ id, ...lane })).sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
-    setText(root.querySelector('.lanes-count'), list.length ? String(list.length) : '');
-    if (!list.length) { lanes.replaceChildren(h('p', { class: 'empty', text: 'No lane is configured.' })); return; }
+  // ---- ci queue ----------------------------------------------------------------
+  // The CI panel shows the live interface-llm CI service: the server shells
+  // `ci-conductor status` (bounded, cached) and the runtime's cooldown lanes.
+  // The old state.lanes doc field is gone, so the dead panel is replaced.
+  ctx.store.subscribe(['plan', 'run'], (state) => {
+    const info = ctx.store.info || {};
+    const queue = info.ci_queue || { available: false, text: '' };
+    const cooling = Object.entries(info.cooldowns || {}).filter(([, s]) => Number(s) > 0)
+      .sort((a, b) => a[0].localeCompare(b[0]));
+    const rows = cooling.map(([lane, secs]) => ({ key: lane, name: lane, detail: `cooling ${Number(secs).toFixed(0)}s` }));
+    if (queue.available && queue.text) rows.push({ key: '__ci', name: 'service queue', detail: queue.text });
+    if (!rows.length) {
+      setText(root.querySelector('.lanes-count'), '');
+      lanes.replaceChildren(h('p', { class: 'empty', text: 'No cooling lane; the CI service reports no queue.' }));
+      return;
+    }
+    setText(root.querySelector('.lanes-count'), String(cooling.length));
     if (lanes.querySelector('.empty')) lanes.replaceChildren();
-    reconcile(lanes, list, {
-      key: (lane) => lane.id,
+    reconcile(lanes, rows, {
+      key: (row) => row.key,
       create: () => h('div', { class: 'lane' },
-        h('div', { class: 'lane-top' }, h('span', { class: 'lane-name' }), h('span', { class: 'lane-task' }), h('span', { class: 'lane-status' })),
-        h('div', { class: 'lane-shas mono' }), h('div', { class: 'lane-checks' }), h('div', { class: 'lane-detail faint' })),
-      update: (el, lane) => {
-        el.dataset.status = lane.status;
-        setText(el.querySelector('.lane-name'), lane.id.replace(/^lane-/, 'Lane '));
-        setText(el.querySelector('.lane-task'), lane.task ? (state.plan.tasks[lane.task]?.title || lane.task) : 'Idle');
-        const status = el.querySelector('.lane-status');
-        if (status.dataset.value !== lane.status) {
-          status.dataset.value = lane.status;
-          status.replaceChildren(pill(lane.status, LANE_TONE[lane.status]));
-        }
-        setText(el.querySelector('.lane-shas'), lane.base || lane.head ? `${shortSha(lane.base)} ← ${shortSha(lane.head)}` : '');
-        const checks = lane.checks || [];
-        reconcile(el.querySelector('.lane-checks'), checks.map((c) => (typeof c === 'string' ? { name: c, status: 'pending' } : c)), {
-          key: (c) => c.name, enter: false,
-          create: () => h('span', { class: 'check' }, h('i'), h('span')),
-          update: (chip, c) => { chip.dataset.status = c.status || 'pending'; setText(chip.lastChild, c.name); },
-        });
-        setText(el.querySelector('.lane-detail'), lane.detail || '');
+        h('div', { class: 'lane-top' }, h('span', { class: 'lane-name' }), h('span', { class: 'lane-status' })),
+        h('div', { class: 'lane-detail faint' })),
+      update: (el, row) => {
+        el.dataset.status = row.key === '__ci' ? 'info' : 'cooling';
+        setText(el.querySelector('.lane-name'), row.name);
+        setText(el.querySelector('.lane-status'), row.key === '__ci' ? 'live' : '');
+        setText(el.querySelector('.lane-detail'), row.detail);
       },
     });
   });

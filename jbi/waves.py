@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import rigor
+from . import models, rigor
 from .protocol import TASK_ID, ProtocolError
 
 REQUIRED = ("id", "title", "goal", "deps", "acceptance")
@@ -39,6 +39,7 @@ OPTIONAL_TASK_META = (
     "node", "batch", "owner", "path", "spec", "deliverable",
     "effort", "eta_s", "estimated_seconds", "consumers", "prTag", "prTitle", "number",
     "upstream_deps", "spec_details", "contracts", "invariants", "test_cases", "done_criteria",
+    "complexity",
 )
 
 
@@ -134,17 +135,50 @@ def levels(tasks: list[dict]) -> list[list[str]]:
     return result
 
 
+def _manual_waves(groups: object, ordered_ids: list[str]) -> list[list[str]] | None:
+    """The document's manual wave groups when they are usable, else None.
+
+    A group list is usable when every entry is a list of known task ids and no
+    id repeats. Tasks the groups never name are appended as their own trailing
+    wave in document order, so a partial manual layout never strands a task
+    without a wave (M1)."""
+    if not isinstance(groups, list) or not groups:
+        return None
+    if not all(isinstance(group, list) for group in groups):
+        return None
+    known = set(ordered_ids)
+    seen: set[str] = set()
+    waves: list[list[str]] = []
+    for group in groups:
+        named = [str(tid) for tid in group]
+        if any(tid not in known or tid in seen for tid in named):
+            return None
+        seen.update(named)
+        waves.append(named)
+    rest = [tid for tid in ordered_ids if tid not in seen]
+    if rest:
+        waves.append(rest)
+    return waves
+
+
 def compile_plan(tasks: list[dict] | dict, revision: int = 1) -> dict:
     explicit_waves: list[list[str]] | None = None
     if isinstance(tasks, dict):
-        if isinstance(tasks.get("wave_groups"), list) and tasks.get("waves") == "explicit":
-            explicit_waves = [list(g) for g in tasks["wave_groups"]]
-        raw_tasks = tasks.get("tasks")
-        if isinstance(raw_tasks, dict):
-            order = tasks.get("order") or list(raw_tasks)
-            tasks = [raw_tasks[tid] for tid in order]
-        elif isinstance(raw_tasks, list):
-            tasks = raw_tasks
+        # Manual wave_groups are honored whenever they are usable, in explicit
+        # and in auto mode alike: the DAG author's grouping is the plan (M1).
+        raw_items = tasks.get("tasks")
+        if isinstance(raw_items, dict):
+            ordered_ids = list(tasks.get("order") or raw_items.keys())
+        elif isinstance(raw_items, list):
+            ordered_ids = [t["id"] for t in raw_items if isinstance(t, dict) and "id" in t]
+        else:
+            ordered_ids = []
+        explicit_waves = _manual_waves(tasks.get("wave_groups"), ordered_ids)
+        if isinstance(raw_items, dict):
+            order = tasks.get("order") or list(raw_items)
+            tasks = [raw_items[tid] for tid in order]
+        elif isinstance(raw_items, list):
+            tasks = raw_items
         else:
             tasks = []
     validate(tasks)
@@ -291,11 +325,23 @@ def detect_wave_owns_conflicts(plan: dict[str, Any]) -> list[dict[str, Any]]:
 
 def prioritize_ready(plan: dict[str, Any], ready_ids: Iterable[str] | None = None,
                      config: dict[str, Any] | None = None) -> list[str]:
-    """Order ready tasks by finish-first boost, critical path, downstream fan-out, then plan order."""
+    """Order ready tasks by finish-first boost, critical path, downstream fan-out, then plan order.
+
+    With `wave_gate` set, a task waits until every task of every earlier wave has
+    finished or was skipped: the DAG author's wave_groups become a hard barrier
+    (audit M1). Off by default, so a run keeps draining ready work across waves."""
     tasks = plan.get("tasks") or {}
     order = plan.get("order") or list(tasks)
     index_map = {tid: idx for idx, tid in enumerate(order)}
     candidates = list(ready_tasks(plan) if ready_ids is None else ready_ids)
+    if config and config.get("wave_gate") and len(candidates) > 1:
+        done_like = (DONE, "skipped")
+        wave_of = plan.get("waves") or []
+        for tid in list(candidates):
+            wave = int((tasks.get(tid) or {}).get("wave") or 1)
+            if any((tasks.get(x) or {}).get("status") not in done_like
+                   for group in wave_of[:max(0, wave - 1)] for x in group):
+                candidates.remove(tid)
     if len(candidates) <= 1:
         return candidates
     cp = set(critical_path(plan, config=config).get("path") or ())
@@ -521,13 +567,28 @@ def _wave_wall_seconds(task_ids: list[str], weights: dict[str, int], max_session
 
 
 def describe_preview(plan: dict[str, Any], config: dict[str, Any] | None = None,
-                     sessions: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Build the deterministic DAG preview model: waves, parallel groups, critical path, and ETAs."""
+                     sessions: dict[str, Any] | None = None,
+                     accounts: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the deterministic DAG preview model: waves, parallel groups, critical path, and ETAs.
+
+    Each task also carries the pipeline the run will actually execute and the
+    routing the resolver names for its implement stage, both served from Python,
+    so no client recomputes either (audit M4)."""
     cfg = {"rigor": "high", "profile": "balanced", "max_sessions": 3, **(config or {})}
     tasks = plan.get("tasks") or {}
     order = [tid for tid in (plan.get("order") or list(tasks)) if tid in tasks]
     raw_waves = plan.get("waves") or ([order] if order else [])
     max_sessions = int(cfg.get("max_sessions") or 3)
+
+    def served_routing(task: dict) -> dict[str, Any]:
+        level, _profile = rigor.effective(task, cfg)
+        pipeline = [[s.name, s.role] for s in rigor.PIPELINES.get(level, rigor.PIPELINES["high"])]
+        state = {"config": {"profile": cfg.get("profile", "balanced"),
+                            "provider_cascade": cfg.get("provider_cascade") or []},
+                 "accounts": accounts or {}}
+        choice = models.select(state, "implement", task=task, attempts=int(task.get("attempts") or 0))
+        return {"pipeline": pipeline, "provider": choice.provider,
+                "model": choice.model, "tier": choice.tier}
 
     total_by_task: dict[str, int] = {}
     rem_by_task: dict[str, int] = {}
@@ -576,6 +637,7 @@ def describe_preview(plan: dict[str, Any], config: dict[str, Any] | None = None,
                 if _owns_overlap(t.get("owns") or (), tasks[other].get("owns") or ())
             ]
             true_parallel = [other for other in parallel_peers if other not in conflicts]
+            served = served_routing(t)
             wave_tasks.append({
                 "id": tid,
                 "title": t.get("title") or tid,
@@ -588,6 +650,9 @@ def describe_preview(plan: dict[str, Any], config: dict[str, Any] | None = None,
                 "wave": number,
                 "attempts": int(t.get("attempts") or 0),
                 "dry_run": bool(t.get("dry_run")),
+                "pipeline": served["pipeline"],
+                "routing": {"provider": served["provider"], "model": served["model"],
+                            "tier": served["tier"]},
                 "eta_s": total_by_task[tid],
                 "remaining_eta_s": rem_by_task[tid],
                 "earliest_start_s": cp_total["earliest_start"].get(tid, 0),

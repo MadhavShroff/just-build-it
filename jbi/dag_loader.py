@@ -321,7 +321,23 @@ def parse_dag_json(text: str) -> dict[str, Any]:
                     task["upstream_deps"] = existing_upstream
                     task["deps"] = [d for d in deps if d not in completed_set or d in active_ids]
     explicit_waves = raw.get("wave_groups") if "wave_groups" in raw else raw.get("waves")
-    waves_mode = "explicit" if (isinstance(explicit_waves, list) and not expanded) else "auto"
+    # A subtask-expanded doc never keeps manual waves: the groups name parent ids
+    # the expansion replaced, so the plan recomputes its waves (auto).
+    named_mode = str(raw.get("waves") or "").strip().lower()
+    if named_mode in ("auto", "explicit") and not expanded:
+        waves_mode = named_mode          # the author named the mode; keep it
+    elif isinstance(explicit_waves, list) and not expanded:
+        waves_mode = "explicit"
+    else:
+        waves_mode = "auto"
+    # Manual wave_groups ride along in explicit and in auto mode alike: the
+    # compiler honors the author's grouping whenever it is usable (M1). The
+    # wave-compiler schema requires wave_groups under 'explicit' and refuses
+    # them under 'auto': explicit groups validate inside the document, auto
+    # groups attach only after its validation ran.
+    manual_groups: list[list[str]] | None = None
+    if isinstance(explicit_waves, list) and not expanded and ("wave_groups" in raw or waves_mode == "explicit"):
+        manual_groups = [list(g) for g in explicit_waves]
     doc: dict[str, Any] = {
         "project": str(raw.get("project") or raw.get("name") or "dag"),
         "repo": str(raw.get("repo") or raw.get("target") or "."),
@@ -335,9 +351,12 @@ def parse_dag_json(text: str) -> dict[str, Any]:
         doc["base"] = str(raw["base"]).strip()
     if str(raw.get("branch") or "").strip():
         doc["branch"] = str(raw["branch"]).strip()
-    if waves_mode == "explicit":
-        doc["wave_groups"] = [list(g) for g in explicit_waves]
-    return validate(doc)
+    if manual_groups is not None and waves_mode == "explicit":
+        doc["wave_groups"] = manual_groups
+    validated = validate(doc)
+    if manual_groups is not None and "wave_groups" not in validated:
+        validated["wave_groups"] = manual_groups
+    return validated
 
 
 def _read_source(source: str | Path) -> tuple[str, bool]:
@@ -404,12 +423,15 @@ def load(source: str | Path, *, revision: int = 1, strict_spec: bool = False,
     if strict_spec:
         validate_strict_spec(doc["tasks"])
     plan = waves.compile_plan(doc["tasks"], revision)
-    if doc.get("waves") == "explicit" and doc.get("wave_groups"):
+    # Manual groups apply in explicit and in auto mode alike (M1); unnamed tasks
+    # keep the dependency-order waves compile_plan computed for them.
+    if doc.get("wave_groups"):
         groups = [list(group) for group in doc["wave_groups"]]
         plan["waves"] = groups
         for number, group in enumerate(groups, start=1):
             for tid in group:
-                plan["tasks"][tid]["wave"] = number
+                if tid in plan["tasks"]:
+                    plan["tasks"][tid]["wave"] = number
     if forbid_wave_owns_conflicts:
         conflicts = waves.detect_wave_owns_conflicts(plan)
         if conflicts:

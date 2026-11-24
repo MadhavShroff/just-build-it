@@ -110,6 +110,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     resume = sub.add_parser("resume", help="reopen a stored run and continue from stored task states")
     resume.add_argument("run_dir", nargs="?", type=Path)
     resume.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
+    recover = sub.add_parser("recover", help="reclaim orphans, re-probe models, re-sync CI, then resume a stored run")
+    recover.add_argument("run_dir", nargs="?", type=Path)
+    recover.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
     resume.add_argument("--ci-service", choices=("ci-conductor",), default=None,
                         help="the only service that can merge a verified task")
     resume.add_argument("--no-tailscale", action="store_true", help="listen on loopback only")
@@ -526,7 +529,7 @@ class Run:
         if getattr(args, "publish_preview", False):
             public_paths = frozenset({"/api/v1/preview", "/api/v1/health"})
         self.app = App(self.store, self.engine, self.auth,
-                       extra_info=lambda: {"pid": os.getpid(), "run_dir": str(self.dir)},
+                       extra_info=self._extra_info,
                        link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified],
                        fleet_reader=lambda: metrics.read_tracking(self.dir),
                        session_reconciler=getattr(self.runtime, "reconcile_sessions", None),
@@ -536,6 +539,48 @@ class Run:
         self.links = netinfo.links(self.server.port, self.run_id, tailnet)
         Control(self.links[0].url, self.auth.token, self.run_id, os.getpid()).save(self.dir / "control.json")
         self._publish_registry(args)
+
+    _ci_snapshot: dict = {}
+    _ci_snapshot_at: float = 0.0
+
+    def _ci_queue_snapshot(self) -> dict:
+        """A bounded, cached read of the CI service queue for the board widget.
+
+        The service may be absent (an offline run, a test box): the snapshot then
+        says so, and the widget shows the truth instead of a dead panel."""
+        now = time.monotonic()
+        if now - type(self)._ci_snapshot_at < 30.0 and type(self)._ci_snapshot:
+            return type(self)._ci_snapshot
+        try:
+            proc = subprocess.run(["ci-conductor", "status"], capture_output=True, text=True,
+                                  timeout=6, stdin=subprocess.DEVNULL)
+            text = (proc.stdout or proc.stderr or "").strip()[:2000]
+            snapshot = {"available": proc.returncode == 0 and bool(text),
+                        "text": text, "checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        except (OSError, subprocess.TimeoutExpired):
+            snapshot = {"available": False, "text": "", "checked": None}
+        type(self)._ci_snapshot = snapshot
+        type(self)._ci_snapshot_at = now
+        return snapshot
+
+    def _extra_info(self) -> dict:
+        """State beyond the store: lane cooldowns, notice identity, and the CI queue.
+
+        The drawer renders the cooldowns and the notice identity; the board widget
+        renders the live CI queue (audit M4, drawer refusal visibility)."""
+        info = {"pid": os.getpid(), "run_dir": str(self.dir)}
+        runtime = getattr(getattr(self, "engine", None), "runtime", None)
+        cooldowns = getattr(runtime, "cooldowns", None)
+        if cooldowns is not None:
+            info["cooldowns"] = cooldowns.lanes()
+        try:
+            run_id = self.store.read("/run/id")
+            info["ci_notice_slot"] = (self.store.read("/config/ci_notice_slot")
+                                      or f"jbi-{run_id or 'run'}")
+        except Exception:
+            info["ci_notice_slot"] = None
+        info["ci_queue"] = self._ci_queue_snapshot()
+        return info
 
     def _publish_registry(self, args) -> None:
         """Record where this run's preview is, so a proxy can forward to it.
@@ -729,8 +774,96 @@ def serve(args: argparse.Namespace, *, resume_dir: Path | None = None) -> int:
     return 0
 
 
-def resume_command(args: argparse.Namespace) -> int:
+def recover_command(args: argparse.Namespace, *, then_resume: bool = True) -> int:
+    """Recover a stored run (audit 4.4.2): reclaim orphans, re-probe the model
+    accounts, re-sync submitted CI rows with the live service, then resume.
+
+    Every step is read-or-safe by itself; a step that fails prints a note and the
+    next step still runs. The run then reopens through the normal resume path.
+    With then_resume=False the recovery report alone prints and the run stays
+    closed; that is the seam the tests drive."""
+    from .store import Store, Changes
+    from . import ci_adapter as ci_mod, metrics, providers, resume as resume_mod
+    from .providers import redact
+    from .tracking import Tracking
+
     target_dir = getattr(args, "run_dir", None)
+    if target_dir is None:
+        runs = sorted((HOME / "runs").glob("r-*"), key=lambda p: p.stat().st_mtime)
+        if not runs:
+            raise SystemExit("No run found. Start one with: just-build-it")
+        target_dir = runs[-1]
+    target_dir = Path(target_dir).expanduser()
+    if not (target_dir / "run.db").is_file():
+        raise SystemExit(f"No stored run at {target_dir}.")
+
+    store = Store(target_dir / "run.db")
+    repo_text = store.read("/run/target")
+    repo_path = Path(repo_text).expanduser() if repo_text else None
+    if repo_path is not None and not (repo_path / ".git").exists():
+        repo_path, repo_text = None, repo_text   # keep the text for the report
+
+    # 1. Reclaim what a dead run left behind. The run being recovered is the
+    #    current run here, so its own worktrees are never touched.
+    report = resume_mod.reclaim_start_orphans(repo_path, current_run_dir=target_dir,
+                                              runs_root=HOME / "runs")
+    print(f"recovered worktrees: removed {len(report.worktrees_removed)}, "
+          f"kept {len(report.worktrees_kept)}; branches: removed {len(report.branches_removed)}, "
+          f"kept {len(report.branches_kept)}; tmux windows killed {len(report.tmux_windows_killed)}")
+    for note in report.notes:
+        print(f"  note: {note}")
+
+    # 2. Re-probe every enabled provider account and store the fresh status, so a
+    #    resumed run routes on today's health instead of the crash's last read.
+    seq, doc = store.snapshot()
+    for name, account in (doc.get("accounts") or {}).items():
+        if not account.get("enabled") or name not in providers.catalog()["providers"]:
+            continue
+        result = providers.probe(name)
+        if result.status == account.get("status") and not result.models:
+            continue
+        fresh = dict(account)
+        fresh.update(status=result.status, detail=redact(result.detail),
+                     models=list(result.models or ()))
+        store.commit("account.status", Changes().set("accounts", name, fresh),
+                     {"provider": name})
+        print(f"  probe {name}: {result.status} ({len(result.models or ())} live models)")
+
+    # 3. Re-sync CI rows: a submitted row whose PR the service and GitHub both
+    #    prove merged becomes green with its squash; anything else stays submitted.
+    synced, total = 0, 0
+    if repo_path is not None and (target_dir / metrics.FLEET_DB).is_file():
+        tracking = Tracking(target_dir / metrics.FLEET_DB)
+        try:
+            rows = [row for row in tracking.fleet().get("ci_submissions", [])
+                    if row.get("state") == "submitted"]
+            total = len(rows)
+            adapter = ci_mod.CIAdapter(ci_service=(store.read("/config/ci_service") or "ci-conductor"))
+            for row in rows:
+                reply = row["service_reply"]
+                if not isinstance(reply, dict):
+                    reply = json.loads(reply or "{}")
+                handover = ci_mod.HandoverResult(
+                    task=row["task_id"], branch=f"jbi/{row['task_id']}", pr_number=row["pr_number"],
+                    head_sha=row["head_sha"], reply=reply,
+                    base_commit=row["base_commit"])
+                try:
+                    evidence = adapter.confirm_merge(repo_path, handover, tracking=tracking)
+                except ci_mod.CIAdapterError as error:
+                    print(f"  ci {row['task_id']} #{row['pr_number']}: still open ({error.error})")
+                    continue
+                tracking.record_ci(row["task_id"], pr_number=row["pr_number"], head_sha=row["head_sha"],
+                                   base_commit=row["base_commit"], service_reply=evidence["reply"],
+                                   green_run=evidence["green_run"], squash_sha=evidence["squash_sha"], state="green")
+                synced += 1
+        finally:
+            tracking.close()
+    print(f"ci rows: {synced} confirmed green, {total - synced} left as-is")
+    store.close()
+    if not then_resume:
+        return 0
+    print("resuming the run.")
+    return serve(args, resume_dir=target_dir)
     if target_dir is None:
         runs = sorted((HOME / "runs").glob("r-*"), key=lambda p: p.stat().st_mtime)
         if not runs:
@@ -833,6 +966,8 @@ def main(argv: list[str] | None = None) -> int:
         return client_command(args)
     if args.command == "resume":
         return resume_command(args)
+    if args.command == "recover":
+        return recover_command(args)
     if args.command == "budget":
         from . import budget
         return budget.main(args)
