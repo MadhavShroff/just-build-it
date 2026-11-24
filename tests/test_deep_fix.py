@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,7 @@ from claude_mux_lite import credentials
 from jbi import agents, briefs, cli, models, protocol, resume, rigor, shim, waves, worktrees as wt
 from jbi.store import Changes, Store
 from jbi.supervisor import Supervisor
+from jbi.tracking import Tracking
 
 from tests.test_lite_process import FakeEndpoint, SECRET, final, write_call
 
@@ -507,8 +510,11 @@ class Defect5StartReclaimOrphans(unittest.TestCase):
         self.addCleanup(store.close)
         sup = Supervisor(store, _NoopHooks(), fresh_run, self.repo, use_tmux=False)
         self.addCleanup(sup.tracking.close)
-        sup.start_execution()
+        # Stop the scheduler before it starts, so no dispatch races this test's
+        # own worktree create below. Reclaim runs before the scheduler thread
+        # starts, so it still fires.
         sup._stopping = "quit"
+        sup.start_execution()
 
         self.assertFalse(corpse.exists(), "corpse worktree survived fresh start")
         self.assertIsNone(wt.head(self.repo, "jbi/T1"), "orphan jbi/T1 branch survived fresh start")
@@ -569,6 +575,139 @@ class Defect5StartReclaimOrphans(unittest.TestCase):
         self.assertEqual(report.branches_removed, [])
         self.assertTrue(live_wt.is_dir())
         self.assertIsNotNone(wt.head(self.repo, "jbi/LIVE"))
+
+
+class ReviewFixes(unittest.TestCase):
+    """The adversarial-review fixes: cooling scope, argv bounds, codex, commit rollback, resume guard."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-rf-"))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.repo, self.base = _make_repo(self.tmp)
+        self.run_dir = self.tmp / "run"
+        self.run_dir.mkdir()
+
+    def _supervisor(self, store):
+        sup = Supervisor(store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+        return sup
+
+    def test_environment_refusal_keeps_the_lane_healthy(self):
+        state = protocol.initial_state("r-rf-b", "now", name="demo", mode="existing",
+                                       target=str(self.repo), max_sessions=1, lanes=1, tmux="")
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        sup = self._supervisor(store)
+        choice = models.Choice("claude", "claude-opus-5-5", "S")
+        session = type("S", (), {"status": {"exit_code": 1, "turns": 0}})()
+        detail = ("no valid receipt (exit 1, reason none); agent: "
+                  "ERROR: before_run refused: workdir is not clean at its base commit")
+        sup._maybe_cool_lane("T1", choice, session, detail)
+        self.assertFalse(sup.cooldowns.cooling("claude/claude-opus-5-5"),
+                         "an environment refusal cooled a healthy lane")
+        transport = type("S", (), {"status": {"exit_code": 1, "turns": 0}})()
+        sup._maybe_cool_lane("T1", choice, transport,
+                             "no valid receipt (exit 1, reason none); agent: "
+                             "ERROR: ProtocolError: transport failure: connection refused")
+        self.assertTrue(sup.cooldowns.cooling("claude/claude-opus-5-5"),
+                        "a transport failure did not cool the lane")
+
+    def test_oversize_prompt_is_refused_before_the_argv_limit(self):
+        bridge = credentials._AgyBridge([])
+        self.addCleanup(bridge.close)
+        huge = "x" * (credentials._AgyBridge.BLOCK_MAX_CHARS + 5000)
+        payload = {"model": "gemini-4-neon-high", "messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "u1", "content": huge}]}]}
+        flat = credentials._AgyBridge._flatten_content(payload["messages"][0]["content"])
+        self.assertLessEqual(len(flat), credentials._AgyBridge.BLOCK_MAX_CHARS + 80)
+        self.assertIn("[truncated by the jbi agy bridge]", flat)
+        with mock.patch.object(bridge, "_invoke", return_value=subprocess.CompletedProcess(
+                [], 0, json.dumps({"structured_output": {"text": "ok", "tool_calls": []}}), "")):
+            status, body, _extra = bridge.handle(json.dumps(payload).encode(), 30.0)
+        self.assertEqual(status, 200)          # the per-block cap keeps a normal turn servable
+
+        # A full prompt past the bridge bound is refused with a named error, never E2BIG.
+        with mock.patch.object(credentials._AgyBridge, "BLOCK_MAX_CHARS", 10_000_000):
+            small = [{"role": "user", "content": [{"type": "text", "text": "y" * 100_001}]}]
+            payload_full = {"model": "gemini-4-neon-high", "system": "", "messages": small}
+            status, body, _extra = bridge.handle(json.dumps(payload_full).encode(), 30.0)
+        self.assertEqual(status, 400)
+        self.assertIn("prompt too large", body.decode())
+
+    def test_codex_provider_refuses_with_a_named_error(self):
+        with self.assertRaises(credentials.BrokerError) as caught:
+            credentials.take_from_environment({"CLAUDE_MUX_PROVIDER": "codex"})
+        self.assertIn("codex", str(caught.exception))
+
+    def test_tracking_commit_failure_rolls_back_and_recovers(self):
+        tracking = Tracking(self.run_dir / "fleet.db")
+        self.addCleanup(tracking.close)
+        tracking.create_task(title="t", goal="", owns=["a.txt"], branch="b",
+                             worktree=str(self.tmp), base_commit="a" * 40, task_id="RF1")
+        real_db = tracking._db
+
+        class _DbProxy:
+            """Delegate everything to the real connection; fail COMMIT on demand."""
+
+            def __init__(self, db):
+                self._db = db
+                self.fail_commit = False
+
+            @property
+            def in_transaction(self):
+                return self._db.in_transaction
+
+            def execute(self, sql, *args):
+                if self.fail_commit and isinstance(sql, str) and sql.strip().upper() == "COMMIT":
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._db.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._db, name)
+
+        proxy = _DbProxy(real_db)
+        tracking._db = proxy
+        proxy.fail_commit = True
+        with self.assertRaises(sqlite3.OperationalError):
+            with tracking._tx() as db:
+                db.execute("UPDATE tasks SET goal='x' WHERE id='RF1'")
+        self.assertFalse(proxy.in_transaction, "a failed COMMIT left the transaction open")
+        proxy.fail_commit = False
+        with tracking._tx() as db:
+            db.execute("UPDATE tasks SET goal='recovered' WHERE id='RF1'")
+        self.assertEqual(tracking.get_task("RF1")["goal"], "recovered")
+
+    def test_resume_refuses_a_live_run_and_allows_a_dead_one(self):
+        live = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)", "jbi-live-probe"])
+        self.addCleanup(live.kill)
+        self.addCleanup(live.wait)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                if b"jbi" in Path(f"/proc/{live.pid}/cmdline").read_bytes():
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.run_dir.joinpath("control.json").write_text(json.dumps({"pid": live.pid}))
+        with self.assertRaises(SystemExit) as caught:
+            cli._refuse_resume_of_a_live_run(self.run_dir)
+        self.assertIn("is live", str(caught.exception))
+        dead = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        dead.wait()
+        self.run_dir.joinpath("control.json").write_text(json.dumps({"pid": dead.pid}))
+        cli._refuse_resume_of_a_live_run(self.run_dir)          # a dead owner never blocks
+
+    def test_pin_provider_case_is_normalized(self):
+        state = protocol.initial_state("r-rf-c", "now", name="demo", mode="existing",
+                                       target=str(self.repo), max_sessions=1, lanes=1, tmux="")
+        state["accounts"] = {"claude": {"label": "Claude", "enabled": True, "status": "ok"}}
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        task = {"id": "T9", "override": {"pin": {"provider": "Claude", "model": "claude-opus-5-5"}}}
+        self.assertIsNone(models.blocked(state, task), "a capitalized pin parked the task forever")
+        choice = models.select(state, "implement", task=task)
+        self.assertEqual((choice.provider, choice.model), ("claude", "claude-opus-5-5"))
 
 
 if __name__ == "__main__":
