@@ -448,13 +448,62 @@ class NeonFenceRegressions(GitFence):
         self.assertIsNone(self.guarded().check("python3 -m unittest"))
 
     def test_a_new_ignored_directory_cannot_delete_an_owned_leaf(self):
-        build = self.work / "build"
-        build.mkdir()
         (self.work / ".gitignore").write_text("build/\n")
         guard = BashGuard(self.work, ("build/allowed.txt",), lambda p: p == "build/allowed.txt", allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
         (build / "allowed.txt").write_text("owned\n")
         self.assertFalse(guard.reconcile()[1])
         self.assertEqual((build / "allowed.txt").read_text(), "owned\n")
+
+    def test_a_new_ignored_directory_reconciles_owned_and_unowned_leaves(self):
+        (self.work / ".gitignore").write_text("build/\n")
+        guard = BashGuard(self.work, ("build/allowed.txt",), lambda p: p == "build/allowed.txt", allow_commits=True)
+        build = self.work / "build"
+        build.mkdir()
+        (build / "allowed.txt").write_text("owned\n")
+        (build / "unowned.txt").write_text("stray\n")
+        reverted, errors = guard.reconcile()
+        self.assertEqual(errors, [])
+        self.assertTrue(any("build/unowned.txt" in item for item in reverted))
+        self.assertFalse((build / "unowned.txt").exists())
+        self.assertEqual((build / "allowed.txt").read_text(), "owned\n")
+
+    def test_seventh_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text(
+            "import subprocess; subprocess.run(['git', 'clean', '-fdx'])\n")
+        refused = (
+            "dash -c 'git clean -fdx'", 'dash -c "g\'\'it st\'\'ash"',
+            "stdbuf -oL git clean -fdx", "setsid git clean -fdx",
+            "taskset -c 0 git clean -fdx", "ionice git clean -fdx",
+            "chrt -r 1 git clean -fdx",
+            "find . -maxdepth 0 -exec git clean -fdx {} +",
+            "find . -name unowned.txt -delete",
+            "printf 'git clean -fdx\\n' | bash -s src/a.py",
+            'python3 -c"import subprocess; subprocess.run([\'git\', \'clean\', \'-fdx\'])"',
+            'perl -e"system(qw(git clean -fdx))"',
+            'node --eval="require(\'child_process\').execSync(\'git clean -fdx\')"',
+            "printf 'git clean -fdx\\n' | python3",
+            "printf 'git clean -fdx\\n' | python3 -",
+            "python3 -m src.evil",
+            "busybox sh -c 'git clean -fdx'",
+            "python3 -", "node", "bash -s",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        self.assertIsNone(self.guarded().check("python3 -m unittest"))
+        done = self.shell_owned("dash -c 'git clean -fdx'")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
+        stashed = self.shell_owned('dash -c "g\'\'it st\'\'ash"')
+        self.assertNotEqual(stashed.returncode, 0)
+        self.assertEqual((self.work / "src" / "a.py").read_text(), "owned edit\n")
+        executed = self.shell_owned("find . -maxdepth 0 -exec git clean -fdx {} +")
+        self.assertNotEqual(executed.returncode, 0)
+        self.assertEqual((self.work / "untracked.txt").read_text(), "unowned\n")
 
     def test_an_owned_subdirectory_under_a_baseline_ignored_dir_survives(self):
         build = self.work / "build"

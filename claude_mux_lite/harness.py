@@ -337,7 +337,9 @@ def inside(root: Path, target: Path) -> bool:
 WRITERS = frozenset({"sed", "cp", "mv", "mkdir", "touch", "rm", "rmdir", "ln", "install", "chmod", "chown",
                      "chgrp", "dd", "truncate", "rsync", "find", "tee", "patch", "unlink", "shred", "cd",
                      "pushd", "git", "tar", "unzip", "curl", "wget"})
-WRAPPERS = frozenset({"env", "nohup", "nice", "time", "timeout", "exec", "command", "builtin", "xargs"})
+WRAPPERS = frozenset({"env", "nohup", "nice", "time", "timeout", "exec", "command", "builtin", "xargs",
+                      "stdbuf", "setsid", "taskset", "ionice", "chrt", "schedtool", "numactl", "setpriv",
+                      "strace", "ltrace", "watch", "script", "parallel"})
 INTERPRETERS = frozenset({"node", "perl", "ruby", "bash", "sh", "zsh", "php", "lua", "awk"})
 SAFE_DEV = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "|&"})
@@ -499,13 +501,16 @@ class BashGuard:
         """Enumerate known ignored trees. Other ignored files stay explicit entries."""
         current = {rel: (xy, rel, orig) for xy, rel, orig in entries}
         for xy, rel, original in entries:
-            if xy != "!!" or not rel.endswith("/") or not any(item.startswith(rel) for item in self.baseline):
+            if xy != "!!" or not rel.endswith("/"):
                 continue
+            # Every ignored directory, old or new, is enumerated into leaves. The
+            # aggregate entry would hide an unowned leaf from reconcile, so the
+            # directory entry itself is replaced.
             rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", rel)
             if rc != 0:
                 raise GuardError("ignored baseline discovery failed")
-            for item in raw.split(b"\0"):
-                child = item.decode("utf-8", "surrogateescape") if item else ""
+            children = [item.decode("utf-8", "surrogateescape") for item in raw.split(b"\0") if item]
+            for child in children:
                 if child != rel:
                     current[child] = ("!!", child, None)
         return list(current.values())
@@ -671,12 +676,34 @@ class BashGuard:
                 if bad:
                     return f"git target refused: {bad}"
         elif cmd == "find":
-            if any(a in ("-delete", "-exec", "-execdir", "-ok", "-fprint", "-fprintf", "-fls") for a in args):
-                for arg in (a for a in args if not a.startswith("-") and a not in ("(", ")", "!", "{}")):
-                    if "/" in arg or arg == "..":
-                        bad = self._bad_path(arg)
-                        if bad:
-                            return f"find target refused: {bad}"
+            if any(a in ("-delete", "-fprint", "-fprintf", "-fls") for a in args):
+                return "find deletion and file writes are refused"
+            index = 0
+            while index < len(args):
+                if args[index] in ("-exec", "-execdir", "-ok", "-okdir"):
+                    payload: list[str] = []
+                    cursor = index + 1
+                    closed = False
+                    while cursor < len(args):
+                        if args[cursor] in (";", "+"):
+                            closed = True
+                            cursor += 1
+                            break
+                        if args[cursor] != "{}":
+                            payload.append(args[cursor])
+                        cursor += 1
+                    if not closed:
+                        return "a find exec section needs a closing ; or +"
+                    reason = self._segment(payload)
+                    if reason:
+                        return f"find exec is refused: {reason}"
+                    index = cursor
+                index += 1
+            for arg in (a for a in args if not a.startswith("-") and a not in ("(", ")", "!", "{}")):
+                if "/" in arg or arg == "..":
+                    bad = self._bad_path(arg)
+                    if bad:
+                        return f"find target refused: {bad}"
         elif cmd == "sed" or cmd in WRITERS:
             skip_script = cmd == "sed" and not any(a in ("-e", "-f") or a.startswith("--expression")
                                                    for a in args)
@@ -691,7 +718,12 @@ class BashGuard:
                     bad = self._bad_path(arg)
                 if bad:
                     return f"{cmd} argument refused: {bad}"
-        if cmd in ("bash", "sh", "zsh"):
+        if cmd == "busybox" and args:
+            # The multi-call binary reaches every applet, including shells.
+            return self._segment(args)
+        if cmd in ("bash", "sh", "zsh", "dash", "ash", "ksh", "mksh", "yash", "csh", "tcsh", "fish"):
+            if any(a == "-s" or re.fullmatch(r"-[A-Za-z]*s", a) for a in args):
+                return "a shell may read commands from standard input"
             positionals = [a for a in args if not a.startswith("-")]
             command_flag = next((a for a in args if a == "-c" or re.fullmatch(r"-[A-Za-z]*c", a)), None)
             if command_flag is not None:
@@ -708,17 +740,24 @@ class BashGuard:
                 return "shell script cannot be read safely"
             return self.check(script.read_text(encoding="utf-8", errors="replace"))
         if cmd.startswith("python") or cmd in INTERPRETERS:
-            if any(a == "-c" or re.fullmatch(r"-[A-Za-z]*[cer]", a) for a in args):
+            # Attached forms (`-c"code"`) tokenize as one word, so the prefix
+            # carries the check. A bare interpreter executes piped input, and a
+            # script argument is unchecked content.
+            if any(a == "-" or a.startswith(("-c", "-e", "-p", "-r")) or a.startswith(("--eval", "--print"))
+                   for a in args):
                 return "interpreter inline code cannot be checked"
             module_flag = next((a for a in args if a == "-m"), None)
             if module_flag is not None:
                 after = args[args.index(module_flag) + 1:]
                 if len(after) != 1 or not re.fullmatch(r"[A-Za-z_][\w.]*", after[0]):
                     return "an interpreter module must be one plain identifier"
+                stem = self.root / after[0].replace(".", "/")
+                if stem.with_suffix(".py").exists() or (stem / "__init__.py").exists():
+                    return "an interpreter module must not resolve inside the workspace"
                 return None
             if any(not a.startswith("-") for a in args):
                 return "interpreter script files cannot be checked; use shell commands"
-            return None
+            return "an interpreter without a script or module may read unchecked input"
         return None
 
     def check(self, command: str) -> str | None:
@@ -806,7 +845,7 @@ class BashGuard:
                         for child in full.iterdir():
                             rel_child = child.relative_to(self.root).as_posix()
                             reserved = any(name == rel_child or name.startswith(rel_child + "/")
-                                           or self.owned(name) for name in self.baseline)
+                                           for name in self.baseline)
                             leased = (self.owned(rel_child)
                                       or any(pattern == rel_child or pattern.startswith(rel_child + "/")
                                              for pattern in self.owns))
@@ -880,7 +919,8 @@ class BashGuard:
         try:
             for xy, path, orig in self._status():
                 for rel in (path, orig):
-                    if rel and not self.owned(rel) and rel not in self.baseline:
+                    # A directory aggregate is judged through its enumerated leaves.
+                    if rel and not rel.endswith("/") and not self.owned(rel) and rel not in self.baseline:
                         msg = f"{rel} is still dirty after revert"
                         if msg not in errors and not any(e.startswith(rel + " ") for e in errors):
                             errors.append(msg)
