@@ -660,6 +660,50 @@ class NeonFenceRegressions(GitFence):
             with self.subTest(command=command):
                 self.assertIsNone(self.guarded().check(command), command)
 
+    def test_twelfth_review_bypasses_are_refused(self):
+        (self.work / "src" / "a.py").write_text("owned edit\n")
+        (self.work / "untracked.txt").write_text("unowned\n")
+        (self.work / "src" / "evil.py").write_text("import subprocess\n")
+        refused = (
+            "true # '\ngit clean -fdx",
+            "true # '\ng''it st''ash",
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && export BASH_ENV="$TMPDIR/x" && bash -c "git status"',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && BASH_ENV="$TMPDIR/x" && export BASH_ENV '
+            '&& bash -c "git status"',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > src/a.py && chmod +x src/a.py '
+            '&& printf -v PATH "%s" "src:/usr/bin:/bin" && a.py',
+            'printf "#!/bin/sh\\ngit clean -fdx\\n" > "$TMPDIR/../../x" && chmod +x "$TMPDIR/../../x" && /tmp/x',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && chmod +x "$TMPDIR/x" '
+            '&& find "$TMPDIR/x" -exec sh -c "{}" \\;',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && chmod +x "$TMPDIR/x" '
+            '&& find "$TMPDIR/x" -exec ssh-agent {} \\;',
+            'printf "1e git clean -fdx\\n" > "$TMPDIR/s" && find "$TMPDIR/s" -exec sed -f {} src/a.py \\;',
+            'printf "all:\\n\\tgit clean -fdx\\n" > "$TMPDIR/M" && find "$TMPDIR/M" -exec make -f {} \\;',
+            "python3 -m pydoc src.evil", "python3 -m unittest src.evil", "python3 -m pytest src/evil.py",
+            'printf "import subprocess\\n" > "$TMPDIR/../../evil.py" && python3 -m pydoc /tmp/evil.py',
+            'printf "import subprocess\\n" > "$TMPDIR/../../test_evil.py" && python3 -m unittest discover -s /tmp',
+            'sed "/./e git clean -fdx" src/a.py',
+            'printf "1e git clean -fdx\\n" > "$TMPDIR/s" && sed -f "$TMPDIR/s" src/a.py',
+            'sed -e"1e git clean -fdx" src/a.py',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && uniq "$TMPDIR/x" src/a.py && bash src/a.py',
+            'printf "git clean -fdx\\n" > "$TMPDIR/x" && iconv -o src/a.py "$TMPDIR/x" && bash src/a.py',
+            'tar -cf /dev/null --checkpoint=1 --checkpoint-action=exec="git clean -fdx" src/a.py',
+            'shopt -s expand_aliases\nalias x="git clean -fdx"\nx',
+            'history -s "git clean -fdx" && fc -s',
+            "ssh-agent git clean -fdx", "systemd-cat git clean -fdx",
+            'printf "all:\\n\\tgit clean -fdx\\n" > "$TMPDIR/M" && make -f "$TMPDIR/M"',
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guarded().check(command), command)
+        allowed = (
+            "python3 -m pytest tests/ -q", "python3 -m pytest -p no:warnings",
+            "/bin/ls src", 'mkdir -p "${TMPDIR}/scratch-task"',
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertIsNone(self.guarded().check(command), command)
+
     def test_a_new_ignored_directory_judges_leaves_alone(self):
         (self.work / ".gitignore").write_text("build/\n")
         guard = BashGuard(self.work, ("src",), lambda p: p.startswith("src"), allow_commits=True)

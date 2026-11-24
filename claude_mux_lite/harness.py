@@ -336,15 +336,16 @@ def inside(root: Path, target: Path) -> bool:
 
 WRITERS = frozenset({"sed", "cp", "mv", "mkdir", "touch", "rm", "rmdir", "ln", "install", "chmod", "chown",
                      "chgrp", "dd", "truncate", "rsync", "find", "tee", "patch", "unlink", "shred", "cd",
-                     "pushd", "git", "tar", "unzip", "curl", "wget", "sort"})
+                     "pushd", "git", "tar", "unzip", "curl", "wget", "sort", "uniq", "iconv"})
 WRAPPERS = frozenset({"env", "nohup", "nice", "time", "timeout", "exec", "command", "builtin", "xargs",
                       "stdbuf", "setsid", "taskset", "ionice", "chrt", "schedtool", "numactl", "setpriv",
                       "strace", "ltrace", "watch", "script", "parallel",
                       "prlimit", "setarch", "linux64", "flock", "choom", "capsh",
-                      "unshare", "aa-exec", "nsenter", "eatmydata", "fakeroot", "dbus-run-session"})
+                      "unshare", "aa-exec", "nsenter", "eatmydata", "fakeroot", "dbus-run-session",
+                      "ssh-agent", "systemd-cat"})
 # Interpreter modules whose own arguments are code or code paths.
 EXEC_MODULES = frozenset({"timeit", "runpy", "trace", "profile", "cProfile", "pdb", "doctest",
-                          "code", "ensurepip"})
+                          "code", "ensurepip", "pydoc"})
 # Assignments that inject unchecked code or loaders into the interpreter.
 INJECTION_VARS = frozenset({"BASH_ENV", "ENV", "PYTHONSTARTUP", "PYTHONHOME", "PERLLIB", "PERL5LIB",
                             "PERL5OPT", "NODE_OPTIONS", "NODE_PATH", "RUBYOPT", "RUBYLIB", "LD_PRELOAD",
@@ -498,7 +499,9 @@ class GuardError(Exception):
 
 
 def _plain_newlines(cmd: str) -> str:
-    """Replace unquoted newlines with ';'. Quotes and backslashes keep their meaning."""
+    """Replace unquoted newlines with ';'. Quotes and backslashes keep their
+    meaning. A '#' outside quotes comments to end of line, and the newline
+    after it still separates commands."""
     out, quote, i = [], "", 0
     while i < len(cmd):
         ch = cmd[i]
@@ -510,6 +513,10 @@ def _plain_newlines(cmd: str) -> str:
             quote = "" if ch == quote else quote
         elif ch in "'\"":
             quote = ch
+        elif ch == "#":
+            while i < len(cmd) and cmd[i] != "\n":
+                i += 1
+            continue
         elif ch == "\n":
             ch = " ; "
         out.append(ch)
@@ -688,10 +695,10 @@ class BashGuard:
         unresolved = arg.replace("${TMPDIR}", "").replace("$TMPDIR", "")
         if "$" in unresolved or "`" in arg or arg.startswith("~"):
             return f"unresolved expansion in {arg!r}"
-        if arg in SAFE_DEV or arg == "$TMPDIR" or arg.startswith(("$TMPDIR/", "${TMPDIR}/")):
-            return None
         if any(part == ".." for part in arg.split("/")):
             return f"parent traversal in {arg!r}"
+        if arg in SAFE_DEV or arg == "$TMPDIR" or arg.startswith(("$TMPDIR/", "${TMPDIR}/")):
+            return None
         target = Path(os.path.realpath(arg if arg.startswith("/") else self.root / arg))
         if not inside(self.root, target):
             return f"{arg!r} is outside the workspace"
@@ -708,6 +715,11 @@ class BashGuard:
                 for part in value.split(":"):
                     if part and inside(self.root, Path(os.path.realpath(self.root / part))):
                         return True
+        for k, word in enumerate(words):
+            # printf -v PATH and read PATH set the search variable without an
+            # assignment word, and the shell honours it either way.
+            if word in ("-v", "-p", "-r", "-a") and k + 1 < len(words) and words[k + 1] == "PATH":
+                return True
         return False
 
     def _env_taints(self, words: list[str]) -> bool:
@@ -759,9 +771,28 @@ class BashGuard:
         i = 0
         while i < len(words) and "=" in words[i] and not words[i].startswith("-"):
             i += 1
+        # Assignment-only segments still set the environment later segments run with.
+        for k in range(i):
+            name = words[k].split("=", 1)[0]
+            if name in INJECTION_VARS:
+                return f"{name} injection is refused"
         if i >= len(words):
             return None
         cmd, args = os.path.basename(words[i]), words[i + 1:]
+        if cmd == FIND_PLACE:
+            return "a find exec section cannot run the found path as code"
+        if cmd in ("alias", "unalias", "shopt", "fc"):
+            return "shell aliases and history re-execution are refused"
+        if cmd == "make" and any(a in ("-f", "--file", "--makefile") or a.startswith("--file=")
+                                 for a in args):
+            return "make files run unchecked recipes"
+        if cmd == "tar" and any("checkpoint-action" in a for a in args):
+            return "tar checkpoint actions run commands"
+        if cmd in ("export", "declare", "readonly", "typeset", "local", "setenv"):
+            for arg in args:
+                name = arg.split("=", 1)[0].lstrip("-")
+                if name in INJECTION_VARS:
+                    return f"{name} injection is refused"
         if os.path.basename(words[i]) in WRAPPERS:
             return "command wrappers are refused"
         if any(ch in words[i] for ch in "*?[{"):
@@ -911,10 +942,22 @@ class BashGuard:
                         return f"find target refused: {bad}"
         elif cmd == "sed" or cmd in WRITERS:
             if cmd == "sed":
-                script_arg = next((a for a in args if not a.startswith("-")), "")
-                if script_arg and (re.search(r"(?:^|;)\s*[0-9]*[!]*e(?=[\s;]|$)", script_arg)
-                                   or re.search(r"s(.)[^=\n]*\1[^=\n]*\1[^;\n]*e(?=[^a-z]|$)", script_arg)):
-                    return "sed e executes a command and is refused"
+                scripts = [a for a in args if not a.startswith("-")]
+                scripts += [a[2:] for a in args if a.startswith("-e") and len(a) > 2]
+                for script in scripts:
+                    if FIND_PLACE in script:
+                        return "a find exec section cannot feed the found path to sed"
+                    if re.search(r"(?:^|;)\s*(?:[0-9$~,]*|/[^/\n]*/)[!]*[0-9]*e(?=[\s;]|$)", script) \
+                            or re.search(r"s(.)[^=\n]*\1[^=\n]*\1[^;\n]*e(?=[^a-z]|$)", script):
+                        return "sed e executes a command and is refused"
+                flag = next((a for a in args if a in ("-f", "--file")), None)
+                if flag is not None:
+                    file_arg = args[args.index(flag) + 1] if args.index(flag) + 1 < len(args) else ""
+                    if file_arg == FIND_PLACE or file_arg.startswith(("$TMPDIR", "${TMPDIR}")) \
+                            or (file_arg and not file_arg.startswith("-")
+                                and not inside(self.root, Path(os.path.realpath(
+                                    self.root / file_arg)))):
+                        return "sed script files may not come from outside the workspace"
             skip_script = cmd == "sed" and not any(a in ("-e", "-f") or a.startswith("--expression")
                                                    for a in args)
             for arg in args:
@@ -1000,6 +1043,16 @@ class BashGuard:
                 for word in after[1:]:
                     if any(ch in word for ch in "()[]{};'\"$"):
                         return "interpreter module arguments cannot carry code or expansions"
+                    if word.startswith("/"):
+                        return "interpreter module arguments may not name absolute paths"
+                    if not word.startswith("-"):
+                        stem = self.root / word.replace(".", "/")
+                        if word.endswith(".py") and (self.root / word).exists():
+                            return "an interpreter module argument may not name a workspace file"
+                        if "." in word and re.fullmatch(r"[A-Za-z_][\w.]*", word) \
+                                and (stem.with_suffix(".py").exists()
+                                     or (stem / "__init__.py").exists()):
+                            return "an interpreter module argument may not name a workspace module"
                 stem = self.root / after[0].replace(".", "/")
                 if stem.with_suffix(".py").exists() or (stem / "__init__.py").exists() \
                         or (stem / "__main__.py").exists():
