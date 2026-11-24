@@ -329,6 +329,12 @@ def parse_dag_json(text: str) -> dict[str, Any]:
         "waves": waves_mode,
         "tasks": tasks,
     }
+    # The DAG names the branch every task cuts from ("base") and the branch where
+    # verified work lands ("branch"). The --base/--branch flags outrank these.
+    if str(raw.get("base") or "").strip():
+        doc["base"] = str(raw["base"]).strip()
+    if str(raw.get("branch") or "").strip():
+        doc["branch"] = str(raw["branch"]).strip()
     if waves_mode == "explicit":
         doc["wave_groups"] = [list(g) for g in explicit_waves]
     return validate(doc)

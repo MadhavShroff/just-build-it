@@ -121,6 +121,20 @@ def catalog() -> dict:
     return json.loads(CATALOG_PATH.read_text())
 
 
+def reviewer_overrides() -> dict[str, tuple[str, str]]:
+    """The catalog's `reviewers` map: stage name -> (provider, model).
+
+    The parallel review step names one model per reviewer stage here, so four
+    reviewers read four ways instead of four identical ways. A stage the map does
+    not name runs the routing default and may read as a duplicate."""
+    raw = catalog().get("reviewers") or {}
+    out: dict[str, tuple[str, str]] = {}
+    for name, want in raw.items():
+        if isinstance(want, dict) and want.get("provider") and want.get("model"):
+            out[str(name)] = (str(want["provider"]).strip().lower(), str(want["model"]))
+    return out
+
+
 def usable(state: dict) -> list[str]:
     """Enabled providers whose last probe did not fail, in preference order."""
     accounts = state.get("accounts", {})

@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+from inspect import signature
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -22,9 +23,13 @@ from typing import Any, Callable
 from . import worktrees as wt
 from .protocol import ProtocolError
 
-Runner = Callable[[list[str], Path], subprocess.CompletedProcess]
+Runner = Callable[..., subprocess.CompletedProcess]
 PR_URL_RE = re.compile(r"/pull/(\d+)\s*$")
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+# The symbolic job id the service's `ready` reply names (`job="pr-<N>"`). Its `job`
+# verb resolves lane job ids (`YYYYMMDD-HHMMSS-lN-gX`) and may answer `no-such-job`
+# for the symbolic form while the pull request only sits queued.
+PR_JOB_RE = re.compile(r"^pr-\d+$")
 REPLY_TYPES = frozenset({"ok", "done", "started", "queued", "data", "unchanged", "need", "refused", "failed"})
 REFUSING_TYPES = frozenset({"need", "refused", "failed"})
 VERBS = ("submit", "ready", "verify")
@@ -45,8 +50,8 @@ class HandoverResult:
     base_commit: str = ""
 
 
-def default_runner(argv: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+def default_runner(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
 
 
 def _full_sha(value: Any) -> bool:
@@ -81,11 +86,24 @@ def job_is_active(text: str) -> bool:
 class CIAdapter:
     """Pushes task branches, creates draft PRs with `gh`, and calls the CI service directly."""
 
-    def __init__(self, runner: Runner = default_runner, executable: str = DEFAULT_EXECUTABLE):
+    def __init__(self, runner: Runner = default_runner, executable: str = DEFAULT_EXECUTABLE,
+                 env: dict[str, str] | None = None):
         self.runner = runner
         if executable == DEFAULT_EXECUTABLE:
             executable = os.environ.get("JBI_CI_CONDUCTOR") or executable
         self.executable = executable
+        # Identity handed to every service call, so the CI service can route its
+        # completion notices to this run instead of the caller's tmux pane. The
+        # subprocess environment is the one channel the service already reads (the
+        # caller-slot variable names the notice owner); extra keys are ignored until
+        # the service grows a callback. Credentials never travel here.
+        self.env = dict(env or {})
+        # A legacy two-argument runner keeps working: the identity environment rides
+        # only on runners that declare the third parameter.
+        try:
+            self._runner_takes_env = len(signature(self.runner).parameters) >= 3
+        except (TypeError, ValueError):
+            self._runner_takes_env = False
 
     def _exec(self, argv: list[str], cwd: Path) -> str:
         res = self.runner(argv, cwd)
@@ -97,7 +115,9 @@ class CIAdapter:
     # ---- git and gh -------------------------------------------------------------------
 
     def push_branch(self, repo: Path, branch: str) -> None:
-        self._exec(["git", *wt.IDENTITY, "-C", str(repo), "push", "-u", "origin", branch], repo)
+        # HOST_CONFIG disables the repository's hooks (a pre-push guard would reject
+        # every `jbi/<task>` branch under a tmux session), monitors, and external diff.
+        self._exec(["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(repo), "push", "-u", "origin", branch], repo)
 
     def find_or_create_draft_pr(self, repo: Path, *, branch: str, base: str, title: str, body: str) -> int:
         listed = self._exec(["gh", "pr", "list", "--head", branch, "--state", "open",
@@ -135,7 +155,11 @@ class CIAdapter:
 
     def _service(self, repo: Path, verb: str, args: list[str]) -> dict[str, Any]:
         """Run one service verb. The reply must be one JSON object with a known `type`."""
-        res = self.runner([self.executable, verb, *args], repo)
+        argv = [self.executable, verb, *args]
+        if self.env and self._runner_takes_env:
+            res = self.runner(argv, repo, {**os.environ, **self.env})
+        else:
+            res = self.runner(argv, repo)
         out = (res.stdout or "").strip()
         try:
             reply = json.loads(out)
@@ -201,24 +225,107 @@ class CIAdapter:
         return HandoverResult(task=tid, branch=branch, pr_number=pr_number, head_sha=head_sha,
                               reply=reply, base_commit=base_commit)
 
+    def _github_pr(self, repo: Path, number: int, fields: tuple[str, ...]) -> dict[str, Any]:
+        """Read one pull request from GitHub through `gh`. No credential ever prints."""
+        out = self._exec(["gh", "pr", "view", str(number), "--json", ",".join(fields)], repo)
+        try:
+            data = json.loads(out)
+        except ValueError as error:
+            raise CIAdapterError(f"gh pr view returned invalid JSON: {error}") from error
+        if not isinstance(data, dict):
+            raise CIAdapterError("gh pr view returned no object")
+        return data
+
+    def _github_says_merged(self, repo: Path, number: int) -> bool:
+        data = self._github_pr(repo, number, ("state",))
+        return str(data.get("state") or "").upper() == "MERGED"
+
+    def _fetch_base(self, repo: Path, result: HandoverResult) -> None:
+        """Pull the base from origin so a service-side squash commit resolves here.
+
+        The CI service merges on GitHub and fetches inside its own lanes; this
+        repository has never seen the squash commit. Without the fetch the local
+        `rev-parse` below fails on every merge."""
+        base = (result.reply.get("bound") or {}).get("base") or wt.MAIN
+        wt.fetch_branch(repo, str(base))
+
     def pending(self, repo: Path, result: HandoverResult) -> bool:
-        """Read the direct job record. A running job has not produced a verdict."""
+        """Read the direct job record. A running job has not produced a verdict.
+
+        A queued symbolic `pr-<N>` job stays active until the merge is proven. The
+        service answers `no-such-job` while it cannot resolve the symbolic id against
+        a lane, and that is a lookup gap, never a lost handover: the pull request
+        record on GitHub decides, so the wait ends the moment the merge lands."""
         job = result.reply.get("job")
         if not job:
             raise CIAdapterError("the handover has no direct job identifier")
-        reply = self._service(repo, "job", [str(job)])
+        job = str(job)
+        try:
+            reply = self._service(repo, "job", [job])
+        except CIAdapterError as error:
+            if PR_JOB_RE.match(job) and "no-such-job" in str(error):
+                try:
+                    return not self._github_says_merged(repo, result.pr_number)
+                except CIAdapterError:
+                    # GitHub is unreadable too: the queue is all anyone knows, so the
+                    # queued pull request keeps waiting instead of aborting the merge.
+                    return True
+            raise
         return job_is_active(str(reply.get("text") or ""))
+
+    def _confirm_symbolic_merge(self, repo: Path, result: HandoverResult, job: str,
+                                tracking: Any | None = None) -> dict[str, Any]:
+        """Complete a `pr-<N>` handover whose job record the service cannot resolve.
+
+        The CI service merges a pull request only after its own green verdict, so a
+        MERGED state on GitHub at this exact head is the merge evidence. The squash
+        commit must still resolve here after a fetch of the base."""
+        number, head = result.pr_number, result.head_sha
+        self._fetch_base(repo, result)
+        data = self._github_pr(repo, number, ("state", "headRefOid", "mergeCommit"))
+        state = str(data.get("state") or "").upper()
+        if state != "MERGED":
+            raise CIAdapterError(f"job {job} has no record and PR #{number} is not merged "
+                                 f"(state {state or 'unknown'})")
+        merged_head = str(data.get("headRefOid") or "")
+        if merged_head and merged_head != head:
+            raise CIAdapterError(f"PR #{number} merged at head {merged_head[:9]}, not {head[:9]}")
+        merge_oid = str((data.get("mergeCommit") or {}).get("oid") or "")
+        if not re.fullmatch(r"[0-9a-f]{7,40}", merge_oid):
+            raise CIAdapterError(f"PR #{number} names no merge commit")
+        squash = self._exec(["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(repo), "rev-parse", "--verify",
+                             f"{merge_oid}^{{commit}}"], repo)
+        if not _full_sha(squash):
+            raise CIAdapterError(f"merge commit {merge_oid} does not resolve to a full commit")
+        reply = {"type": "data", "job": job, "source": "github",
+                 "text": f"#{number} merged at head {head[:9]}; the job record {job} is "
+                         "unresolvable, the merge evidence comes from GitHub"}
+        evidence = {"job": job, "pr_number": number, "head_sha": head, "squash_sha": squash,
+                    "green_run": job, "reply": reply}
+        if tracking is not None:
+            tracking.record_ci(result.task, pr_number=number, head_sha=head, base_commit=result.base_commit,
+                               service_reply={**reply, "bound": result.reply.get("bound")},
+                               green_run=job, squash_sha=squash, state="green")
+            tracking.record_merge(result.task, number, head, squash, job)
+        return evidence
 
     def confirm_merge(self, repo: Path, result: HandoverResult, *, job: str | None = None,
                       tracking: Any | None = None) -> dict[str, Any]:
         """Read the job record. Return merge evidence, or raise when any piece is missing.
 
         A `submit` reply never proves a merge. The job text must show a green verdict, the
-        exact PR at the exact head, and a merge line for that PR."""
+        exact PR at the exact head, and a merge line for that PR. A symbolic `pr-<N>`
+        job the service cannot resolve falls back to the GitHub pull request record."""
         job = job or result.reply.get("job")
         if not job:
             raise CIAdapterError("no job id to read merge evidence from")
-        reply = self._service(repo, "job", [str(job)])
+        job = str(job)
+        try:
+            reply = self._service(repo, "job", [job])
+        except CIAdapterError as error:
+            if PR_JOB_RE.match(job) and "no-such-job" in str(error):
+                return self._confirm_symbolic_merge(repo, result, job, tracking)
+            raise
         text = str(reply.get("text") or "")
         number, head = result.pr_number, result.head_sha
         if reply["type"] != "data":
@@ -230,7 +337,8 @@ class CIAdapter:
         merged = re.search(rf"#{number}->([0-9a-f]{{7,40}})\b", text)
         if not merged:
             raise CIAdapterError(f"job {job} has no merge record for PR #{number}")
-        squash = self._exec(["git", *wt.IDENTITY, "-C", str(repo), "rev-parse", "--verify",
+        self._fetch_base(repo, result)
+        squash = self._exec(["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(repo), "rev-parse", "--verify",
                              f"{merged.group(1)}^{{commit}}"], repo)
         if not _full_sha(squash):
             raise CIAdapterError(f"merge commit {merged.group(1)} does not resolve to a full commit")

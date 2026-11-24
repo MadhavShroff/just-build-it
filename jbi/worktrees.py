@@ -148,6 +148,36 @@ def head(repo: Path, ref: str = MAIN) -> str | None:
     return out or None
 
 
+def fetch_branch(repo: Path, name: str, *, update_local: bool = False) -> str | None:
+    """Refresh one branch from `origin`. Best effort: return its head, or None.
+
+    The CI service merges on GitHub and fetches in its own lanes, so a squash commit
+    it reports never exists in this repository until this host fetches the base.
+    `update_local` also fast-forwards the local branch to `origin/<name>` when that
+    branch is the one checked out here. A rewritten origin, a dirty target root, or
+    a detached checkout never moves this host: the merge must fast-forward or it
+    does not happen. A failed fetch returns None, never raises, so an offline host
+    keeps its current base. The fetch alone re-enables the file protocol: this host
+    fetches a remote its own owner configured, which is exactly the case
+    `HOST_CONFIG` otherwise refuses.
+    """
+    argv = ["git", *IDENTITY, *HOST_CONFIG, "-c", "protocol.file.allow=always",
+            "-C", str(repo), "fetch", "--quiet", "origin", name]
+    result = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                            env=_host_env())
+    if result.returncode != 0:
+        return None
+    if update_local and current_branch_or_none(repo) == name:
+        origin_ref = f"refs/remotes/origin/{name}"
+        merge = subprocess.run(["git", *IDENTITY, *HOST_CONFIG, "-C", str(repo),
+                                "merge", "--quiet", "--ff-only", origin_ref],
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                               env=_host_env())
+        if merge.returncode != 0:
+            return head(repo, name)          # fetched, but the local branch stays put
+    return head(repo, name)
+
+
 def missing_branch(repo: Path, name: str) -> bool:
     """True when `name` names no branch under `refs/heads`.
 

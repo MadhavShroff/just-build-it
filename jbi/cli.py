@@ -139,6 +139,15 @@ def default_lanes() -> int:
     return max(1, min(4, (os.cpu_count() or 4) // 4))
 
 
+def merge_branch_sources(flag_base: str | None, flag_branch: str | None,
+                         dag: dict | None) -> tuple[str | None, str | None]:
+    """The branch flags of one start. The flags outrank the DAG; the DAG outranks the defaults."""
+    doc = dag or {}
+    base = (flag_base or str(doc.get("base") or "").strip() or "").strip() or None
+    branch = (flag_branch or str(doc.get("branch") or "").strip() or "").strip() or None
+    return base, branch
+
+
 def apply_branch_flags(store: Store, repo: Path | None, base: str | None,
                        branch: str | None, *, dry_run: bool = False) -> None:
     """Validate --base and --branch at start, then store them for the runtime.
@@ -448,21 +457,25 @@ class Run:
                 if getattr(args, "preview", False):
                     cfg_changes.set("config", "preview", True)
                 self.store.commit("config", cfg_changes, {})
-            # A DAG can name its own repository with a "repo" key. Resolve that path
-            # here so --base and --branch validate against the repo the run targets.
+            # A DAG can name its own repository with a "repo" key, and its own
+            # branches with "base" and "branch" keys. The flags outrank the DAG, the
+            # DAG outranks the defaults. Resolve the paths here so the branch flags
+            # validate against the repository the run targets.
             flag_repo = Path(target) if args.repo else None
-            if flag_repo is None and getattr(args, "dag", None):
+            dag_doc: dict = {}
+            if getattr(args, "dag", None):
                 from . import dag_loader
                 try:
-                    named = str(dag_loader.load_document(
-                        args.dag.expanduser().resolve()).get("repo") or "").strip()
+                    dag_doc = dag_loader.load_document(args.dag.expanduser().resolve())
                 except Exception:               # a bad DAG still fails at plan.load
-                    named = ""
-                if named not in ("", "."):
+                    dag_doc = {}
+                named = str(dag_doc.get("repo") or "").strip()
+                if flag_repo is None and named not in ("", "."):
                     flag_repo = Path(named).expanduser().resolve()
-            if getattr(args, "base", None) or getattr(args, "branch", None):
-                apply_branch_flags(self.store, flag_repo,
-                                   getattr(args, "base", None), getattr(args, "branch", None),
+            base_flag, branch_flag = merge_branch_sources(
+                getattr(args, "base", None), getattr(args, "branch", None), dag_doc)
+            if base_flag or branch_flag:
+                apply_branch_flags(self.store, flag_repo, base_flag, branch_flag,
                                    dry_run=bool(getattr(args, "dry_run", False)))
             if getattr(args, "cascade", None):
                 is_offline = bool(args.offline or getattr(args, "dry_run", False) or getattr(args, "preview", False))
