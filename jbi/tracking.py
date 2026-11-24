@@ -14,6 +14,7 @@ import posixpath
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ GLOB_CHARS = "*?["
 CI_STATES = ("submitted", "green", "failed")
 TASK_STATES = ("created", "dispatched", "running", "verifying", "queued", "merging", "merged",
                "failed", "paused", "blocked", "abandoned")
-SESSION_STATUSES = ("idle", "busy", "reset", "failed", "ended")
+SESSION_STATUSES = ("idle", "busy", "reset", "failed", "ended", "lost")
 DELIVERY_STATES = ("queued", "sent", "delivered", "failed", "read")
 HISTORY_ROLES = ("user", "assistant", "system")
 
@@ -197,11 +198,21 @@ class Tracking:
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
+            for attempt in range(10):
+                try:
+                    self._db.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if ("locked" in msg or "busy" in msg) and attempt < 9:
+                        time.sleep(min(0.5, 0.02 * (1.5 ** attempt)))
+                        continue
+                    raise
             try:
                 yield self._db
             except BaseException:
-                self._db.execute("ROLLBACK")
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
                 raise
             self._db.execute("COMMIT")
 

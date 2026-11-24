@@ -351,5 +351,123 @@ class Defect3CascadeEnablesClaude(unittest.TestCase):
         self.assertEqual((choice.provider, choice.model), ("claude", "claude-opus-5-5"))
 
 
+class Defect4TrackerStormAndLiveness(unittest.TestCase):
+    """Defect 4: failure storms keep events flowing and unbacked running sessions become lost."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-d4-"))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.repo, self.base = _make_repo(self.tmp)
+        self.run_dir = self.tmp / "run"
+        self.run_dir.mkdir()
+
+    def test_repeated_failure_storm_keeps_events_flowing_and_reaches_failed(self):
+        import sqlite3
+        state = protocol.initial_state("r-d4-storm", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["config"]["rigor"] = "vibe"
+        state["accounts"] = {"claude": {"label": "Claude", "enabled": True, "status": "ok"}}
+        state["plan"] = waves.compile_plan([
+            {"id": "T1", "title": "A", "goal": "Fail repeatedly", "deps": [],
+             "owns": ["src/a.txt"], "acceptance": "true",
+             "override": {"pin": {"provider": "claude", "model": "claude-opus-5-5"}}},
+        ], 1)
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        sup = Supervisor(store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+        worktree = wt.create_worktree(self.repo, "T1", self.base, self.run_dir / "worktrees")
+
+        # Inject transient SQLite locked errors into Store._retry_db's path via wrapper
+        orig_retry = store._retry_db
+        flaky_count = {"n": 0}
+        def flaky_retry(fn):
+            def wrapped():
+                flaky_count["n"] += 1
+                if flaky_count["n"] % 7 == 0:
+                    raise sqlite3.OperationalError("database is locked")
+                return fn()
+            return orig_retry(wrapped)
+        store._retry_db = flaky_retry
+
+        # Run 8 consecutive failures (2 full DECISION_AFTER cycles) under failure storm
+        seqs = [store.seq]
+        with mock.patch.dict(os.environ, {"CLAUDE_MUX_BASE_URL": "http://127.0.0.1:1",
+                                          "CLAUDE_MUX_API_KEY": SECRET}):
+            for attempt in range(8):
+                store.commit("test.attempt", Changes().set("plan", "tasks", "T1", "attempts", attempt), {})
+                ok, detail, _model = sup._agent_stage(
+                    store.read("/plan/tasks/T1"), rigor.stage("vibe", "implement"), worktree, [])
+                self.assertFalse(ok)
+                self.assertNotIn("reason none", detail.lower())
+                self.assertGreater(store.seq, seqs[-1], "event seq stopped advancing during failure storm")
+                seqs.append(store.seq)
+
+        # Every session in run.db reached 'failed' (none stuck 'running')
+        sessions = store.read("/sessions") or {}
+        self.assertEqual(len(sessions), 8)
+        for sid, s in sessions.items():
+            self.assertEqual(s["status"], "failed", f"{sid} stayed {s['status']}")
+        # fleet.db lease session is NOT stuck 'busy'
+        fleet_sessions = {s["id"]: s["status"] for s in sup.tracking.fleet()["sessions"]}
+        self.assertNotIn("busy", fleet_sessions.values(), f"fleet.db left busy session: {fleet_sessions}")
+        # Events table is gapless from 1..store.seq
+        events = store.events_after(0, 1000)
+        self.assertEqual([e["seq"] for e in events], list(range(1, store.seq + 1)))
+
+    def test_unbacked_running_session_becomes_lost_on_reconcile_and_resume(self):
+        state = protocol.initial_state("r-d4-lost", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        state["plan"] = waves.compile_plan([
+            {"id": "T1", "title": "A", "goal": "Do task", "deps": [],
+             "owns": ["src/a.txt"], "acceptance": "true"},
+        ], 1)
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        store.commit("session.status", Changes().set("sessions", "s-ghost-1", {
+            "task": "T1", "role": "implement", "provider": "agy", "model": "gemini-4-neon-high",
+            "status": "running", "started": "2026-11-24T00:00:00Z",
+        }), {})
+        sup = Supervisor(store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+
+        reconciled = sup.reconcile_sessions()
+        self.assertEqual(reconciled, ["s-ghost-1"])
+        self.assertEqual(store.read("/sessions/s-ghost-1/status"), "lost")
+
+        # Also verify prepare_resume transitions stale running (run.db) and busy (fleet.db) to lost
+        store.commit("session.status", Changes().set("sessions", "s-ghost-2", {
+            "task": "T1", "role": "implement", "provider": "agy", "model": "gemini-4-neon-high",
+            "status": "running", "started": "2026-11-24T00:00:00Z",
+        }), {})
+        worktree = wt.create_worktree(self.repo, "T1", self.base, self.run_dir / "worktrees")
+        sup._task_lease("T1", worktree)
+        self.assertIn("busy", [s["status"] for s in sup.tracking.fleet()["sessions"]])
+        cli.prepare_resume(store)
+        self.assertEqual(store.read("/sessions/s-ghost-2/status"), "lost")
+        self.assertNotIn("busy", [s["status"] for s in sup.tracking.fleet()["sessions"]])
+
+    def test_scheduler_survives_admit_exception_and_keeps_running(self):
+        import threading
+        state = protocol.initial_state("r-d4-sched", "now", name="demo", mode="existing", target=str(self.repo),
+                                       max_sessions=1, lanes=1, tmux="")
+        store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(store.close)
+        sup = Supervisor(store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(sup.tracking.close)
+        calls = {"n": 0}
+        second = threading.Event()
+        def flaky_admit():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient storm error")
+            second.set()
+            sup._stopping = "quit"
+        sup._admit = flaky_admit
+        sup.start_execution()
+        self.assertTrue(second.wait(5), "scheduler thread died on first _admit exception")
+        self.assertGreaterEqual(calls["n"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

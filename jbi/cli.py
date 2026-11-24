@@ -291,6 +291,22 @@ def prepare_resume(store: Store, *, offline: bool = False) -> list[str]:
     if store.read("/run/busy") is not None:
         changes.replace("run", "busy", None)
 
+    for sid, sess in (store.read("/sessions") or {}).items():
+        if isinstance(sess, dict) and sess.get("status") == "running":
+            changes.replace("sessions", sid, "status", "lost")
+    fleet_db = Path(store.path).parent / "fleet.db"
+    if fleet_db.is_file():
+        from .tracking import Tracking
+        tr = Tracking(fleet_db)
+        try:
+            for row in tr.fleet().get("sessions", []):
+                if row.get("status") == "busy":
+                    tr.mark_session_status(row["id"], "lost")
+        except Exception:
+            pass
+        finally:
+            tr.close()
+
     plan = store.read("/plan") or {}
     config = store.read("/config") or {"rigor": "high", "profile": "balanced"}
     tasks = plan.get("tasks") or {}
@@ -465,6 +481,7 @@ class Run:
                        extra_info=lambda: {"pid": os.getpid(), "run_dir": str(self.dir)},
                        link_bases=lambda: [{"label": l.label, "url": l.url} for l in self.links if l.verified],
                        fleet_reader=lambda: metrics.read_tracking(self.dir),
+                       session_reconciler=getattr(self.runtime, "reconcile_sessions", None),
                        base_path=getattr(args, "base_path", "") or "",
                        public_paths=public_paths)
         self.server = Server(self.app, netinfo.hosts(tailnet), args.port).start()
