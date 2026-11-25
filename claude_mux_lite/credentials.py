@@ -185,19 +185,24 @@ class _AgyBridge:
     def _invoke(self, model: str, prompt: str, timeout: float, *, conversation_id: str | None) -> subprocess.CompletedProcess:
         binary = shutil.which("agy")
         if not binary:
-            raise FileNotFoundError("agy CLI is not installed on PATH")
-        argv = [binary, "--model", model, "--output-format", "json",
+            fallback = Path.home() / ".local" / "bin" / "agy"
+            if fallback.is_file() and os.access(fallback, os.X_OK):
+                binary = str(fallback)
+            else:
+                raise FileNotFoundError("agy CLI is not installed on PATH")
+        argv = [binary, "--model", model, "--input-format", "stream-json", "--output-format", "stream-json",
                 "--disable-slash-commands", "--json-schema", _AGY_TURN_SCHEMA]
         if conversation_id:
             argv += ["--conversation", conversation_id]
-        argv.append(f"-p={prompt}")
-        return subprocess.run(argv, cwd=str(self._workdir), stdin=subprocess.DEVNULL,
+        argv += ["-p", ""]
+        stdin_line = json.dumps({"event": "user", "message": {"role": "user", "content": prompt}},
+                                separators=(",", ":")) + "\n"
+        return subprocess.run(argv, cwd=str(self._workdir), input=stdin_line,
                               capture_output=True, text=True, timeout=timeout)
 
-    # One turn travels as one `-p=` argv element. The kernel caps one element at
-    # MAX_ARG_STRLEN (128 KiB); past 100 KiB the exec would die with E2BIG, so the
-    # bridge refuses the turn first with a named error the supervisor cools on.
-    PROMPT_MAX_CHARS = 100_000
+    # Prompts travel over stdin via `--input-format stream-json`, avoiding the
+    # Linux MAX_ARG_STRLEN (128 KiB) argv cap while still bounding runaway payloads.
+    PROMPT_MAX_CHARS = 2_000_000
 
     def handle(self, body: bytes, timeout: float) -> tuple[int, bytes, dict[str, str]]:
         try:
@@ -234,11 +239,38 @@ class _AgyBridge:
             if any(tok in lower for tok in ("429", "rate limit", "rate_limit", "quota", "resource_exhausted", "capacity")):
                 return 429, clean.encode("utf-8"), {}
             return 502, b"", {TRANSPORT_HEADER: f"agy exited {proc.returncode}: {clean}"[:300]}
-        try:
-            doc = json.loads(proc.stdout)
-        except ValueError:
+        doc: dict[str, Any] | None = None
+        raw_out = (proc.stdout or "").strip()
+        if raw_out:
+            try:
+                parsed_whole = json.loads(raw_out)
+                if isinstance(parsed_whole, dict):
+                    doc = parsed_whole.get("result") if parsed_whole.get("event") == "result" and isinstance(parsed_whole.get("result"), dict) else parsed_whole
+            except ValueError:
+                for ln in reversed(raw_out.splitlines()):
+                    ln = ln.strip()
+                    if not ln.startswith("{"):
+                        continue
+                    try:
+                        ev = json.loads(ln)
+                    except ValueError:
+                        continue
+                    if isinstance(ev, dict):
+                        if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+                            doc = ev["result"]
+                            break
+                        if "structured_output" in ev or "response" in ev:
+                            doc = ev
+                            break
+        if not isinstance(doc, dict):
             clean = _redact((proc.stderr or proc.stdout).strip(), self._secrets)[:300]
             return 502, b"", {TRANSPORT_HEADER: f"agy returned non-JSON output: {clean}"[:300]}
+        if doc.get("status") == "ERROR":
+            clean = _redact(str(doc.get("error") or proc.stderr or "agy stream-json error").strip(), self._secrets)[:500]
+            lower = clean.lower()
+            if any(tok in lower for tok in ("429", "rate limit", "rate_limit", "quota", "resource_exhausted", "capacity")):
+                return 429, clean.encode("utf-8"), {}
+            return 502, b"", {TRANSPORT_HEADER: f"agy error: {clean}"[:300]}
         if isinstance(doc, dict) and isinstance(doc.get("conversation_id"), str) and doc["conversation_id"]:
             self._conversation_id = doc["conversation_id"]
             self._sent_count = len(messages)

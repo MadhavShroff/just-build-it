@@ -402,10 +402,83 @@ def purge_tsbuildinfo(worktree: Path) -> list[str]:
     return sorted(removed)
 
 
-def prepare_worktree(worktree: Path, *, setup_commands: Iterable[str] = (),
+def link_ignored_deps(repo: Path, worktree: Path) -> list[str]:
+    """Create gitignored `node_modules/` directories in `worktree` populated with symlinks to `repo`.
+
+    Git pattern `node_modules/` (trailing slash) ignores real directories, not
+    top-level symlinks. Creating a real directory whose immediate children are
+    symlinks into `repo/<rel>/node_modules/*` keeps `dirty_paths` and `commit_all`
+    completely clean while exposing all packages and `.bin` executables read-only
+    inside the bwrap root mount.
+    """
+    linked: list[str] = []
+    repo_root = Path(repo).resolve()
+    wt_root = Path(worktree).resolve()
+    if repo_root == wt_root or not repo_root.is_dir() or not wt_root.is_dir():
+        return linked
+    skip_dirs = {".git", "worktrees", ".next", "dist", "build", "coverage", ".turbo", "__pycache__"}
+    candidates: list[Path] = []
+    for base, dirs, _files in os.walk(repo_root, followlinks=False):
+        rel_base = Path(base).relative_to(repo_root)
+        depth = len(rel_base.parts)
+        if "node_modules" in dirs:
+            candidates.append(rel_base / "node_modules" if depth > 0 else Path("node_modules"))
+            dirs.remove("node_modules")
+        if depth >= 3:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+    for rel in sorted(candidates):
+        src = repo_root / rel
+        dst = wt_root / rel
+        if not src.is_dir() or not dst.parent.is_dir() or os.path.lexists(dst):
+            continue
+        chk = subprocess.run(["git", *HOST_CONFIG, "-C", str(wt_root), "check-ignore", "-q", rel.as_posix() + "/"],
+                             capture_output=True, stdin=subprocess.DEVNULL, env=_host_env())
+        if chk.returncode != 0:
+            continue
+        try:
+            dst.mkdir(exist_ok=True)
+            for entry in os.scandir(src):
+                link_path = dst / entry.name
+                if os.path.lexists(link_path):
+                    continue
+                target_path = Path(entry.path)
+                if entry.is_symlink():
+                    try:
+                        real_target = Path(os.path.realpath(entry.path))
+                        rel_target = real_target.relative_to(repo_root)
+                        wt_pkg = wt_root / rel_target
+                        if wt_pkg.is_dir():
+                            target_path = wt_pkg
+                            src_dist = real_target / "dist"
+                            dst_dist = wt_pkg / "dist"
+                            if src_dist.is_dir() and not os.path.lexists(dst_dist):
+                                dchk = subprocess.run(
+                                    ["git", *HOST_CONFIG, "-C", str(wt_root), "check-ignore", "-q",
+                                     (rel_target / "dist").as_posix() + "/"],
+                                    capture_output=True, stdin=subprocess.DEVNULL, env=_host_env())
+                                if dchk.returncode == 0:
+                                    dst_dist.mkdir(exist_ok=True)
+                                    for dentry in os.scandir(src_dist):
+                                        os.symlink(dentry.path, dst_dist / dentry.name)
+                    except (OSError, ValueError):
+                        pass
+                os.symlink(target_path, link_path)
+            linked.append(rel.as_posix())
+        except OSError:
+            pass
+    return linked
+
+
+def prepare_worktree(worktree: Path, *, repo: Path | None = None, setup_commands: Iterable[str] = (),
                      cache_key: str | None = None, timeout: int = 300) -> list[str]:
-    """Purge stale `.tsbuildinfo` caches and run workspace `setup_commands` when `cache_key` changed."""
+    """Purge stale `.tsbuildinfo` caches, link gitignored `node_modules`, and run `setup_commands`."""
     notes: list[str] = []
+    if repo is not None:
+        linked = link_ignored_deps(repo, worktree)
+        if linked:
+            notes.append(f"linked {len(linked)} node_modules dir(s)")
     purged = purge_tsbuildinfo(worktree)
     if purged:
         notes.append(f"purged {len(purged)} tsbuildinfo file(s)")

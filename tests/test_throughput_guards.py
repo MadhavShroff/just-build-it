@@ -333,6 +333,49 @@ class TestShimWatchdogAndEpicLane(unittest.TestCase):
             self.assertEqual(wt.head(repo, "main"), base_sha, "the adapter never moves a branch")
             self.assertEqual(wt.head(repo, "epic/wave-4"), base_sha)
 
+    def test_link_ignored_deps_keeps_worktree_clean_and_reclaim_safe(self) -> None:
+        from jbi import resume
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            wt.init_repo(repo)
+            (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            base_sha = wt.commit_all(repo, "init")
+            assert base_sha
+            (repo / "node_modules" / "pkg").mkdir(parents=True)
+            (repo / "node_modules" / "pkg" / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+            task_wt = wt.create_worktree(repo, "t-deps", "main", root / "wts")
+            linked = wt.link_ignored_deps(repo, task_wt)
+            self.assertEqual(linked, ["node_modules"])
+            self.assertTrue((task_wt / "node_modules").is_dir())
+            self.assertTrue((task_wt / "node_modules" / "pkg").is_symlink())
+            self.assertEqual(wt.dirty_paths(task_wt), [])
+            ok, why = resume._worktree_contents_committed(repo, task_wt)
+            self.assertTrue(ok, why)
+
+    def test_agy_stream_json_result_envelope_parses_structured_output_and_usage(self) -> None:
+        from claude_mux_lite import credentials
+        from unittest import mock
+        bridge = credentials._AgyBridge([])
+        self.addCleanup(bridge.close)
+        ndjson = "\n".join([
+            json.dumps({"event": "init", "conversation_id": "conv-123"}),
+            json.dumps({"event": "result", "result": {
+                "conversation_id": "conv-123",
+                "status": "SUCCESS",
+                "structured_output": {"text": "DONE", "tool_calls": []},
+                "usage": {"input_tokens": 120, "output_tokens": 30, "cache_read_tokens": 80},
+            }}),
+        ])
+        with mock.patch.object(bridge, "_invoke", return_value=subprocess.CompletedProcess([], 0, ndjson, "")):
+            code, body, _ = bridge.handle(json.dumps({"model": "gemini-4-neon-medium", "messages": []}).encode(), 10.0)
+        self.assertEqual(code, 200)
+        ans = json.loads(body.decode())
+        self.assertEqual(ans["content"][0]["text"], "DONE")
+        self.assertEqual(ans["usage"]["input_tokens"], 120)
+        self.assertEqual(ans["usage"]["cache_read_input_tokens"], 80)
+
 
 if __name__ == "__main__":
     unittest.main()

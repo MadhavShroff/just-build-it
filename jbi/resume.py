@@ -173,6 +173,39 @@ def reclaim_tmux(run_id: str, original_pid: int | None, report: OrphanReport) ->
 # ---- worktrees (2.3) --------------------------------------------------------------
 
 
+def _unlink_repo_dep_symlinks(repo: Path, path: Path) -> None:
+    """Remove `node_modules` and `dist` link-populated directories that point into `repo`."""
+    repo_real = Path(repo).resolve()
+    wt_real = Path(path).resolve()
+    for base, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in list(dirs) + list(files):
+            if name not in ("node_modules", "dist"):
+                continue
+            cand = Path(base) / name
+            try:
+                if cand.is_symlink():
+                    real_t = Path(os.path.realpath(cand))
+                    if real_t.is_relative_to(repo_real) or real_t.is_relative_to(wt_real):
+                        cand.unlink()
+                        if name in dirs:
+                            dirs.remove(name)
+                elif cand.is_dir():
+                    entries = list(os.scandir(cand))
+                    if entries and all(
+                        e.is_symlink() and (
+                            Path(os.path.realpath(e.path)).is_relative_to(repo_real)
+                            or Path(os.path.realpath(e.path)).is_relative_to(wt_real)
+                        )
+                        for e in entries
+                    ):
+                        shutil.rmtree(cand)
+                        if name in dirs:
+                            dirs.remove(name)
+            except (OSError, ValueError):
+                pass
+
+
 def _worktree_contents_committed(repo: Path, path: Path) -> tuple[bool, str]:
     """Prove every byte in the worktree is reachable in a commit.
 
@@ -185,6 +218,7 @@ def _worktree_contents_committed(repo: Path, path: Path) -> tuple[bool, str]:
     Returns (ok, why).
     """
     try:
+        _unlink_repo_dep_symlinks(repo, path)
         git_dir, common = wt.pin_git_metadata(path, repo)
         out = wt.trusted_git(git_dir, common, path, "status", "--ignored", "--porcelain", "-uall", result=True)
     except (OSError, wt.GitError) as error:
