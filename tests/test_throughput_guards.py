@@ -345,14 +345,35 @@ class TestShimWatchdogAndEpicLane(unittest.TestCase):
             assert base_sha
             (repo / "node_modules" / "pkg").mkdir(parents=True)
             (repo / "node_modules" / "pkg" / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+            (repo / "node_modules" / "zod").mkdir(parents=True)
+            (repo / "node_modules" / "zod" / "index.d.ts").write_text("export type Z = string;\n", encoding="utf-8")
             task_wt = wt.create_worktree(repo, "t-deps", "main", root / "wts")
             linked = wt.link_ignored_deps(repo, task_wt)
             self.assertEqual(linked, ["node_modules"])
             self.assertTrue((task_wt / "node_modules").is_dir())
             self.assertTrue((task_wt / "node_modules" / "pkg").is_symlink())
+            self.assertFalse((task_wt / "node_modules" / "zod").is_symlink())
+            self.assertTrue((task_wt / "node_modules" / "zod" / "index.d.ts").is_file())
             self.assertEqual(wt.dirty_paths(task_wt), [])
             ok, why = resume._worktree_contents_committed(repo, task_wt)
             self.assertTrue(ok, why)
+
+    def test_task_lease_recovers_unleased_non_abandoned_task_and_updates_owns(self) -> None:
+        from jbi.tracking import Tracking
+        with tempfile.TemporaryDirectory() as td:
+            tr = Tracking(Path(td) / "fleet.db")
+            self.addCleanup(tr.close)
+            base = "a" * 40
+            wt_dir = Path(td) / "wt"
+            tr.ensure_task(task_id="T-R", title="T", goal="G", owns=["src/a.ts"],
+                           branch="jbi/T-R", worktree=wt_dir, base_commit=base, node="n")
+            tr.mark_task_state("T-R", "running")
+            tr.mark_task_state("T-R", "abandoned")
+            grant = tr.dispatch("T-R", session_id="s-n-T-R", owns=["src/a.ts"], branch="jbi/T-R", worktree=wt_dir)
+            self.assertIsNotNone(grant["lease"])
+            updated = tr.update_task_owns("T-R", ["src/a.ts", "src/b.spec.ts"])
+            self.assertEqual(updated["owns"], ["src/a.ts", "src/b.spec.ts"])
+            self.assertEqual(tr.fleet()["leases"][0]["owns"], ["src/a.ts", "src/b.spec.ts"])
 
     def test_agy_stream_json_result_envelope_parses_structured_output_and_usage(self) -> None:
         from claude_mux_lite import credentials
