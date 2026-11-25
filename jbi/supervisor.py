@@ -776,6 +776,9 @@ class Supervisor:
     def wake(self) -> None:
         self._wake.set()
 
+    def set_branch(self, branch: str) -> None:
+        self.branch = branch
+
     def _schedule(self) -> None:
         seq = self.store.seq
         while self._stopping not in ("quit", "kill", "standdown"):

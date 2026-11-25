@@ -240,9 +240,20 @@ class Engine:
     # ---- configure and execute -------------------------------------------------------
 
     def _run_configure(self, ctype: str, payload: dict) -> None:
-        changes = Changes().replace("config", "rigor", payload["rigor"]).replace("config", "profile",
-                                                                                   payload["profile"])
-        self.store.log("config", f"Rigor {payload['rigor']}, models {payload['profile']}",
+        changes = Changes()
+        parts: list[str] = []
+        if payload.get("rigor"):
+            changes.replace("config", "rigor", payload["rigor"])
+            parts.append(f"Rigor {payload['rigor']}")
+        if payload.get("profile"):
+            changes.replace("config", "profile", payload["profile"])
+            parts.append(f"models {payload['profile']}")
+        if payload.get("branch"):
+            changes.replace("bootstrap", "branch", payload["branch"])
+            if self.runtime and callable(getattr(self.runtime, "set_branch", None)):
+                self.runtime.set_branch(payload["branch"])
+            parts.append(f"branch {payload['branch']}")
+        self.store.log("config", ", ".join(parts) or "Configuration unchanged",
                        extra=changes, etype="run.config")
         if self.runtime and self.store.read("/run/phase") == "execute":
             self.runtime.wake()
