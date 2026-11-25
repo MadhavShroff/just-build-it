@@ -212,6 +212,23 @@ class CIAdapter:
         base_commit = wt.head(repo, base)
         if not _full_sha(base_commit):
             raise CIAdapterError(f"base {base} has no full 40-hex commit")
+        existing_pr = task.get("pr_number")
+        if isinstance(existing_pr, int) and existing_pr > 0:
+            try:
+                pr_data = self._github_pr(repo, existing_pr, ("state", "headRefOid"))
+                if str(pr_data.get("state") or "").upper() == "MERGED" and pr_data.get("headRefOid") == head_sha:
+                    reply = {
+                        "type": "queued",
+                        "job": f"pr-{existing_pr}",
+                        "already_merged": True,
+                        "text": f"#{existing_pr} at {head_sha[:9]} is already merged on GitHub.",
+                        "bound": {"task": tid, "verb": verb, "pr_number": existing_pr,
+                                  "head_sha": head_sha, "base": base, "base_commit": base_commit},
+                    }
+                    return HandoverResult(task=tid, branch=branch, pr_number=existing_pr,
+                                          head_sha=head_sha, reply=reply, base_commit=base_commit)
+            except CIAdapterError:
+                pass
         self.push_branch(repo, branch)
         title = task.get("title") or tid
         pr_number = self.find_or_create_draft_pr(repo, branch=branch, base=base, title=title,
@@ -259,6 +276,8 @@ class CIAdapter:
         job = result.reply.get("job")
         if not job:
             raise CIAdapterError("the handover has no direct job identifier")
+        if result.reply.get("already_merged"):
+            return False
         job = str(job)
         try:
             reply = self._service(repo, "job", [job])
@@ -320,6 +339,8 @@ class CIAdapter:
         if not job:
             raise CIAdapterError("no job id to read merge evidence from")
         job = str(job)
+        if result.reply.get("already_merged") and PR_JOB_RE.match(job):
+            return self._confirm_symbolic_merge(repo, result, job, tracking)
         try:
             reply = self._service(repo, "job", [job])
         except CIAdapterError as error:
@@ -336,6 +357,8 @@ class CIAdapter:
             raise CIAdapterError(f"job {job} has no green verdict")
         merged = re.search(rf"#{number}->([0-9a-f]{{7,40}})\b", text)
         if not merged:
+            if PR_JOB_RE.match(job):
+                return self._confirm_symbolic_merge(repo, result, job, tracking)
             raise CIAdapterError(f"job {job} has no merge record for PR #{number}")
         self._fetch_base(repo, result)
         squash = self._exec(["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(repo), "rev-parse", "--verify",
