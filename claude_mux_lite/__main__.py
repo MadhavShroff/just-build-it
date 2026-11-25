@@ -7,13 +7,24 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .harness import LiteHarness, strip_marks
+from .harness import RECEIPT_LINE, LiteHarness, strip_marks
 from jbi.store import now
 from jbi.tracking import Tracking
 
 
+def _is_brief_turn(msg: dict) -> bool:
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    return False
+
+
 def _continuation_messages(messages: list[dict]) -> tuple[list[dict], str]:
-    """Keep complete exchanges; a correction supplies the next valid user turn."""
+    """Keep complete exchanges; cap multi-attempt history to the latest attempt."""
     kept = list(messages)
     discarded: list[str] = []
     while kept:
@@ -33,6 +44,18 @@ def _continuation_messages(messages: list[dict]) -> tuple[list[dict], str]:
                 kept.pop()
                 continue
         break
+    if len(kept) > 4 and kept[-1].get("role") == "assistant":
+        last_blocks = kept[-1].get("content")
+        last_texts = ([last_blocks] if isinstance(last_blocks, str)
+                      else [str(b.get("text") or "") for b in (last_blocks or [])
+                            if isinstance(b, dict) and b.get("type") == "text"])
+        first_line = "\n".join(t for t in last_texts if t.strip()).strip().splitlines()
+        if first_line and RECEIPT_LINE.match(first_line[0]) and first_line[0].rstrip().endswith("| PASS"):
+            kept = []
+    if len(kept) > 30:
+        brief_indices = [idx for idx, m in enumerate(kept) if _is_brief_turn(m)]
+        if len(brief_indices) > 1:
+            kept = kept[brief_indices[-1]:]
     if not discarded:
         return kept, ""
     return kept, ("The previous attempt ended before a valid reply. Its incomplete exchange is omitted. "

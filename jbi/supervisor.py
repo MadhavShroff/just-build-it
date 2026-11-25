@@ -311,54 +311,56 @@ class Supervisor:
 
     def _task_lease(self, task_id: str, cwd: Path | None = None) -> dict:
         """Register the task before agent execution. Return its one live lease."""
-        task = self.store.read(f"/plan/tasks/{task_id}") or {}
-        worktree = cwd or self.run_dir / "worktrees" / task_id
-        owns = list(task.get("owns") or [])
-        if task_id == "bootstrap":
-            owns = ["*"]
-        existing = self.tracking.get_task(task_id)
-        base = (existing or {}).get("base_commit")
-        if existing is None:
-            base = wt.head(self.repo, self.store.read("/bootstrap/base_branch") or self.base_branch)
-        if base is None:
-            raise ValueError(f"task {task_id} needs a base commit")
-        branch = f"jbi/{task_id}"
-        self.tracking.ensure_task(task_id=task_id, title=str(task.get("title") or task_id),
-                                  goal=str(task.get("goal") or ""), owns=owns, branch=branch,
-                                  worktree=worktree, base_commit=base, node=self.dag_name())
-        for lease in self.tracking.fleet()["leases"]:
-            if lease["task_id"] == task_id and lease["released_at"] is None:
-                return lease
-        current_task = self.tracking.get_task(task_id)
-        if current_task is not None and current_task["state"] not in ("created", "abandoned", "merged"):
-            self.tracking.mark_task_state(task_id, "abandoned")
-        session_id = _bounded_id("s", self.dag_name(), task_id)
-        grant = self.tracking.dispatch(task_id, session_id=session_id, owns=owns,
-                                       branch=branch, worktree=worktree)
-        return grant["lease"]
+        with self._lock:
+            task = self.store.read(f"/plan/tasks/{task_id}") or {}
+            worktree = cwd or self.run_dir / "worktrees" / task_id
+            owns = list(task.get("owns") or [])
+            if task_id == "bootstrap":
+                owns = ["*"]
+            existing = self.tracking.get_task(task_id)
+            base = (existing or {}).get("base_commit")
+            if existing is None:
+                base = wt.head(self.repo, self.store.read("/bootstrap/base_branch") or self.base_branch)
+            if base is None:
+                raise ValueError(f"task {task_id} needs a base commit")
+            branch = f"jbi/{task_id}"
+            self.tracking.ensure_task(task_id=task_id, title=str(task.get("title") or task_id),
+                                      goal=str(task.get("goal") or ""), owns=owns, branch=branch,
+                                      worktree=worktree, base_commit=base, node=self.dag_name())
+            for lease in self.tracking.fleet()["leases"]:
+                if lease["task_id"] == task_id and lease["released_at"] is None:
+                    return lease
+            current_task = self.tracking.get_task(task_id)
+            if current_task is not None and current_task["state"] not in ("created", "abandoned", "merged"):
+                self.tracking.mark_task_state(task_id, "abandoned")
+            session_id = _bounded_id("s", self.dag_name(), task_id)
+            grant = self.tracking.dispatch(task_id, session_id=session_id, owns=owns,
+                                           branch=branch, worktree=worktree)
+            return grant["lease"]
 
     def _stage_dispatch(self, sid: str, task_id: str, cwd: Path, model: str,
                         brief: Path | None = None, attempt: int = 0, provider: str = "") -> dict:
         """Renew a dispatch. Only a prior dispatch in this same task supplies history."""
-        lease = self._task_lease(task_id, cwd)
-        stage_key = re.sub(r"-\d+$", "", sid)
-        # The history key names the provider: a cross-provider failover starts a fresh
-        # transcript, because one provider's content blocks never replay into another's.
-        history_key = f"h-{lease['session_id']}-{stage_key}-{provider}"
-        if len(history_key) > 64:
-            digest = hashlib.sha256(
-                f"{lease['session_id']}\0{stage_key}\0{provider}".encode()).hexdigest()
-            history_key = f"h-{digest[:32]}-{lease['task_id'][-12:]}-{stage_key[-12:]}"
-        self.tracking.start_history_session(history_key, node=self.dag_name())
-        history = self.tracking.session_history(history_key) if attempt > 0 else []
-        digest = hashlib.sha256(brief.read_bytes()).hexdigest() if brief else None
-        continuation = bool(history)
-        dispatch = self.tracking.renew_dispatch(task_id, model=model, brief_digest=digest,
-                                                continuation=continuation)
-        self.active_dispatch[sid] = dispatch["dispatch_id"]
-        return {**dispatch, "continuation": continuation,
-                "history": history, "history_session_id": history_key,
-                "session_id": lease["session_id"]}
+        with self._lock:
+            lease = self._task_lease(task_id, cwd)
+            stage_key = re.sub(r"-\d+$", "", sid)
+            # The history key names the provider: a cross-provider failover starts a fresh
+            # transcript, because one provider's content blocks never replay into another's.
+            history_key = f"h-{lease['session_id']}-{stage_key}-{provider}"
+            if len(history_key) > 64:
+                digest = hashlib.sha256(
+                    f"{lease['session_id']}\0{stage_key}\0{provider}".encode()).hexdigest()
+                history_key = f"h-{digest[:32]}-{lease['task_id'][-12:]}-{stage_key[-12:]}"
+            self.tracking.start_history_session(history_key, node=self.dag_name())
+            history = self.tracking.session_history(history_key) if attempt > 0 else []
+            digest = hashlib.sha256(brief.read_bytes()).hexdigest() if brief else None
+            continuation = bool(history)
+            dispatch = self.tracking.renew_dispatch(task_id, model=model, brief_digest=digest,
+                                                    continuation=continuation)
+            self.active_dispatch[sid] = dispatch["dispatch_id"]
+            return {**dispatch, "continuation": continuation,
+                    "history": history, "history_session_id": history_key,
+                    "session_id": lease["session_id"]}
 
     def _store_lite_spec(self, task_id: str, role: str, cwd: Path, model: str, attempt: int,
                          brief: Path, receipt: Path, base: Path, timeout_sec: float, *,
@@ -956,7 +958,8 @@ class Supervisor:
                 permanent_reroutes += 1
                 continue
             attempts = task.get("attempts", 0) + 1
-            findings = detail.splitlines()[:20]
+            raw_lines = detail.splitlines()
+            findings = raw_lines if len(raw_lines) <= 20 else [*raw_lines[:10], *raw_lines[-10:]]
             history = [*(task.get("attempt_history") or []), {"stage": stage.name, "findings": findings}]
             self._task_update(tid, attempts=attempts, findings=findings, attempt_history=history[-20:],
                               resume_after=None)
@@ -1275,7 +1278,14 @@ class Supervisor:
             # deadlocks `ci_notice`, which needs the same lock to deliver its answer.
             with self._handover_lock:
                 task = self.store.read(f"/plan/tasks/{tid}")
+                expected_head = wt.head(worktree, "HEAD") or task.get("commit")
                 handover = self._handovers.get(tid)
+                if handover is not None and expected_head and handover.head_sha != expected_head:
+                    handover = None
+                    self._handovers.pop(tid, None)
+                if expected_head and task.get("commit") != expected_head:
+                    self._task_update(tid, commit=expected_head)
+                    task = self.store.read(f"/plan/tasks/{tid}")
                 if handover is None:
                     original = self.tracking.get_task(tid) or {}
                     existing = [row for row in self.tracking.pending_ci(tid)
@@ -1363,12 +1373,14 @@ class Supervisor:
         current = wt.head(self.repo, base)
         if not current:
             raise ci_mod.CIAdapterError(f"base {base} has no commit")
-        if live and not wt.is_ancestor(self.repo, handover.base_commit, current):
-            raise ci_mod.CIAdapterError(f"base {base} diverged before task lease release")
-        if live and current != handover.base_commit and not wt.is_ancestor(self.repo, current, squash):
-            raise ci_mod.CIAdapterError(f"base {base} changed after CI verification; submit a fresh exact head")
-        if current != squash and not wt.fast_forward_main(self.repo, squash, current, branch=base):
-            raise ci_mod.CIAdapterError(f"base {base} changed before CI squash synchronization")
+        already_in_base = wt.is_ancestor(self.repo, squash, current)
+        if not already_in_base:
+            if live and not wt.is_ancestor(self.repo, handover.base_commit, current):
+                raise ci_mod.CIAdapterError(f"base {base} diverged before task lease release")
+            if live and current != handover.base_commit and not wt.is_ancestor(self.repo, current, squash):
+                raise ci_mod.CIAdapterError(f"base {base} changed after CI verification; submit a fresh exact head")
+            if current != squash and not wt.fast_forward_main(self.repo, squash, current, branch=base):
+                raise ci_mod.CIAdapterError(f"base {base} changed before CI squash synchronization")
         self._handovers.pop(tid, None)
         self._merged(job, squash)
         return True
