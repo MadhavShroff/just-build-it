@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -10,6 +11,10 @@ from pathlib import Path
 from .harness import RECEIPT_LINE, LiteHarness, strip_marks
 from jbi.store import now
 from jbi.tracking import Tracking
+
+_READONLY_RECEIPT_RE = re.compile(
+    r"-(?:review(?:-[a-z0-9-]+)?|verify|security|test-audit|methodology-audit|dry-run)-\d+\.txt$"
+)
 
 
 def _is_brief_turn(msg: dict) -> bool:
@@ -95,11 +100,19 @@ def main(arguments: list[str]) -> int:
     history: list[dict] = []
     usage_path = Path(spec["usage_path"])
     try:
+        receipt_name = Path(spec["receipt"]).name if spec.get("receipt") else ""
+        is_readonly_stage = (spec.get("role") in ("review", "verify", "security")
+                             or bool(_READONLY_RECEIPT_RE.search(receipt_name)))
         history_key = spec.get("history_session_id") or spec["session_id"]
-        if spec.get("continuation"):
+        if spec.get("continuation") and not is_readonly_stage:
             history, correction_note = _continuation_messages(tracking.session_history(history_key))
         else:
             correction_note = ""
+        timeout_sec = float(spec.get("timeout_sec", 1800))
+        max_turns = int(spec.get("max_turns", 200))
+        if is_readonly_stage:
+            timeout_sec = min(timeout_sec, 600.0)
+            max_turns = min(max_turns, 22)
         def inbox() -> str:
             text = []
             for message in tracking.pending_messages(spec["session_id"]):
@@ -123,10 +136,11 @@ def main(arguments: list[str]) -> int:
                 workdir=Path(spec["workdir"]), model=spec["model"], task_id=spec["task_id"],
                 tracking=tracking, owns=tuple(spec["owns"]), session=history,
                 receipt=Path(spec["receipt"]) if spec.get("receipt") else None,
-                checkpoint=Path(spec["checkpoint"]), timeout_sec=float(spec.get("timeout_sec", 1800)),
+                checkpoint=Path(spec["checkpoint"]), timeout_sec=timeout_sec,
                 before_turn=inbox, on_progress=progress,
-                max_turns=int(spec.get("max_turns", 200)), effort=spec.get("effort", "high"),
+                max_turns=max_turns, effort=spec.get("effort", "high"),
                 repo_context=spec.get("repo_context", ""), frozen_contracts=spec.get("frozen_contracts", ""),
+                wrap_up_final_turn=is_readonly_stage,
             )
             result = harness.run(correction_note + spec["brief"])
         finally:

@@ -352,7 +352,8 @@ class Supervisor:
                     f"{lease['session_id']}\0{stage_key}\0{provider}".encode()).hexdigest()
                 history_key = f"h-{digest[:32]}-{lease['task_id'][-12:]}-{stage_key[-12:]}"
             self.tracking.start_history_session(history_key, node=self.dag_name())
-            history = self.tracking.session_history(history_key) if attempt > 0 else []
+            is_implement = stage_key == "implement" or stage_key.endswith("-implement")
+            history = self.tracking.session_history(history_key) if (attempt > 0 and is_implement) else []
             digest = hashlib.sha256(brief.read_bytes()).hexdigest() if brief else None
             continuation = bool(history)
             dispatch = self.tracking.renew_dispatch(task_id, model=model, brief_digest=digest,
@@ -369,12 +370,15 @@ class Supervisor:
                                         attempt=attempt, provider=provider)
         task = self.store.read(f"/plan/tasks/{task_id}") or {}
         lease = self._task_lease(task_id, cwd)
+        raw_max_turns = int(rigor.task_timeouts(task)["max_turns"])
+        max_turns = raw_max_turns if role == "implement" else min(raw_max_turns, 22)
+        eff_timeout = float(timeout_sec or 1800) if role == "implement" else min(float(timeout_sec or 600), 600.0)
         spec = {"tracking": str(self.tracking.path), "workdir": str(cwd), "model": model,
-                "task_id": task_id, "owns": lease["owns"], "session_id": dispatch["session_id"],
+                "task_id": task_id, "role": role, "owns": lease["owns"], "session_id": dispatch["session_id"],
                 "history_session_id": dispatch["history_session_id"],
                 "dispatch_id": dispatch["dispatch_id"], "continuation": dispatch["continuation"],
                 "receipt": str(receipt), "checkpoint": str(base / "checkpoint.json"),
-                "timeout_sec": timeout_sec or 1800, "max_turns": rigor.task_timeouts(task)["max_turns"],
+                "timeout_sec": eff_timeout, "max_turns": max_turns,
                 "effort": rigor.effort_for(role, task=task, attempts=attempt), "brief": brief.read_text(encoding="utf-8"),
                 "repo_context": json.dumps(self.store.read("/plan/prd") or {}, sort_keys=True),
                 "frozen_contracts": json.dumps(task.get("contracts") or [], sort_keys=True),
@@ -884,6 +888,19 @@ class Supervisor:
             raise wt.GitError(f"base branch {self.base_branch} has no commit")
         existing = self.tracking.get_task(tid)
         if existing is not None:
+            if existing.get("state") == "merged":
+                merges = [m for m in self.tracking.fleet()["merges"] if m["task_id"] == tid]
+                squash_sha = merges[-1]["squash_sha"] if merges else (existing.get("head_commit") or "")
+                stages = dict(task.get("stages") or {})
+                stages.setdefault("merge", {"status": "passed", "detail": f"merged {squash_sha[:12]}", "model": None})
+                self.store.commit("task.merged", Changes()
+                                  .set("plan", "tasks", tid, "status", "merged")
+                                  .set("plan", "tasks", tid, "commit", squash_sha)
+                                  .set("plan", "tasks", tid, "stages", stages)
+                                  .set("plan", "tasks", tid, "findings", []),
+                                  {"task": tid})
+                self._progress()
+                return
             base = existing["base_commit"]
         worktree = wt.restore_worktree(self.repo, tid, base, self.run_dir / "worktrees",
                                        expected_head=(existing or {}).get("head_commit"))
@@ -1415,6 +1432,24 @@ class Supervisor:
         self._merge_ok.pop(tid, None)
         # A notice cannot bypass the current-base handover lock of a concurrent poll.
         with self._handover_lock, self._ci_lock:
+            existing = self.tracking.get_task(tid)
+            if self.store.read(f"/plan/tasks/{tid}/status") == "merged" or (existing and existing.get("state") == "merged"):
+                if self.store.read(f"/plan/tasks/{tid}/status") != "merged":
+                    merges = [m for m in self.tracking.fleet()["merges"] if m["task_id"] == tid]
+                    squash_sha = merges[-1]["squash_sha"] if merges else (
+                        notice.get("merge_sha") or (existing or {}).get("head_commit") or "")
+                    stages = dict(self.store.read(f"/plan/tasks/{tid}/stages") or {})
+                    stages.setdefault("merge", {"status": "passed", "detail": f"merged {squash_sha[:12]}", "model": None})
+                    self.store.commit("task.merged", Changes()
+                                      .set("plan", "tasks", tid, "status", "merged")
+                                      .set("plan", "tasks", tid, "commit", squash_sha)
+                                      .set("plan", "tasks", tid, "stages", stages)
+                                      .set("plan", "tasks", tid, "findings", []),
+                                      {"task": tid})
+                    self._progress()
+                self._merge_ok[tid] = True
+                self._merge_done[tid].set()
+                return
             job = MergeJob(tid, f"jbi/{tid}", self.store.read("/config/rigor") or "high",
                            self.run_dir / "worktrees" / tid)
             handover = self._handovers.get(tid)
@@ -1422,16 +1457,16 @@ class Supervisor:
                 wanted = str(notice.get("job") or notice.get("job_id"))
                 rows = [row for row in self.tracking.fleet()["ci_submissions"]
                         if row["task_id"] == tid and row["service_reply"].get("job") == wanted]
-                if len(rows) == 1:
-                    row = rows[0]
+                if rows:
+                    row = rows[-1]
                     handover = ci_mod.HandoverResult(
                         task=tid, branch=f"jbi/{tid}", pr_number=row["pr_number"],
                         head_sha=row["head_sha"], reply=row["service_reply"], base_commit=row["base_commit"])
                     self._handovers[tid] = handover
             if handover is None and hasattr(self.tracking, "pending_ci"):
                 rows = self.tracking.pending_ci(tid)
-                if len(rows) == 1:
-                    row = rows[0]
+                if rows:
+                    row = rows[-1]
                     handover = ci_mod.HandoverResult(
                         task=tid, branch=f"jbi/{tid}", pr_number=row["pr_number"],
                         head_sha=row["head_sha"], reply=row["service_reply"], base_commit=row["base_commit"])
