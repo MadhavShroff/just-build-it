@@ -70,12 +70,38 @@ def extra_env(provider: str) -> dict[str, str]:
     return {"PYTHONPATH": str(PACKAGE_ROOT)} if provider == "simulator" else {}
 
 
+def _augment_path(env: dict[str, str]) -> None:
+    """Include standard user tool directories (nvm node, ~/.local/bin, ~/.cargo/bin) when present."""
+    home = env.get("HOME") or str(Path.home())
+    raw = env.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    parts = [p for p in raw.split(":") if p]
+    seen = set(parts)
+    extra: list[str] = []
+    home_path = Path(home)
+    nvm_dir = home_path / ".nvm" / "versions" / "node"
+    if nvm_dir.is_dir():
+        try:
+            versions = sorted((p / "bin" for p in nvm_dir.iterdir() if (p / "bin").is_dir()), reverse=True)
+            if versions:
+                extra.append(str(versions[0]))
+        except OSError:
+            pass
+    for rel in (".local/bin", ".cargo/bin"):
+        cand = home_path / rel
+        if cand.is_dir():
+            extra.append(str(cand))
+    prepend = [p for p in extra if p not in seen]
+    if prepend:
+        env["PATH"] = ":".join(prepend + parts)
+
+
 def child_env(provider: str | None, source: Mapping[str, str] | None = None,
               extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """An environment for a child: the base allowlist, the provider's own variables, `extra`."""
     source = os.environ if source is None else source
     allowed = set(BASE_ENV) | set(PROVIDER_ENV.get(provider or "", ()))
     env = {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
+    _augment_path(env)
     env.update(extra or {})
     return env
 
@@ -84,7 +110,9 @@ def runtime_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for the tmux server: the union of every provider allowlist."""
     source = os.environ if source is None else source
     allowed = set(BASE_ENV).union(*PROVIDER_ENV.values())
-    return {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
+    env = {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
+    _augment_path(env)
+    return env
 
 
 @dataclass

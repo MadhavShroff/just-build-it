@@ -628,7 +628,7 @@ class ReviewFixes(unittest.TestCase):
 
         # A full prompt past the bridge bound is refused with a named error, never E2BIG.
         with mock.patch.object(credentials._AgyBridge, "BLOCK_MAX_CHARS", 10_000_000):
-            small = [{"role": "user", "content": [{"type": "text", "text": "y" * 100_001}]}]
+            small = [{"role": "user", "content": [{"type": "text", "text": "y" * (credentials._AgyBridge.PROMPT_MAX_CHARS + 1)}]}]
             payload_full = {"model": "gemini-4-neon-high", "system": "", "messages": small}
             status, body, _extra = bridge.handle(json.dumps(payload_full).encode(), 30.0)
         self.assertEqual(status, 400)

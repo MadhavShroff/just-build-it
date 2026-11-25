@@ -481,9 +481,34 @@ def host_git_argv(*args: str, work_tree: Path | str | None = None, git_dir: Path
     return argv + list(args)
 
 
+def _augment_user_path(raw_path: str, home: str) -> str:
+    """Include standard user tool directories (local bin, cargo, nvm node) when present."""
+    if not home:
+        return raw_path
+    parts = [p for p in raw_path.split(":") if p]
+    seen = set(parts)
+    extra: list[str] = []
+    home_path = Path(home)
+    nvm_dir = home_path / ".nvm" / "versions" / "node"
+    if nvm_dir.is_dir():
+        try:
+            versions = sorted((p / "bin" for p in nvm_dir.iterdir() if (p / "bin").is_dir()), reverse=True)
+            if versions:
+                extra.append(str(versions[0]))
+        except OSError:
+            pass
+    for rel in (".local/bin", ".cargo/bin"):
+        cand = home_path / rel
+        if cand.is_dir():
+            extra.append(str(cand))
+    prepend = [p for p in extra if p not in seen]
+    return ":".join(prepend + parts) if prepend else raw_path
+
+
 def fence_env() -> dict[str, str]:
     """The environment of a fenced shell. It holds no credential."""
     env = {k: os.environ[k] for k in CHILD_ENV if k in os.environ}
+    env["PATH"] = _augment_user_path(env.get("PATH", "/usr/bin:/bin"), env.get("HOME", ""))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
@@ -624,6 +649,8 @@ class BashGuard:
         for xy, rel, original in entries:
             if xy != "!!" or not rel.endswith("/"):
                 continue
+            if rel == "node_modules/" or rel.endswith("/node_modules/"):
+                continue
             rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", rel)
             if rc != 0:
                 raise GuardError("ignored baseline discovery failed")
@@ -658,7 +685,9 @@ class BashGuard:
             for p in (path, orig):
                 if p:
                     snap[p] = (xy, self._signature(p))
-        directories = [path for xy, path, _ in entries if xy == "!!" and path.endswith("/")]
+        directories = [path for xy, path, _ in entries
+                       if xy == "!!" and path.endswith("/")
+                       and path != "node_modules/" and not path.endswith("/node_modules/")]
         for directory in directories:
             # Enumerate real ignored leaves, not the aggregate directory status.
             rc, raw = self._git("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", directory)
@@ -1319,6 +1348,7 @@ class LiteHarness:
                  timeout_sec: float = 1800.0, bash_max_sec: int = 1800, receipt: Path | None = None,
                  repo_context: str = "", frozen_contracts: str = "",
                  before_run: Callable[[], None] | None = None, before_turn: Callable[[], str] | None = None,
+                 on_progress: Callable[[str], None] | None = None,
                  checkpoint: Path | None = None,
                  allowed_commits: bool = False, sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
@@ -1332,6 +1362,7 @@ class LiteHarness:
         self.system = build_system(repo_context, frozen_contracts)
         self.before_run, self.sleep, self.clock = before_run, sleep, clock
         self.before_turn = before_turn
+        self.on_progress = on_progress
         self.checkpoint = Path(checkpoint) if checkpoint else None
         if self.checkpoint is not None and inside(self.root, Path(os.path.realpath(self.checkpoint))):
             raise ValueError("checkpoint path must be outside the workspace")
@@ -1394,6 +1425,8 @@ class LiteHarness:
                     self._messages.append({"role": "user", "content": [{"type": "text", "text": message}]})
                 if self.clock() >= deadline:
                     return self._fail(result, "timeout", last_text, timed_out=True, code=124)
+                if self.on_progress is not None:
+                    self.on_progress(f"[jbi.lite] task={self.task_id} turn={turn} model={self.model} request")
                 payload = build_payload(model=self.model, max_tokens=self.max_output_tokens,
                                         effort=self.effort, system=self.system, messages=self._messages)
                 resp, err = self._call(payload, deadline)
@@ -1422,7 +1455,14 @@ class LiteHarness:
                         return self._fail(result, "output truncated at max_tokens", last_text)
                     result.final_text = last_text
                     self._write_receipt(last_text)
+                    if self.on_progress is not None:
+                        self.on_progress(f"[jbi.lite] task={self.task_id} turn={turn} done "
+                                         f"in={self.usage.input_tokens} out={self.usage.output_tokens} "
+                                         f"cache_read={self.usage.cache_read}")
                     return result
+                if self.on_progress is not None:
+                    tool_summary = ",".join(str(b.get("name") or "?") for b in uses)
+                    self.on_progress(f"[jbi.lite] task={self.task_id} turn={turn} tools={tool_summary}")
                 results = [self._tool_result(b, deadline) for b in uses]
                 self._messages.append({"role": "user", "content": results})
                 self._save(turn, last_text)

@@ -881,7 +881,7 @@ class Supervisor:
                                        expected_head=(existing or {}).get("head_commit"))
         wt.pin_git_metadata(worktree, self.repo)
         setup_cmds = self.store.read("/config/worktree_setup_commands") or ()
-        wt.prepare_worktree(worktree, setup_commands=setup_cmds, cache_key=base)
+        wt.prepare_worktree(worktree, repo=self.repo, setup_commands=setup_cmds, cache_key=base)
         self._task_lease(tid, worktree)
         findings: list[str] = task.get("findings") or []
         stage_name: str | None = task.get("resume_after")
@@ -1121,7 +1121,7 @@ class Supervisor:
                                                 pool=self.provider_pool, cooldowns=self.cooldowns)
         shared = briefs.discover_shared_helpers(worktree) if stage.role == "implement" else None
         limits = rigor.task_timeouts(task)
-        ckpt_path = worktree / ".jbi_checkpoint.json"
+        ckpt_path = self.run_dir / "checkpoints" / f"{tid}.json"
         ckpt_note: str | None = None
         if stage.role == "implement" and ckpt_path.is_file():
             try:
@@ -1158,6 +1158,7 @@ class Supervisor:
         reason = session.status.get("reason")
         if reason in ("timeout", "idle-timeout") and stage.role == "implement":
             try:
+                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
                 ckpt_path.write_text(json.dumps({"task": tid, "attempt": attempt + 1, "reason": reason,
                                                  "provider": choice.provider, "model": choice.model}), encoding="utf-8")
             except OSError:
@@ -1214,7 +1215,7 @@ class Supervisor:
         # A before_run refusal ("workdir is not clean", a live lease) is the
         # environment's fault, never the provider's: cooling its lane would flip
         # the whole run onto the next rung for nothing.
-        if "before_run refused" in lower:
+        if "before_run refused" in lower or "prompt too large" in lower:
             return
         lane_key = f"{choice.provider}/{choice.model}"
         if permanent:
@@ -1227,7 +1228,7 @@ class Supervisor:
             "rate limit", "rate_limit", "quota", "overloaded", "capacity",
             "authentication_error", "transport failure", "connection refused",
             "resource_exhausted", "credential broker failed",
-            "retries exhausted", "prompt too large",
+            "retries exhausted",
         ))
         zero_turn_error = session.status.get("turns") == 0
         if provider_error or zero_turn_error:

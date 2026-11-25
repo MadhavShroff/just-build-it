@@ -84,15 +84,30 @@ def main(arguments: list[str]) -> int:
                 tracking.message_receipt(message["id"], "delivered", "injected before the next model turn")
             return "\n".join(text).strip()
 
-        harness = LiteHarness(
-            workdir=Path(spec["workdir"]), model=spec["model"], task_id=spec["task_id"],
-            tracking=tracking, owns=tuple(spec["owns"]), session=history,
-            receipt=Path(spec["receipt"]) if spec.get("receipt") else None,
-            checkpoint=Path(spec["checkpoint"]), timeout_sec=float(spec.get("timeout_sec", 1800)), before_turn=inbox,
-            max_turns=int(spec.get("max_turns", 200)), effort=spec.get("effort", "high"),
-            repo_context=spec.get("repo_context", ""), frozen_contracts=spec.get("frozen_contracts", ""),
-        )
-        result = harness.run(correction_note + spec["brief"])
+        import threading
+        def progress(msg: str) -> None:
+            print(msg, flush=True)
+
+        stop_beat = threading.Event()
+        def beat() -> None:
+            while not stop_beat.wait(45.0):
+                print(f"[jbi.lite] task={spec['task_id']} model={spec['model']} active...", flush=True)
+
+        beat_thread = threading.Thread(target=beat, daemon=True)
+        beat_thread.start()
+        try:
+            harness = LiteHarness(
+                workdir=Path(spec["workdir"]), model=spec["model"], task_id=spec["task_id"],
+                tracking=tracking, owns=tuple(spec["owns"]), session=history,
+                receipt=Path(spec["receipt"]) if spec.get("receipt") else None,
+                checkpoint=Path(spec["checkpoint"]), timeout_sec=float(spec.get("timeout_sec", 1800)),
+                before_turn=inbox, on_progress=progress,
+                max_turns=int(spec.get("max_turns", 200)), effort=spec.get("effort", "high"),
+                repo_context=spec.get("repo_context", ""), frozen_contracts=spec.get("frozen_contracts", ""),
+            )
+            result = harness.run(correction_note + spec["brief"])
+        finally:
+            stop_beat.set()
         history = harness.take_messages()
         dispatch = int(spec["dispatch_id"])
         tracking.record_cost(dispatch, input_tokens=result.usage.input_tokens,
