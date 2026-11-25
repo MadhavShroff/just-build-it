@@ -840,9 +840,34 @@ class ReadonlyStageAndIdempotentMergeTest(unittest.TestCase):
                                               self.run_dir / "sessions/s-T1-review-ds-1-2", 1800, provider="agy")
         spec = json.loads(spec_path.read_text())
         self.assertFalse(spec["continuation"])
-        self.assertEqual(spec["max_turns"], 22)
-        self.assertEqual(spec["timeout_sec"], 600.0)
+        self.assertEqual(spec["max_turns"], 16)
+        self.assertEqual(spec["timeout_sec"], 1080.0)
         self.assertEqual(spec["role"], "review")
+
+    def test_non_receipt_json_reply_nudges_and_recovers(self):
+        from claude_mux_lite.harness import LiteHarness
+        calls = 0
+
+        def transport(payload):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"content": [{"type": "text", "text": '{"text": "I inspect diff", "tool_calls": ['}],
+                        "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 5}}
+            return {"content": [{"type": "text", "text": f"BRIEF T1 | {self.base} | PASS\nclean"}],
+                    "stop_reason": "end_turn", "usage": {"input_tokens": 12, "output_tokens": 6}}
+
+        self.sup._task_lease("T1", self.worktree)
+        receipt = self.run_dir / "receipts" / "T1-review-ds-3-0.txt"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        h = LiteHarness(workdir=self.worktree, model="m", task_id="T1", tracking=self.sup.tracking,
+                        owns=("src/a.txt",), transport=transport, max_turns=6, receipt=receipt,
+                        require_receipt_line=True)
+        res = h.run("Review diff")
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(calls, 2)
+        self.assertTrue(receipt.is_file())
+        self.assertTrue(receipt.read_text().startswith("BRIEF T1"))
 
     def test_late_ci_notice_after_merge_stays_merged(self):
         self.sup._task_lease("T1", self.worktree)

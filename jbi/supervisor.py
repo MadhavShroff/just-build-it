@@ -371,8 +371,8 @@ class Supervisor:
         task = self.store.read(f"/plan/tasks/{task_id}") or {}
         lease = self._task_lease(task_id, cwd)
         raw_max_turns = int(rigor.task_timeouts(task)["max_turns"])
-        max_turns = raw_max_turns if role == "implement" else min(raw_max_turns, 22)
-        eff_timeout = float(timeout_sec or 1800) if role == "implement" else min(float(timeout_sec or 600), 600.0)
+        max_turns = raw_max_turns if role == "implement" else min(raw_max_turns, 16)
+        eff_timeout = float(timeout_sec or 1800) if role == "implement" else min(float(timeout_sec or 1080), 1080.0)
         spec = {"tracking": str(self.tracking.path), "workdir": str(cwd), "model": model,
                 "task_id": task_id, "role": role, "owns": lease["owns"], "session_id": dispatch["session_id"],
                 "history_session_id": dispatch["history_session_id"],

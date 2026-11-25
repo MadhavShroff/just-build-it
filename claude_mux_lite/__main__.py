@@ -103,6 +103,7 @@ def main(arguments: list[str]) -> int:
         receipt_name = Path(spec["receipt"]).name if spec.get("receipt") else ""
         is_readonly_stage = (spec.get("role") in ("review", "verify", "security")
                              or bool(_READONLY_RECEIPT_RE.search(receipt_name)))
+        is_jbi_stage = is_readonly_stage or bool(re.search(r"-implement-\d+\.txt$", receipt_name))
         history_key = spec.get("history_session_id") or spec["session_id"]
         if spec.get("continuation") and not is_readonly_stage:
             history, correction_note = _continuation_messages(tracking.session_history(history_key))
@@ -111,8 +112,8 @@ def main(arguments: list[str]) -> int:
         timeout_sec = float(spec.get("timeout_sec", 1800))
         max_turns = int(spec.get("max_turns", 200))
         if is_readonly_stage:
-            timeout_sec = min(timeout_sec, 600.0)
-            max_turns = min(max_turns, 22)
+            timeout_sec = min(timeout_sec, 1080.0)
+            max_turns = min(max_turns, 16)
         def inbox() -> str:
             text = []
             for message in tracking.pending_messages(spec["session_id"]):
@@ -140,7 +141,7 @@ def main(arguments: list[str]) -> int:
                 before_turn=inbox, on_progress=progress,
                 max_turns=max_turns, effort=spec.get("effort", "high"),
                 repo_context=spec.get("repo_context", ""), frozen_contracts=spec.get("frozen_contracts", ""),
-                wrap_up_final_turn=is_readonly_stage,
+                wrap_up_final_turn=is_readonly_stage, require_receipt_line=is_jbi_stage,
             )
             result = harness.run(correction_note + spec["brief"])
         finally:
