@@ -37,8 +37,31 @@ def is_protected(path: Path | str) -> bool:
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in PROTECTED_GLOBS)
 
 
+_REGEX_PREV_CHARS = frozenset("=(,[!&|?:;{}~^+-*%<>")
+_REGEX_PREV_WORDS = frozenset({
+    "return", "throw", "case", "typeof", "void", "delete",
+    "in", "of", "instanceof", "new", "yield", "await", "else", "do",
+})
+
+
+def _can_start_regex(text: str, pos: int) -> bool:
+    j = pos - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return True
+    if text[j] in _REGEX_PREV_CHARS:
+        return True
+    if text[j].isalpha() or text[j] in "_$":
+        end = j + 1
+        while j >= 0 and (text[j].isalnum() or text[j] in "_$"):
+            j -= 1
+        return text[j + 1:end] in _REGEX_PREV_WORDS
+    return False
+
+
 def _balanced_delimiters(text: str) -> str | None:
-    """Fast lexical delimiter balance check for JS/TS files, ignoring strings and comments."""
+    """Fast lexical delimiter balance check for JS/TS files, handling strings, templates, regexes, and comments."""
     pairs = {"{": "}", "[": "]", "(": ")"}
     closing = {"}": "{", "]": "[", ")": "("}
     stack: list[tuple[str, int]] = []
@@ -46,13 +69,15 @@ def _balanced_delimiters(text: str) -> str | None:
     i = 0
     n = len(text)
     state = "code"
+    regex_in_class = False
     while i < n:
         ch = text[i]
         nxt = text[i + 1] if i + 1 < n else ""
         if ch == "\n":
             line += 1
-            if state == "line_comment":
+            if state in ("line_comment", "regex"):
                 state = "code"
+                regex_in_class = False
             i += 1
             continue
         if state == "line_comment":
@@ -65,11 +90,42 @@ def _balanced_delimiters(text: str) -> str | None:
             else:
                 i += 1
             continue
-        if state in ("single", "double", "template"):
+        if state == "regex":
             if ch == "\\":
+                if nxt == "\n":
+                    line += 1
                 i += 2
                 continue
-            if (state == "single" and ch == "'") or (state == "double" and ch == '"') or (state == "template" and ch == "`"):
+            if ch == "[":
+                regex_in_class = True
+            elif ch == "]" and regex_in_class:
+                regex_in_class = False
+            elif ch == "/" and not regex_in_class:
+                state = "code"
+            i += 1
+            continue
+        if state in ("single", "double"):
+            if ch == "\\":
+                if nxt == "\n":
+                    line += 1
+                i += 2
+                continue
+            if (state == "single" and ch == "'") or (state == "double" and ch == '"'):
+                state = "code"
+            i += 1
+            continue
+        if state == "template":
+            if ch == "\\":
+                if nxt == "\n":
+                    line += 1
+                i += 2
+                continue
+            if ch == "$" and nxt == "{":
+                stack.append(("${", line))
+                state = "code"
+                i += 2
+                continue
+            if ch == "`":
                 state = "code"
             i += 1
             continue
@@ -80,6 +136,11 @@ def _balanced_delimiters(text: str) -> str | None:
         if ch == "/" and nxt == "*":
             state = "block_comment"
             i += 2
+            continue
+        if ch == "/" and _can_start_regex(text, i):
+            state = "regex"
+            regex_in_class = False
+            i += 1
             continue
         if ch == "'":
             state = "single"
@@ -99,6 +160,10 @@ def _balanced_delimiters(text: str) -> str | None:
             if not stack:
                 return f"unmatched '{ch}' at line {line}"
             top, top_line = stack.pop()
+            if top == "${" and ch == "}":
+                state = "template"
+                i += 1
+                continue
             if top != closing[ch]:
                 return f"mismatched '{ch}' at line {line} (opened '{top}' at line {top_line})"
         i += 1
@@ -141,9 +206,11 @@ def check_syntax(path: Path) -> str | None:
             return None
         err = _balanced_delimiters(text)
         return f"{path.name}: {err}" if err else None
-    if suffix in (".ts", ".tsx"):
+    if suffix == ".ts":
         err = _balanced_delimiters(text)
         return f"{path.name}: {err}" if err else None
+    if suffix == ".tsx":
+        return None
     return None
 
 

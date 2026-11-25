@@ -1179,7 +1179,13 @@ class Supervisor:
             else:
                 guard_errors = []
             if guard_errors:
-                wt.discard_changes(worktree)
+                if any(e.startswith("modified unowned path") for e in guard_errors):
+                    wt.discard_changes(worktree)
+                else:
+                    draft_sha = wt.commit_all(worktree, f"{tid}: implement draft attempt {attempt + 1}") or wt.head(worktree, "HEAD")
+                    if draft_sha:
+                        self._task_update(tid, commit=draft_sha)
+                        self.tracking.record_commit(tid, draft_sha)
                 return False, "; ".join(guard_errors), choice.model
             sha = wt.commit_all(worktree, f"{tid}: implement attempt {attempt + 1}")
             sha = sha or wt.head(worktree, "HEAD")
