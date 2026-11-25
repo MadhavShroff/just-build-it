@@ -65,12 +65,20 @@ def probe(url: str, run_id: str, timeout: float = 3.0) -> bool:
     return body.get("ok") is True and body.get("run_id") == run_id
 
 
-def links(port: int, run_id: str, tailnet: Tailnet | None) -> list[Link]:
+def links(port: int, run_id: str, tailnet: Tailnet | None, base_path: str = "") -> list[Link]:
+    """One link per listener address, each verified by a live probe of that URL.
+
+    base_path carries a reverse-proxy mount such as /jbi/preview. The URL and
+    the probe must both include the mount: control.json takes its URL from
+    links[0], and a bare-host URL makes `jbi links` and `jbi fleet` join
+    /api/v1/... onto the mounted dashboard and fail 404.
+    """
+    base = "/" + base_path.strip("/") if base_path.strip("/") else ""
     found = []
-    local = f"http://{LOOPBACK}:{port}"
+    local = f"http://{LOOPBACK}:{port}{base}"
     found.append(Link("Local", LOOPBACK, local, probe(local, run_id)))
     if tailnet:
-        url = f"http://{tailnet.ip}:{port}"
+        url = f"http://{tailnet.ip}:{port}{base}"
         ok = probe(url, run_id)
         found.append(Link("Tailscale", tailnet.ip, url, ok,
                           "" if ok else "the listener did not answer on the Tailscale address"))
