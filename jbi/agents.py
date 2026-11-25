@@ -102,6 +102,8 @@ def child_env(provider: str | None, source: Mapping[str, str] | None = None,
     allowed = set(BASE_ENV) | set(PROVIDER_ENV.get(provider or "", ()))
     env = {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
     _augment_path(env)
+    if provider is None:
+        env.setdefault("NODE_OPTIONS", "--max-old-space-size=8192")
     env.update(extra or {})
     return env
 

@@ -1016,6 +1016,7 @@ class Supervisor:
                 result = run_command(task["acceptance"], cwd=worktree, env=agents.child_env(None),
                                      timeout=acc_timeout, parent_pid=self.parent_pid, groups=self.groups)
             finally:
+                wt.discard_changes(worktree)
                 did = self.active_dispatch.pop(sid, None)
                 if did is not None:
                     self.tracking.finish_dispatch(did, verdict="ended")

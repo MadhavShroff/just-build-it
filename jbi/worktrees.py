@@ -440,6 +440,8 @@ def link_ignored_deps(repo: Path, worktree: Path) -> list[str]:
         try:
             dst.mkdir(exist_ok=True)
             for entry in os.scandir(src):
+                if entry.name in (".vite", ".vite-temp", ".cache"):
+                    continue
                 link_path = dst / entry.name
                 if os.path.lexists(link_path):
                     continue
