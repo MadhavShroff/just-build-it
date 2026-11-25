@@ -296,10 +296,14 @@ def apply_cache_marks(messages: list[dict]) -> list[dict]:
 
 
 def build_payload(*, model: str, max_tokens: int, effort: str, system: list[dict],
-                  messages: list[dict]) -> dict:
-    return {"model": model, "max_tokens": max_tokens, "output_config": {"effort": effort},
-            "tools": TOOLS, "system": system, "messages": apply_cache_marks(messages),
-            "cache_control": dict(EPHEMERAL)}
+                  messages: list[dict], tools: list[dict] | None = None) -> dict:
+    payload = {"model": model, "max_tokens": max_tokens, "output_config": {"effort": effort},
+               "system": system, "messages": apply_cache_marks(messages),
+               "cache_control": dict(EPHEMERAL)}
+    resolved_tools = TOOLS if tools is None else tools
+    if resolved_tools:
+        payload["tools"] = resolved_tools
+    return payload
 
 
 def count_marks(payload: dict) -> int:
@@ -1350,6 +1354,7 @@ class LiteHarness:
                  before_run: Callable[[], None] | None = None, before_turn: Callable[[], str] | None = None,
                  on_progress: Callable[[str], None] | None = None,
                  checkpoint: Path | None = None,
+                 wrap_up_final_turn: bool = False,
                  allowed_commits: bool = False, sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
         self.workdir = Path(workdir)
@@ -1357,6 +1362,7 @@ class LiteHarness:
         self.model, self.task_id, self.tracking, self.owns = model, task_id, tracking, tuple(owns)
         self.transport = transport or HttpTransport(timeout=timeout_sec)
         self.max_turns, self.max_output_tokens, self.effort = max_turns, max_output_tokens, effort
+        self.wrap_up_final_turn = wrap_up_final_turn
         self.timeout_sec, self.bash_max_sec = timeout_sec, bash_max_sec
         self.receipt = Path(receipt) if receipt else None
         self.system = build_system(repo_context, frozen_contracts)
@@ -1425,10 +1431,17 @@ class LiteHarness:
                     self._messages.append({"role": "user", "content": [{"type": "text", "text": message}]})
                 if self.clock() >= deadline:
                     return self._fail(result, "timeout", last_text, timed_out=True, code=124)
+                final_wrap_up = self.wrap_up_final_turn and self.max_turns >= 4 and turn == self.max_turns
+                if final_wrap_up:
+                    self._messages.append({"role": "user", "content": [{"type": "text", "text": (
+                        "Final turn reached: do not call any more tools. Emit your complete "
+                        "BRIEF <task> | <sha-or-uncommitted> | PASS or FAIL receipt now based on the evidence gathered."
+                    )}]})
                 if self.on_progress is not None:
                     self.on_progress(f"[jbi.lite] task={self.task_id} turn={turn} model={self.model} request")
                 payload = build_payload(model=self.model, max_tokens=self.max_output_tokens,
-                                        effort=self.effort, system=self.system, messages=self._messages)
+                                        effort=self.effort, system=self.system, messages=self._messages,
+                                        tools=[] if final_wrap_up else None)
                 resp, err = self._call(payload, deadline)
                 if err:
                     return self._fail(result, err[1], last_text, timed_out=err[0] == "timeout",

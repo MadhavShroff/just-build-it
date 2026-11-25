@@ -808,5 +808,54 @@ class CacheKeyRoutingTest(unittest.TestCase):
                              base=self.base, state=self.state, pool=pool)
 
 
+class ReadonlyStageAndIdempotentMergeTest(unittest.TestCase):
+    """PR 22: read-only review/verify stages cap turns + skip stale history, and late ci_notice is idempotent."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="jbi-pr22-"))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.repo, self.base = _make_repo(self.tmp)
+        self.run_dir = self.tmp / "run"
+        self.run_dir.mkdir()
+        state = _state(self.repo, "r-pr22")
+        state["plan"] = waves.compile_plan([
+            {"id": "T1", "title": "A", "goal": "Write src/a.txt", "deps": [],
+             "owns": ["src/a.txt"], "acceptance": "test -f src/a.txt", "effort": "XL"},
+        ], 1)
+        self.store = Store(self.run_dir / "run.db", state)
+        self.addCleanup(self.store.close)
+        self.sup = Supervisor(self.store, _NoopHooks(), self.run_dir, self.repo, use_tmux=False)
+        self.addCleanup(self.sup.tracking.close)
+        self.worktree = wt.create_worktree(self.repo, "T1", self.base, self.run_dir / "worktrees")
+
+    def test_review_spec_caps_turns_and_skips_stale_history(self):
+        from jbi import briefs
+        self.sup._task_lease("T1", self.worktree)
+        d0 = self.sup._stage_dispatch("s-T1-review-1", "T1", self.worktree, "m", attempt=0, provider="agy")
+        self.sup.tracking.record_session_history(d0["history_session_id"],
+                                                 [{"role": "user", "content": "old review"}])
+        brief, receipt = briefs.write(self.run_dir, task=self.store.read("/plan/tasks/T1"),
+                                      role="review", stage="review-ds-1", attempt=1)
+        spec_path = self.sup._store_lite_spec("T1", "review", self.worktree, "m", 1, brief, receipt,
+                                              self.run_dir / "sessions/s-T1-review-ds-1-2", 1800, provider="agy")
+        spec = json.loads(spec_path.read_text())
+        self.assertFalse(spec["continuation"])
+        self.assertEqual(spec["max_turns"], 22)
+        self.assertEqual(spec["timeout_sec"], 600.0)
+        self.assertEqual(spec["role"], "review")
+
+    def test_late_ci_notice_after_merge_stays_merged(self):
+        self.sup._task_lease("T1", self.worktree)
+        self.sup.tracking.record_ci("T1", pr_number=1092, head_sha=self.base, base_commit=self.base,
+                                    state="green", squash_sha=self.base, green_run="pr-1092",
+                                    service_reply={"job": "pr-1092"})
+        self.sup.tracking.record_merge("T1", pr_number=1092, head_sha=self.base,
+                                       squash_sha=self.base, green_run="pr-1092")
+        self.store.commit("fixture", Changes().set("plan", "tasks", "T1", "status", "failed"))
+        self.sup.ci_notice("T1", {"verdict": "green", "pr_number": 1092})
+        self.assertEqual(self.store.read("/plan/tasks/T1/status"), "merged")
+        self.assertEqual(self.store.read("/plan/tasks/T1/commit"), self.base)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -270,7 +270,7 @@ class Engine:
 
     def _task_override(self, ctype: str, payload: dict) -> None:
         self._task(payload["task"])
-        override = {k: payload[k] for k in ("rigor", "profile", "model") if payload.get(k)}
+        override = {k: payload[k] for k in ("rigor", "profile", "model", "pin") if payload.get(k)}
         changes = Changes()
         parts = [f"{k} {v}" for k, v in override.items()]
         if "owns" in payload:
