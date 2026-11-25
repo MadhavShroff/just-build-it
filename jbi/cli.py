@@ -865,6 +865,10 @@ def recover_command(args: argparse.Namespace, *, then_resume: bool = True) -> in
         return 0
     print("resuming the run.")
     return serve(args, resume_dir=target_dir)
+
+
+def resume_command(args: argparse.Namespace) -> int:
+    target_dir = getattr(args, "run_dir", None)
     if target_dir is None:
         runs = sorted((HOME / "runs").glob("r-*"), key=lambda p: p.stat().st_mtime)
         if not runs:
@@ -876,7 +880,7 @@ def recover_command(args: argparse.Namespace, *, then_resume: bool = True) -> in
     elif not (Path(target_dir).expanduser() / "run.db").is_file() and getattr(args, "if_exists", False):
         print(f"No stored run at {target_dir}; exiting cleanly.")
         return 0
-    return serve(args, resume_dir=target_dir)
+    return serve(args, resume_dir=Path(target_dir).expanduser())
 
 
 def run_client(run_dir: Path | None) -> Client:
