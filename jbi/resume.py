@@ -176,6 +176,8 @@ def reclaim_tmux(run_id: str, original_pid: int | None, report: OrphanReport) ->
 def _unlink_repo_dep_symlinks(repo: Path, path: Path) -> None:
     """Remove `node_modules` and `dist` link-populated directories that point into `repo`."""
     repo_real = Path(repo).resolve()
+    deps_override = os.environ.get("JBI_DEPS_SOURCE", "").strip()
+    deps_real = Path(deps_override).resolve() if deps_override else repo_real
     wt_real = Path(path).resolve()
     for base, dirs, files in os.walk(path, followlinks=False):
         dirs[:] = [d for d in dirs if d != ".git"]
@@ -186,7 +188,7 @@ def _unlink_repo_dep_symlinks(repo: Path, path: Path) -> None:
             try:
                 if cand.is_symlink():
                     real_t = Path(os.path.realpath(cand))
-                    if real_t.is_relative_to(repo_real) or real_t.is_relative_to(wt_real):
+                    if real_t.is_relative_to(repo_real) or real_t.is_relative_to(deps_real) or real_t.is_relative_to(wt_real):
                         cand.unlink()
                         if name in dirs:
                             dirs.remove(name)
@@ -195,6 +197,7 @@ def _unlink_repo_dep_symlinks(repo: Path, path: Path) -> None:
                     if entries and all(
                         (e.is_symlink() and (
                             Path(os.path.realpath(e.path)).is_relative_to(repo_real)
+                            or Path(os.path.realpath(e.path)).is_relative_to(deps_real)
                             or Path(os.path.realpath(e.path)).is_relative_to(wt_real)
                         )) or (name == "node_modules" and e.name in (".vite", ".vite-temp", ".cache"))
                         for e in entries

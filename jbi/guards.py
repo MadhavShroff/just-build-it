@@ -113,6 +113,8 @@ def check_syntax(path: Path) -> str | None:
     if not path.is_file():
         return None
     suffix = path.suffix.lower()
+    if suffix not in (".json", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx"):
+        return None
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -203,8 +205,16 @@ def safe_edit_hint(content: str, old_text: str, filename: str = "file") -> str:
 def validate_worktree_edits(worktree: Path, owns: Iterable[str] = ()) -> list[str]:
     """Validate ownership and fast syntax across all dirty paths in `worktree`."""
     errors: list[str] = []
-    dirty = wt.dirty_paths(worktree)
     owns_list = [p for p in owns if isinstance(p, str) and p.strip()]
+    dirty = wt.dirty_paths(worktree)
+    restored = False
+    for rel in list(dirty):
+        if (rel == ".yarn/install-state.gz" or rel.endswith("/.yarn/install-state.gz")) \
+                and (not owns_list or not wt.path_owned(rel, owns_list)):
+            wt.git(worktree, "checkout", "--", rel, check=False)
+            restored = True
+    if restored:
+        dirty = wt.dirty_paths(worktree)
     if owns_list:
         unowned = [p for p in dirty if not wt.path_owned(p, owns_list)]
         if unowned:

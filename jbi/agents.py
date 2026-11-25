@@ -18,8 +18,10 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 # Variables every child may keep. Everything else is dropped, so one provider's
 # secret never reaches another provider's agent or a plain command.
 BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TZ", "TMPDIR",
-            "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMUX_TMPDIR")
+            "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMUX_TMPDIR",
+            "JBI_DEPS_SOURCE")
 BASE_PREFIXES = ("LC_",)
+BASE_SUFFIXES = ("_MONGO_URI", "_REDIS_URL")
 PROVIDER_ENV: dict[str, tuple[str, ...]] = {
     "claude-mux-lite": ("CLAUDE_MUX_BASE_URL", "CLAUDE_MUX_API_KEY", "CLAUDE_MUX_HEADERS"),
     "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
@@ -100,7 +102,8 @@ def child_env(provider: str | None, source: Mapping[str, str] | None = None,
     """An environment for a child: the base allowlist, the provider's own variables, `extra`."""
     source = os.environ if source is None else source
     allowed = set(BASE_ENV) | set(PROVIDER_ENV.get(provider or "", ()))
-    env = {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
+    env = {k: v for k, v in source.items()
+           if k in allowed or k.startswith(BASE_PREFIXES) or k.endswith(BASE_SUFFIXES)}
     _augment_path(env)
     if provider is None:
         env.setdefault("NODE_OPTIONS", "--max-old-space-size=8192")
@@ -112,7 +115,8 @@ def runtime_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for the tmux server: the union of every provider allowlist."""
     source = os.environ if source is None else source
     allowed = set(BASE_ENV).union(*PROVIDER_ENV.values())
-    env = {k: v for k, v in source.items() if k in allowed or k.startswith(BASE_PREFIXES)}
+    env = {k: v for k, v in source.items()
+           if k in allowed or k.startswith(BASE_PREFIXES) or k.endswith(BASE_SUFFIXES)}
     _augment_path(env)
     return env
 

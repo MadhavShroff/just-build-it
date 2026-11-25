@@ -412,7 +412,8 @@ def link_ignored_deps(repo: Path, worktree: Path) -> list[str]:
     inside the bwrap root mount.
     """
     linked: list[str] = []
-    repo_root = Path(repo).resolve()
+    deps_override = os.environ.get("JBI_DEPS_SOURCE", "").strip()
+    repo_root = Path(deps_override).resolve() if deps_override else Path(repo).resolve()
     wt_root = Path(worktree).resolve()
     if repo_root == wt_root or not repo_root.is_dir() or not wt_root.is_dir():
         return linked
