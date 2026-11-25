@@ -42,6 +42,10 @@ class TestGuards(unittest.TestCase):
             bad_ts.write_text("export function f() {\n  return [1, 2;\n}\n", encoding="utf-8")
             self.assertIn("mismatched", guards.check_syntax(bad_ts) or "")
 
+            regex_ts = root / "regex.ts"
+            regex_ts.write_text("export const rx = /\\(/;\nexport function g(): boolean { return rx.test('('); }\n", encoding="utf-8")
+            self.assertIsNone(guards.check_syntax(regex_ts))
+
     def test_guard_write_refuses_bad_json_and_truncation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
