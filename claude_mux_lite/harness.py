@@ -1623,6 +1623,7 @@ class LiteHarness:
         if len(out) > BASH_OUT_MAX:
             out = out[:BASH_OUT_MAX // 2] + "\n...[truncated]...\n" + out[-BASH_OUT_MAX // 2:]
         reverted, errors = self.guard.reconcile()
+        reverted = [r for r in reverted if r != ".yarn/install-state.gz" and not r.endswith("/.yarn/install-state.gz")]
         body = f"{note}\n{out}"
         if reverted or errors:
             detail = "; ".join(([f"reverted {', '.join(reverted)}"] if reverted else []) + errors)
