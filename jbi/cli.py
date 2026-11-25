@@ -536,7 +536,8 @@ class Run:
                        base_path=getattr(args, "base_path", "") or "",
                        public_paths=public_paths)
         self.server = Server(self.app, netinfo.hosts(tailnet), args.port).start()
-        self.links = netinfo.links(self.server.port, self.run_id, tailnet)
+        self.links = netinfo.links(self.server.port, self.run_id, tailnet,
+                                   base_path=self.app.base_path)
         Control(self.links[0].url, self.auth.token, self.run_id, os.getpid()).save(self.dir / "control.json")
         self._publish_registry(args)
 

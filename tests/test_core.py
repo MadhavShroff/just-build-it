@@ -18,11 +18,12 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from jbi import cli, dag_loader, planner
+from jbi import cli, dag_loader, netinfo, planner
 from jbi import jsonpatch as jp
 from jbi import protocol, rigor, waves
 from jbi.engine import Engine
 from jbi.llm import CompletionError
+from jbi.client import Client, Control
 from jbi.protocol import ProtocolError
 from jbi.server import MAX_BODY, App, Auth, Server
 from jbi.store import Changes, Store, now
@@ -745,6 +746,37 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(record["url"], "http://127.0.0.1:9999/jbi/preview")
         self.assertNotIn("token", record)
         self.assertEqual(sorted(record["published"]), [])
+
+    def test_links_and_control_carry_the_base_path_prefix(self):
+        """`jbi links` and `jbi fleet` read control.json; its URL must carry the mount.
+
+        The server refuses any path outside the mount, so a bare-port URL joins
+        /api/v1/... onto the host and the mounted dashboard answers 404 (sb 29053).
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = new_store(Path(tmp.name))
+        self.addCleanup(store.close)
+        auth = Auth()
+        app = App(store, Engine(store, None, None), auth, base_path="/jbi/preview")
+        server = Server(app, ["127.0.0.1"]).start()
+        self.addCleanup(server.stop)
+
+        links = netinfo.links(server.port, "r-test", None, base_path="/jbi/preview")
+        self.assertEqual(links[0].url, f"http://127.0.0.1:{server.port}/jbi/preview")
+        self.assertTrue(links[0].verified)   # the probe joined the mount and passed
+        # No mount keeps the bare-host URL, so nothing else changes shape.
+        bare = netinfo.links(server.port, "r-test", None)
+        self.assertEqual(bare[0].url, f"http://127.0.0.1:{server.port}")
+        self.assertFalse(bare[0].verified)
+
+        # control.json takes links[0].url; a client built from that file must
+        # reach the mounted endpoints exactly as the browser does.
+        control = Control(links[0].url, auth.token, "r-test", os.getpid())
+        path = Path(tmp.name) / "control.json"
+        control.save(path)
+        client = Client.from_control(Control.load(path))
+        self.assertEqual(client.health()["run_id"], "r-test")
 
     def test_a_key_works_once(self):
         key = self.auth.new_key()
