@@ -88,6 +88,27 @@ def _peer(connection: socket.socket) -> tuple[int, int]:
     return pid, uid
 
 
+def _parse_agy_response_text(raw_resp: str) -> dict[str, Any]:
+    """Parse structured JSON or markdown-fenced JSON from an agy response string."""
+    stripped = raw_resp.strip()
+    if not stripped:
+        return {"text": "", "tool_calls": []}
+    candidates = [stripped]
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            candidates.insert(0, "\n".join(lines[1:-1]).strip())
+    for cand in candidates:
+        if cand.startswith("{") and cand.endswith("}"):
+            try:
+                parsed = json.loads(cand)
+                if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
+                    return parsed
+            except ValueError:
+                pass
+    return {"text": raw_resp, "tool_calls": []}
+
+
 class _AgyBridge:
     """Serve Anthropic-shaped /v1/messages turns through the local `agy` CLI.
 
@@ -277,14 +298,11 @@ class _AgyBridge:
         structured = doc.get("structured_output") if isinstance(doc, dict) else None
         if not isinstance(structured, dict):
             raw_resp = doc.get("response") if isinstance(doc, dict) else ""
-            if isinstance(raw_resp, str) and raw_resp.strip():
-                try:
-                    parsed = json.loads(raw_resp)
-                    structured = parsed if isinstance(parsed, dict) else {"text": raw_resp, "tool_calls": []}
-                except ValueError:
-                    structured = {"text": raw_resp, "tool_calls": []}
-            else:
-                structured = {"text": "", "tool_calls": []}
+            structured = _parse_agy_response_text(raw_resp) if isinstance(raw_resp, str) else {"text": "", "tool_calls": []}
+        elif not structured.get("tool_calls") and isinstance(structured.get("text"), str):
+            nested = _parse_agy_response_text(structured["text"])
+            if nested.get("tool_calls") or (nested.get("text") != structured["text"] and nested.get("text")):
+                structured = nested
         text = str(structured.get("text") or "")
         raw_calls = structured.get("tool_calls") if isinstance(structured.get("tool_calls"), list) else []
         content: list[dict[str, Any]] = []
@@ -305,7 +323,7 @@ class _AgyBridge:
                     "input": inp,
                 })
         if not content:
-            content.append({"type": "text", "text": text})
+            return 502, b"", {TRANSPORT_HEADER: "agy returned empty turn output"}
         raw_usage = doc.get("usage") if isinstance(doc, dict) and isinstance(doc.get("usage"), dict) else {}
         usage: dict[str, int] = {}
         for dst, src in (("input_tokens", "input_tokens"),
