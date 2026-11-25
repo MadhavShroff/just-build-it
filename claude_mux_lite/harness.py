@@ -1355,6 +1355,7 @@ class LiteHarness:
                  on_progress: Callable[[str], None] | None = None,
                  checkpoint: Path | None = None,
                  wrap_up_final_turn: bool = False,
+                 require_receipt_line: bool = False,
                  allowed_commits: bool = False, sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
         self.workdir = Path(workdir)
@@ -1363,6 +1364,7 @@ class LiteHarness:
         self.transport = transport or HttpTransport(timeout=timeout_sec)
         self.max_turns, self.max_output_tokens, self.effort = max_turns, max_output_tokens, effort
         self.wrap_up_final_turn = wrap_up_final_turn
+        self.require_receipt_line = require_receipt_line
         self.timeout_sec, self.bash_max_sec = timeout_sec, bash_max_sec
         self.receipt = Path(receipt) if receipt else None
         self.system = build_system(repo_context, frozen_contracts)
@@ -1424,6 +1426,7 @@ class LiteHarness:
         self._ran = True
         deadline = self.clock() + self.timeout_sec
         last_text = ""
+        non_receipt_nudges = 0
         try:
             for turn in range(1, self.max_turns + 1):
                 message = self.before_turn() if self.before_turn else ""
@@ -1466,6 +1469,17 @@ class LiteHarness:
                 if not uses:
                     if resp.get("stop_reason") == "max_tokens":
                         return self._fail(result, "output truncated at max_tokens", last_text)
+                    first_line = last_text.strip().splitlines()[0] if last_text.strip() else ""
+                    if (self.require_receipt_line and turn < self.max_turns
+                            and non_receipt_nudges < 2 and not RECEIPT_LINE.match(first_line)):
+                        non_receipt_nudges += 1
+                        self._messages.append({"role": "user", "content": [{"type": "text", "text": (
+                            "Your reply did not start with a valid receipt header. If you intended to call a tool, "
+                            "invoke the tool directly instead of printing JSON. When finished, start line 1 with: "
+                            f"BRIEF {self.task_id} | <sha-or-uncommitted> | PASS or FAIL."
+                        )}]})
+                        self._save(turn, last_text)
+                        continue
                     result.final_text = last_text
                     self._write_receipt(last_text)
                     if self.on_progress is not None:
