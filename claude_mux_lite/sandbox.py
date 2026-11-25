@@ -114,7 +114,8 @@ class LinuxSandbox:
                 *self.git_mounts(),
                 "--bind", str(self.scratch), str(self.scratch),
                 "--ro-bind", str(self.no_hooks), str(self.no_hooks),
-                "--setenv", "JBI_WORKDIR", str(self.workdir), "--setenv", "TMPDIR", str(self.scratch)]
+                "--setenv", "JBI_WORKDIR", str(self.workdir), "--setenv", "TMPDIR", str(self.scratch),
+                "--setenv", "NODE_OPTIONS", "--max-old-space-size=8192"]
         if self.private_git:
             argv += ["--setenv", "GIT_DIR", str(self.git_dir),
                      "--setenv", "GIT_COMMON_DIR", str(self.common_dir),

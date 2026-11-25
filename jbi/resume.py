@@ -193,10 +193,10 @@ def _unlink_repo_dep_symlinks(repo: Path, path: Path) -> None:
                 elif cand.is_dir():
                     entries = list(os.scandir(cand))
                     if entries and all(
-                        e.is_symlink() and (
+                        (e.is_symlink() and (
                             Path(os.path.realpath(e.path)).is_relative_to(repo_real)
                             or Path(os.path.realpath(e.path)).is_relative_to(wt_real)
-                        )
+                        )) or (name == "node_modules" and e.name in (".vite", ".vite-temp", ".cache"))
                         for e in entries
                     ):
                         shutil.rmtree(cand)
