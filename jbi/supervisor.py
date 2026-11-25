@@ -329,6 +329,9 @@ class Supervisor:
         for lease in self.tracking.fleet()["leases"]:
             if lease["task_id"] == task_id and lease["released_at"] is None:
                 return lease
+        current_task = self.tracking.get_task(task_id)
+        if current_task is not None and current_task["state"] not in ("created", "abandoned", "merged"):
+            self.tracking.mark_task_state(task_id, "abandoned")
         session_id = _bounded_id("s", self.dag_name(), task_id)
         grant = self.tracking.dispatch(task_id, session_id=session_id, owns=owns,
                                        branch=branch, worktree=worktree)
@@ -1458,7 +1461,14 @@ class Supervisor:
     def answer(self, request_id: str, answer: str) -> None:
         tid = self.store.read(f"/requests/{request_id}/task")
         if tid:
-            self.control(tid, {"skip": "skip", "pause": "pause"}.get(answer, "retry"))
+            self.control(tid, {"skip": "skip", "pause": "pause", "resume": "resume"}.get(answer, "retry"))
+
+    def update_task_owns(self, task_id: str, owns: list[str]) -> list[str]:
+        from . import tracking as tracking_mod
+        normalized = tracking_mod.normalize_owns(owns)
+        if self.tracking.get_task(task_id) is not None:
+            return self.tracking.update_task_owns(task_id, normalized)["owns"]
+        return normalized
 
     def send_message(self, target: str, text: str, all_sessions: bool = False) -> None:
         for message in self.tracking.send(target, text, all_sessions=all_sessions):

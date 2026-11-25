@@ -260,16 +260,33 @@ class Engine:
     def _task_override(self, ctype: str, payload: dict) -> None:
         self._task(payload["task"])
         override = {k: payload[k] for k in ("rigor", "profile", "model") if payload.get(k)}
-        text = ", ".join(f"{k} {v}" for k, v in override.items()) or "defaults"
+        changes = Changes()
+        parts = [f"{k} {v}" for k, v in override.items()]
+        if "owns" in payload:
+            owns = list(payload["owns"])
+            if self.runtime and callable(getattr(self.runtime, "update_task_owns", None)):
+                try:
+                    owns = self.runtime.update_task_owns(payload["task"], owns)
+                except Exception as exc:
+                    raise ProtocolError("conflict", str(exc), task=payload["task"]) from exc
+            changes.replace("plan", "tasks", payload["task"], "owns", owns)
+            parts.append(f"owns ({len(owns)} paths)")
+        if override or "owns" not in payload:
+            changes.replace("plan", "tasks", payload["task"], "override", override)
+        text = ", ".join(parts) or "defaults"
         self.store.log("config", f"{payload['task']}: {text}",
-                       extra=Changes().replace("plan", "tasks", payload["task"], "override", override),
-                       etype="task.override", task=payload["task"])
+                       extra=changes, etype="task.override", task=payload["task"])
         if self.runtime and self.store.read("/run/phase") == "execute":
             self.runtime.wake()
 
     def _task_control(self, ctype: str, payload: dict) -> None:
         self._task(payload["task"])
-        self._require_runtime().control(payload["task"], ctype.split(".", 1)[1])
+        action = ctype.split(".", 1)[1]
+        if action == "resume" and payload.get("resume_after"):
+            self.store.commit("task.status",
+                              Changes().set("plan", "tasks", payload["task"], "resume_after", payload["resume_after"]),
+                              {"task": payload["task"]})
+        self._require_runtime().control(payload["task"], action)
 
     def _ci_notice(self, ctype: str, payload: dict) -> None:
         notice = {**(payload.get("data") or {}), **{k: v for k, v in payload.items() if k != "data"}}

@@ -658,6 +658,28 @@ class Tracking:
                                  f"{have!r}, not {want!r}")
         return task
 
+    def update_task_owns(self, task_id: str, owns: Iterable[str]) -> dict:
+        """Update the owned path set of an existing task and any live lease it holds."""
+        _check_id(task_id, "task")
+        owned = normalize_owns(owns)
+        stamp = _now()
+        with self._tx() as db:
+            task = self._task(task_id, db)
+            if task["state"] == "merged":
+                raise LeaseError(f"task {task_id} is merged and keeps its owned paths")
+            for held in db.execute("SELECT * FROM leases WHERE released_at IS NULL AND task_id<>?",
+                                   (task_id,)).fetchall():
+                for new in owned:
+                    for old in json.loads(held["owns"]):
+                        if paths_overlap(new, old):
+                            raise LeaseError(
+                                f"lease conflict: task {task_id} asks for {new!r}, "
+                                f"which overlaps {old!r} held by task {held['task_id']}")
+            raw_owns = json.dumps(owned)
+            db.execute("UPDATE tasks SET owns=?, updated_at=? WHERE id=?", (raw_owns, stamp, task_id))
+            db.execute("UPDATE leases SET owns=? WHERE task_id=? AND released_at IS NULL", (raw_owns, task_id))
+            return self._task(task_id, db)
+
     def renew_dispatch(self, task_id: str, *, model: str | None = None,
                        brief_digest: str | None = None, verdict: str | None = None,
                        receipt: str | None = None, continuation: bool = True) -> dict:

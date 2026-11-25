@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -440,13 +441,22 @@ def link_ignored_deps(repo: Path, worktree: Path) -> list[str]:
             continue
         try:
             dst.mkdir(exist_ok=True)
-            for entry in os.scandir(src):
-                if entry.name in (".vite", ".vite-temp", ".cache"):
+            (dst / ".jbi-linked-deps").write_text("", encoding="utf-8")
+            with os.scandir(src) as src_entries:
+                entries = list(src_entries)
+            for entry in entries:
+                if entry.name in (".vite", ".vite-temp", ".cache", ".jbi-linked-deps"):
                     continue
                 link_path = dst / entry.name
                 if os.path.lexists(link_path):
                     continue
                 target_path = Path(entry.path)
+                if entry.name == "zod" and entry.is_dir(follow_symlinks=False):
+                    try:
+                        shutil.copytree(entry.path, link_path, copy_function=os.link, symlinks=True)
+                        continue
+                    except OSError:
+                        shutil.rmtree(link_path, ignore_errors=True)
                 if entry.is_symlink():
                     try:
                         real_target = Path(os.path.realpath(entry.path))
@@ -462,9 +472,15 @@ def link_ignored_deps(repo: Path, worktree: Path) -> list[str]:
                                      (rel_target / "dist").as_posix() + "/"],
                                     capture_output=True, stdin=subprocess.DEVNULL, env=_host_env())
                                 if dchk.returncode == 0:
-                                    dst_dist.mkdir(exist_ok=True)
-                                    for dentry in os.scandir(src_dist):
-                                        os.symlink(dentry.path, dst_dist / dentry.name)
+                                    try:
+                                        shutil.copytree(src_dist, dst_dist, copy_function=os.link, symlinks=True)
+                                        (dst_dist / ".jbi-linked-deps").write_text("", encoding="utf-8")
+                                    except OSError:
+                                        shutil.rmtree(dst_dist, ignore_errors=True)
+                                        dst_dist.mkdir(exist_ok=True)
+                                        (dst_dist / ".jbi-linked-deps").write_text("", encoding="utf-8")
+                                        for dentry in os.scandir(src_dist):
+                                            os.symlink(dentry.path, dst_dist / dentry.name)
                     except (OSError, ValueError):
                         pass
                 os.symlink(target_path, link_path)

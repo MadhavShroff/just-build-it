@@ -193,6 +193,11 @@ def _unlink_repo_dep_symlinks(repo: Path, path: Path) -> None:
                         if name in dirs:
                             dirs.remove(name)
                 elif cand.is_dir():
+                    if (cand / ".jbi-linked-deps").is_file():
+                        shutil.rmtree(cand)
+                        if name in dirs:
+                            dirs.remove(name)
+                        continue
                     entries = list(os.scandir(cand))
                     if entries and all(
                         (e.is_symlink() and (
