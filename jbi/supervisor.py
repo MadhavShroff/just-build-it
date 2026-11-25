@@ -886,6 +886,9 @@ class Supervisor:
         setup_cmds = self.store.read("/config/worktree_setup_commands") or ()
         wt.prepare_worktree(worktree, repo=self.repo, setup_commands=setup_cmds, cache_key=base)
         self._task_lease(tid, worktree)
+        head_now = wt.head(worktree, "HEAD")
+        if head_now:
+            self.tracking.record_commit(tid, head_now)
         findings: list[str] = task.get("findings") or []
         stage_name: str | None = task.get("resume_after")
         permanent_reroutes = 0

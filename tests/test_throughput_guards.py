@@ -401,6 +401,25 @@ class TestShimWatchdogAndEpicLane(unittest.TestCase):
         self.assertEqual(ans["usage"]["input_tokens"], 120)
         self.assertEqual(ans["usage"]["cache_read_input_tokens"], 80)
 
+        fenced_ndjson = "\n".join([
+            json.dumps({"event": "result", "result": {
+                "conversation_id": "conv-124",
+                "status": "SUCCESS",
+                "response": '```json\n{"text": "check", "tool_calls": [{"name": "bash", "input": {"command": "pwd"}}]}\n```',
+            }}),
+        ])
+        with mock.patch.object(bridge, "_invoke", return_value=subprocess.CompletedProcess([], 0, fenced_ndjson, "")):
+            code2, body2, _ = bridge.handle(json.dumps({"model": "gemini-3.8-flash-high", "messages": []}).encode(), 10.0)
+        self.assertEqual(code2, 200)
+        ans2 = json.loads(body2.decode())
+        self.assertEqual(ans2["stop_reason"], "tool_use")
+        self.assertEqual(ans2["content"][1]["name"], "bash")
+
+        empty_ndjson = json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": ""}})
+        with mock.patch.object(bridge, "_invoke", return_value=subprocess.CompletedProcess([], 0, empty_ndjson, "")):
+            code3, _, hdr3 = bridge.handle(json.dumps({"model": "gemini-3.8-flash-high", "messages": []}).encode(), 10.0)
+        self.assertEqual(code3, 502)
+
 
 if __name__ == "__main__":
     unittest.main()
