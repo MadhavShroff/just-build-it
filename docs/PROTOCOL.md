@@ -136,6 +136,7 @@ POST /api/v1/commands
 | `stack.back` | stack, bootstrap | — From `stack`: back to `intake`. From `bootstrap`: only when `/bootstrap/status` is `failed`; back to `stack`. |
 | `bootstrap.retry` | bootstrap | — Only when `/bootstrap/status` is `failed`. Runs bootstrap again at the same target. |
 | `run.configure` | configure, execute | `rigor`: level, `profile`: profile |
+| `model.set` | any | `cascade`: string, optional `clear_cooldowns`: bool |
 | `run.start` | configure, execute | — |
 | `task.override` | configure, execute | `task`: id, optional `rigor`, optional `profile`, optional `model` |
 | `task.retry` | execute | `task`: id |

@@ -36,6 +36,7 @@ class Engine:
             "stack.revise": self._stack_revise, "stack.accept": self._stack_accept,
             "stack.back": self._stack_back, "bootstrap.retry": self._bootstrap_retry,
             "run.configure": self._run_configure,
+            "model.set": self._model_set,
             "run.start": self._run_start, "task.override": self._task_override,
             "task.retry": self._task_control, "task.pause": self._task_control,
             "task.resume": self._task_control, "ci.notice": self._ci_notice,
@@ -255,6 +256,32 @@ class Engine:
             parts.append(f"branch {payload['branch']}")
         self.store.log("config", ", ".join(parts) or "Configuration unchanged",
                        extra=changes, etype="run.config")
+        if self.runtime and self.store.read("/run/phase") == "execute":
+            self.runtime.wake()
+
+    def _model_set(self, ctype: str, payload: dict) -> None:
+        from . import models as models_mod
+        try:
+            entries = models_mod.parse_cascade(payload["cascade"])
+        except ValueError as error:
+            raise ProtocolError("payload_invalid", str(error), field="cascade") from error
+        changes = Changes().set("config", "provider_cascade", entries)
+        if not self.store.read("/config/dry_run"):
+            for entry in entries:
+                name = entry["provider"]
+                account = self.store.read(f"/accounts/{name}") or providers.blank_account(name)
+                if not account.get("enabled"):
+                    changes.set("accounts", name, {**account, "enabled": True})
+        order = ", ".join(f"{e['provider']}/{e['model']}" for e in entries)
+        self.store.log("config", f"Cascade updated: {order}", extra=changes, etype="run.config")
+        if payload.get("clear_cooldowns", True) and self.runtime is not None:
+            cooldowns = getattr(self.runtime, "cooldowns", None)
+            if cooldowns is not None and callable(getattr(cooldowns, "clear", None)):
+                lanes = []
+                for entry in entries:
+                    lanes.append(entry["provider"])
+                    lanes.append(f"{entry['provider']}/{entry['model']}")
+                cooldowns.clear(lanes)
         if self.runtime and self.store.read("/run/phase") == "execute":
             self.runtime.wake()
 
