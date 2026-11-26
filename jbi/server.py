@@ -320,8 +320,6 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
     PUBLIC = {
         ("GET", "/api/v1/health"),
         ("POST", "/api/v1/session"),
-        ("GET", "/api/v1/metrics"),
-        ("GET", "/api/v1/preview"),
     }
     return Handler
 

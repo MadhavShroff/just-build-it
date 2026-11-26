@@ -895,7 +895,9 @@ class ServerTest(unittest.TestCase):
                 tr.record_merge(tid, number, head, base, f"job-{number}")
             tr.release(tid, reason="merged", repository=root)
         tr.close()
-        status, body = self.call("GET", "/api/v1/metrics")
+        self.assertEqual(self.call("GET", "/api/v1/metrics")[0], 401)
+        status, body = self.call("GET", "/api/v1/metrics",
+                                 Authorization=f"Bearer {self.auth.token}")
         self.assertEqual(status, 200)
         m = body["metrics"]
         self.assertTrue(m["tokens"]["available"])
@@ -908,7 +910,8 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(all(row["released_at"] for row in m["leases"]))
 
     def test_metrics_missing_store_reports_unavailable_with_path_and_no_invented_numbers(self):
-        status, body = self.call("GET", "/api/v1/metrics")
+        status, body = self.call("GET", "/api/v1/metrics",
+                                 Authorization=f"Bearer {self.auth.token}")
         self.assertEqual(status, 200)
         m = body["metrics"]
         for section in ("tokens", "task_ledger", "prs_merged"):
@@ -927,7 +930,9 @@ class ServerTest(unittest.TestCase):
                           .replace("plan", plan)
                           .set("config", "dry_run", True)
                           .set("config", "preview", True))
-        status, body = self.call("GET", "/api/v1/preview")
+        self.assertEqual(self.call("GET", "/api/v1/preview")[0], 401)
+        status, body = self.call("GET", "/api/v1/preview",
+                                 Authorization=f"Bearer {self.auth.token}")
         self.assertEqual(status, 200)
         p = body["preview"]
         self.assertTrue(p["dry_run"])

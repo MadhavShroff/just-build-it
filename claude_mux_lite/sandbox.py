@@ -14,6 +14,72 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+# Host credential and control-plane directories masked with empty tmpfs inside bwrap
+# before any authorized worktree leaf is mounted on top.
+MASKED_HOME_DIRS: tuple[str, ...] = (
+    ".ssh",
+    ".claude",
+    ".just-build-it",
+    ".aws",
+    ".gnupg",
+    ".config/gh",
+    ".tangram-dev",
+    ".gemini",
+    ".codex",
+)
+
+
+def secret_mask_args(home: Path | None = None) -> list[str]:
+    """Return bwrap --tmpfs arguments that hide sensitive directories under HOME."""
+    base = home if home is not None else Path(os.environ.get("HOME") or Path.home())
+    args: list[str] = []
+    for rel in MASKED_HOME_DIRS:
+        target = base / rel
+        if target.is_dir():
+            args += ["--tmpfs", str(target)]
+    return args
+
+
+def acceptance_argv(command: str, workdir: Path, *,
+                    bwrap_path: str | None = None) -> list[str]:
+    """Wrap one acceptance command in a secret-masked bwrap sandbox with host loopback kept.
+
+    Unlike agent bash calls (--unshare-all), acceptance keeps host network access so
+    disposable local test services (MongoDB, Redis, Playwright) remain reachable while
+    host secret directories (~/.ssh, ~/.claude, ~/.just-build-it, ~/.tangram-dev) stay
+    masked and the host filesystem outside workdir and /tmp stays read-only.
+    """
+    exe = bwrap_path or shutil.which("bwrap")
+    resolved = workdir.resolve()
+    if not exe:
+        return ["bash", "-c", command]
+    argv = [
+        exe, "--die-with-parent", "--new-session",
+        "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        *secret_mask_args(),
+        "--bind", str(resolved), str(resolved),
+    ]
+    git_file = resolved / ".git"
+    if git_file.is_file():
+        try:
+            text = git_file.read_text(encoding="utf-8", errors="replace").strip()
+            if text.startswith("gitdir:"):
+                gd = Path(text.split(":", 1)[1].strip())
+                if not gd.is_absolute():
+                    gd = (resolved / gd).resolve()
+                if gd.is_dir():
+                    argv += ["--ro-bind", str(gd), str(gd)]
+                    common_file = gd / "commondir"
+                    if common_file.is_file():
+                        cd = (gd / common_file.read_text(encoding="utf-8", errors="replace").strip()).resolve()
+                        if cd.is_dir():
+                            argv += ["--ro-bind", str(cd), str(cd)]
+        except OSError:
+            pass
+    argv += ["--chdir", str(resolved), "--", "bash", "-c", command]
+    return argv
+
 
 def discover_git(workdir: Path) -> tuple[Path, Path]:
     """Return (git_dir, common_dir) by reading the `.git` entry. No Git program runs.
@@ -110,6 +176,7 @@ class LinuxSandbox:
                 "--setenv", "USER", os.environ.get("USER", "jbi"),
                 "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
                 "--tmpfs", "/tmp",
+                *secret_mask_args(),
                 "--bind", str(self.workdir), str(self.workdir),
                 *self.git_mounts(),
                 "--bind", str(self.scratch), str(self.scratch),
