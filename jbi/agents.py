@@ -81,7 +81,8 @@ def _augment_path(env: dict[str, str]) -> None:
     extra: list[str] = []
     home_path = Path(home)
     nvm_dir = home_path / ".nvm" / "versions" / "node"
-    if nvm_dir.is_dir():
+    has_nvm_node = any(p.startswith(str(nvm_dir) + "/") for p in parts)
+    if nvm_dir.is_dir() and not has_nvm_node:
         try:
             versions = sorted((p / "bin" for p in nvm_dir.iterdir() if (p / "bin").is_dir()), reverse=True)
             if versions:
