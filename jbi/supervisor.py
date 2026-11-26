@@ -1499,7 +1499,11 @@ class Supervisor:
                 self._merge_failed(job, ["No bound CI handover exists. Read the direct job record."])
                 return
             try:
-                evidence = self.ci_adapter.confirm_merge(self.repo, handover, tracking=self.tracking)
+                evidence = self.ci_adapter.confirm_merge(
+                    self.repo, handover,
+                    job=str(notice.get("job_id") or notice.get("job") or "") or None,
+                    tracking=self.tracking,
+                )
             except ci_mod.CIAdapterError:
                 self._merge_failed(job, ci_mod.format_failure_findings(notice))
             else:
