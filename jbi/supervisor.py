@@ -44,6 +44,21 @@ def _permanent_model_error(detail: str) -> bool:
     """True when a dispatch failure text says the provider does not know the model."""
     lower = str(detail).lower()
     return any(token in lower for token in PERMANENT_MODEL_TOKENS)
+
+
+TRANSIENT_PROVIDER_TOKENS = (
+    "http 429",
+    "rate_limit_error",
+    "http 529",
+    "overloaded_error",
+    "resource_exhausted",
+)
+
+
+def _transient_provider_error(detail: str) -> bool:
+    """True when a dispatch failed on provider rate-limiting or overload rather than task code."""
+    lower = str(detail).lower()
+    return any(token in lower for token in TRANSIENT_PROVIDER_TOKENS)
 STANDDOWN_WAIT = 20.0
 TICK = 1.0
 CLOSE_WAIT = 10.0                 # a window close is verified within this time, not assumed
@@ -914,6 +929,7 @@ class Supervisor:
         findings: list[str] = task.get("findings") or []
         stage_name: str | None = task.get("resume_after")
         permanent_reroutes = 0
+        transient_reroutes = 0
         while not self._stopping or self._stopping == "finish":
             task = self.store.read(f"/plan/tasks/{tid}")
             if task.get("status") == "paused":     # stop after the current stage; keep progress
@@ -973,6 +989,12 @@ class Supervisor:
                 # failure. Past the bound the failure counts like any other, so a run
                 # whose every lane is retired still escalates.
                 permanent_reroutes += 1
+                continue
+            if _transient_provider_error(detail) and transient_reroutes < 3:
+                # Rate limits (HTTP 429 / 529 / 503) already cooled the failing lane in
+                # `_maybe_cool_lane`; fall through to the next cascade rung without
+                # burning the task's attempt budget or halting on a request.
+                transient_reroutes += 1
                 continue
             attempts = task.get("attempts", 0) + 1
             raw_lines = detail.splitlines()
@@ -1042,7 +1064,9 @@ class Supervisor:
             self._stage_dispatch(sid, tid, worktree,
                                  "acceptance", attempt=task.get("attempts", 0))
             try:
-                result = run_command(task["acceptance"], cwd=worktree, env=agents.child_env(None),
+                from claude_mux_lite.sandbox import acceptance_argv
+                acc_argv = acceptance_argv(task["acceptance"], worktree)
+                result = run_command(acc_argv, cwd=worktree, env=agents.child_env(None),
                                      timeout=acc_timeout, parent_pid=self.parent_pid, groups=self.groups)
             finally:
                 wt.discard_changes(worktree)

@@ -200,13 +200,14 @@ def _watch_thread(parent: int, start: str | None, pgid: int, grace: float, done:
         done.wait(0.2)
 
 
-def run_command(command: str, *, cwd: Path, env: dict, timeout: float, parent_pid: int | None = None,
+def run_command(command: str | list[str], *, cwd: Path, env: dict, timeout: float, parent_pid: int | None = None,
                 groups: Groups | None = None, grace: float = COMMAND_GRACE) -> CompletedResult:
-    """Run one shell command in its own process group, tied to `parent_pid`. Never raises."""
+    """Run one command in its own process group, tied to `parent_pid`. Never raises."""
     parent = int(parent_pid or os.getpid())
     start = process_start(parent)
+    use_shell = isinstance(command, str)
     try:
-        proc = subprocess.Popen(command, shell=True, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(command, shell=use_shell, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
                                 preexec_fn=_child_guard)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
