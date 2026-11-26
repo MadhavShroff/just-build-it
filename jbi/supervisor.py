@@ -283,13 +283,12 @@ class Supervisor:
             records = self.tracking.pending_ci(tid)
             if not records or task.get("commit") is None:
                 continue
-            if len(records) != 1:
-                raise RuntimeError(f"task {tid} has ambiguous unanswered CI submissions")
-            record = records[0]
+            matching = [r for r in records if r["head_sha"] == task["commit"]]
+            if not matching:
+                continue
+            record = matching[-1]
             reply = record["service_reply"]
             bound = reply.get("bound") if isinstance(reply, dict) else None
-            if task["commit"] != record["head_sha"]:
-                continue
             if not bound or bound.get("task") != tid or bound.get("head_sha") != record["head_sha"]:
                 raise RuntimeError(f"task {tid} has no bound handover")
             if int(bound.get("pr_number", 0)) != record["pr_number"]:
