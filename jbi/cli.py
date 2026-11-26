@@ -107,9 +107,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     send.add_argument("--agent", help="target an agent session; use 'all' for every session")
     send.add_argument("--all", action="store_true", help="send to every session")
     send.add_argument("--text", help="message text for --agent or --all")
+    model_cmd = sub.add_parser("model", help="show or switch the live model cascade without restarting the run")
+    model_cmd.add_argument("cascade", nargs="?", help="'founder', JSON list, or comma-separated provider/model entries")
+    model_cmd.add_argument("--show", action="store_true", help="print the current live cascade and active models")
+    model_cmd.add_argument("--keep-cooldowns", action="store_true", help="keep existing provider cooldowns")
+    model_cmd.add_argument("--run-dir", type=Path)
     resume = sub.add_parser("resume", help="reopen a stored run and continue from stored task states")
     resume.add_argument("run_dir", nargs="?", type=Path)
     resume.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
+    resume.add_argument("--cascade", default=None,
+                        help="replace provider_cascade before resuming ('founder', JSON list, or provider/model entries)")
     recover = sub.add_parser("recover", help="reclaim orphans, re-probe models, re-sync CI, then resume a stored run")
     recover.add_argument("run_dir", nargs="?", type=Path)
     recover.add_argument("--port", type=int, default=0, help="the dashboard port (default: a free port)")
@@ -246,24 +253,10 @@ def install_cascade(store: Store, cascade: str | None, *, offline: bool = False)
     """
     from . import models
     from .store import Changes
-    if cascade == "founder":
-        entries = [dict(entry) for entry in models.FOUNDER_CASCADE]
-    else:
-        try:
-            entries = json.loads(cascade or "")
-        except json.JSONDecodeError as error:
-            raise SystemExit(f"cascade_invalid: --cascade is 'founder' or a JSON list of "
-                             f"{{provider, model}} entries: {error.msg}")
-        if not isinstance(entries, list) or not entries:
-            raise SystemExit("cascade_invalid: --cascade needs 'founder' or a non-empty JSON list")
-    for entry in entries:
-        if not isinstance(entry, dict) or not entry.get("provider"):
-            raise SystemExit("cascade_invalid: every cascade entry names a provider")
-        name = f"{entry.get('provider')}/{entry.get('model')}"
-        if ("morph" in str(entry.get("model") or "").casefold()
-                or "morph" in str(entry.get("provider") or "").casefold()):
-            raise SystemExit(f"morph_refused: cascade entry {name!r} is a morph "
-                             "model; morph answers 401 and nothing in jbi may depend on it")
+    try:
+        entries = models.parse_cascade(cascade or "")
+    except ValueError as error:
+        raise SystemExit(str(error))
     store.commit("config", Changes().set("config", "provider_cascade", entries), {})
     _enable_cascade_accounts(store, entries, offline=offline)
     order = ", ".join(f"{entry.get('provider')}/{entry.get('model')}" for entry in entries)
@@ -430,6 +423,8 @@ class Run:
             is_offline = bool(getattr(args, "offline", False))
             if is_offline:
                 self._seed_accounts(True)
+            if getattr(args, "cascade", None):
+                install_cascade(self.store, args.cascade, offline=is_offline)
             prepare_resume(self.store, offline=is_offline)
         else:
             self.run_id = "r-" + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -952,6 +947,26 @@ def client_command(args: argparse.Namespace) -> int:
         elif args.command == "links":
             for link in client.links():
                 print(f"{link['label']:<10}{link['url']}")
+        elif args.command == "model":
+            if args.show or not args.cascade:
+                snap = client.state()["state"]
+                print(json.dumps({
+                    "provider_cascade": (snap.get("config") or {}).get("provider_cascade") or [],
+                    "enabled_accounts": sorted(
+                        name for name, acc in (snap.get("accounts") or {}).items()
+                        if acc.get("enabled")
+                    ),
+                }, indent=2))
+            else:
+                res = client.send("model.set", {
+                    "cascade": args.cascade,
+                    "clear_cooldowns": not args.keep_cooldowns,
+                })
+                snap = client.state()["state"]
+                print(json.dumps({
+                    **res,
+                    "provider_cascade": (snap.get("config") or {}).get("provider_cascade") or [],
+                }, indent=2))
         else:
             try:
                 payload = json.loads(args.payload)
@@ -967,7 +982,7 @@ def client_command(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.command in ("status", "links", "send", "fleet"):
+    if args.command in ("status", "links", "send", "fleet", "model"):
         return client_command(args)
     if args.command == "resume":
         return resume_command(args)

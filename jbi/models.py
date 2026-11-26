@@ -77,6 +77,15 @@ class ProviderCooldowns:
             return {lane: round(max(0.0, until - now), 1)
                     for lane, until in self._until.items() if until > now}
 
+    def clear(self, lanes: Iterable[str] | None = None) -> None:
+        """Clear cooldowns for the named lanes, or all lanes when lanes is None."""
+        with self._lock:
+            if lanes is None:
+                self._until.clear()
+                return
+            for lane in lanes:
+                self._until.pop(lane, None)
+
 
 class ProviderPool:
     """Weighted multi-provider round-robin pool (provider retry helper).
@@ -232,6 +241,70 @@ def select(state: dict, role: str, *, task: dict | None = None, attempts: int = 
     healthy = [p for p in up if cooldowns is None or not cooldowns.cooling(p)]
     provider = (healthy or up or ["simulator"])[0]
     return _choice(provider, catalog()["providers"][provider]["models"][tier], tier)
+
+
+def parse_cascade(spec: str | list[dict]) -> list[dict[str, str]]:
+    """Parse a live or startup cascade specification into normalized {provider, model} entries.
+
+    Accepts 'founder', a JSON list of {provider, model} objects, or comma-separated
+    'provider/model' or 'provider:model' shorthand entries.
+    """
+    import json
+    known = set(catalog()["providers"])
+    if isinstance(spec, list):
+        raw_entries = spec
+    else:
+        text = (spec or "").strip()
+        if not text:
+            raise ValueError("cascade_invalid: cascade must not be empty")
+        if text == "founder":
+            raw_entries = [dict(entry) for entry in FOUNDER_CASCADE]
+        elif text.startswith("["):
+            try:
+                raw_entries = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"cascade_invalid: cascade is 'founder', a JSON list, or provider/model entries: {error.msg}"
+                ) from error
+            if not isinstance(raw_entries, list) or not raw_entries:
+                raise ValueError("cascade_invalid: cascade must be a non-empty list")
+        else:
+            raw_entries = []
+            for part in text.split(","):
+                item = part.strip()
+                if not item:
+                    continue
+                if "/" in item:
+                    prov, mod = item.split("/", 1)
+                elif ":" in item:
+                    prov, mod = item.split(":", 1)
+                else:
+                    raise ValueError(
+                        f"cascade_invalid: entry {item!r} must use 'provider/model' or 'provider:model'"
+                    )
+                raw_entries.append({"provider": prov.strip(), "model": mod.strip()})
+            if not raw_entries:
+                raise ValueError("cascade_invalid: cascade must name at least one provider/model")
+
+    entries: list[dict[str, str]] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict) or not str(entry.get("provider") or "").strip():
+            raise ValueError("cascade_invalid: every cascade entry names a provider")
+        provider = str(entry["provider"]).strip().lower()
+        model = str(entry.get("model") or "").strip()
+        if "morph" in model.casefold() or "morph" in provider.casefold():
+            raise ValueError(
+                f"morph_refused: cascade entry '{provider}/{model}' is a morph model; "
+                "morph answers 401 and nothing in jbi may depend on it"
+            )
+        if provider not in known:
+            raise ValueError(
+                f"cascade_invalid: unknown provider {provider!r} (known: {', '.join(sorted(known))})"
+            )
+        if not model:
+            raise ValueError(f"cascade_invalid: entry for provider {provider!r} needs a model name")
+        entries.append({"provider": provider, "model": model})
+    return entries
 
 
 def blocked(state: dict, task: dict | None = None) -> str | None:
