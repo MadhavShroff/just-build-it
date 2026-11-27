@@ -9,6 +9,7 @@ The configured CI service performs every merge. Host functions synchronize only 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import shutil
 import subprocess
@@ -502,6 +503,90 @@ def link_ignored_deps(repo: Path, worktree: Path) -> list[str]:
     return linked
 
 
+def _package_src_signature(pkg_dir: Path) -> str:
+    """Content digest of `tsconfig.build.json` and every file under `pkg_dir/src`."""
+    digest = hashlib.sha256()
+    build_cfg = pkg_dir / "tsconfig.build.json"
+    if build_cfg.is_file():
+        digest.update(b"tsconfig.build.json\0")
+        digest.update(build_cfg.read_bytes())
+        digest.update(b"\0")
+    src_dir = pkg_dir / "src"
+    if src_dir.is_dir():
+        for root, dirs, files in os.walk(src_dir, followlinks=False):
+            dirs.sort()
+            for name in sorted(files):
+                fpath = Path(root) / name
+                if fpath.is_file() and not fpath.is_symlink():
+                    rel = fpath.relative_to(pkg_dir).as_posix()
+                    digest.update(rel.encode("utf-8") + b"\0")
+                    digest.update(fpath.read_bytes())
+                    digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _find_tsc_executable(worktree: Path, pkg_dir: Path) -> str | None:
+    """Locate a local `tsc` binary in `pkg_dir`, `worktree`, `JBI_DEPS_SOURCE`, or `PATH`."""
+    roots = [pkg_dir, worktree, worktree / "tangram-backend" / "nest-backend", worktree / "tangram-ui"]
+    deps_override = os.environ.get("JBI_DEPS_SOURCE", "").strip()
+    if deps_override:
+        dep_root = Path(deps_override).resolve()
+        roots.extend([dep_root, dep_root / "tangram-backend" / "nest-backend", dep_root / "tangram-ui"])
+    for root in roots:
+        cand = root / "node_modules" / ".bin" / "tsc"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return shutil.which("tsc")
+
+
+def refresh_linked_workspace_dists(worktree: Path, *, timeout: int = 120) -> list[str]:
+    """Rebuild gitignored `<pkg>/dist` folders in `worktree` when `<pkg>/src` outpaces linked `dist`."""
+    rebuilt: list[str] = []
+    wt_root = Path(worktree).resolve()
+    if not wt_root.is_dir() or not (wt_root / ".git").exists():
+        return rebuilt
+    skip = {".git", "node_modules", "worktrees", ".jbi"}
+    for pkg_dir in sorted(wt_root.iterdir()):
+        if pkg_dir.name in skip or pkg_dir.name.startswith("."):
+            continue
+        if not pkg_dir.is_dir() or pkg_dir.is_symlink():
+            continue
+        if not (pkg_dir / "tsconfig.build.json").is_file() or not (pkg_dir / "src").is_dir():
+            continue
+        chk = subprocess.run(
+            ["git", *HOST_CONFIG, "-C", str(wt_root), "check-ignore", "-q", f"{pkg_dir.name}/dist/"],
+            capture_output=True, stdin=subprocess.DEVNULL, env=_host_env(),
+        )
+        if chk.returncode != 0:
+            continue
+        sig = _package_src_signature(pkg_dir)
+        dist_dir = pkg_dir / "dist"
+        sig_file = dist_dir / ".jbi-src-sig"
+        if sig_file.is_file():
+            try:
+                if sig_file.read_text(encoding="utf-8").strip() == sig:
+                    continue
+            except OSError:
+                pass
+        tsc_bin = _find_tsc_executable(wt_root, pkg_dir)
+        if not tsc_bin:
+            continue
+        # Remove hardlinked `dist` directory first so JBI_DEPS_SOURCE files are never mutated.
+        shutil.rmtree(dist_dir, ignore_errors=True)
+        proc = subprocess.run(
+            [tsc_bin, "-p", "tsconfig.build.json"],
+            cwd=str(pkg_dir), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout,
+        )
+        if proc.returncode == 0 and dist_dir.is_dir():
+            try:
+                (dist_dir / ".jbi-linked-deps").write_text("", encoding="utf-8")
+                sig_file.write_text(sig + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            rebuilt.append(f"{pkg_dir.name}/dist")
+    return rebuilt
+
+
 def prepare_worktree(worktree: Path, *, repo: Path | None = None, setup_commands: Iterable[str] = (),
                      cache_key: str | None = None, timeout: int = 300) -> list[str]:
     """Purge stale `.tsbuildinfo` caches, link gitignored `node_modules`, and run `setup_commands`."""
@@ -510,6 +595,9 @@ def prepare_worktree(worktree: Path, *, repo: Path | None = None, setup_commands
         linked = link_ignored_deps(repo, worktree)
         if linked:
             notes.append(f"linked {len(linked)} node_modules dir(s)")
+    refreshed = refresh_linked_workspace_dists(worktree)
+    if refreshed:
+        notes.append(f"rebuilt {', '.join(refreshed)}")
     purged = purge_tsbuildinfo(worktree)
     if purged:
         notes.append(f"purged {len(purged)} tsbuildinfo file(s)")

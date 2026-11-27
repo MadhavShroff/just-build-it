@@ -684,6 +684,64 @@ class LeaseAutoWidenAndSiblingWaitTests(unittest.TestCase):
         self.assertEqual(wt.current_branch_or_none(restored), "jbi/T9")
         self.assertEqual(wt.head(restored, "HEAD"), tip)
 
+    def test_refresh_linked_workspace_dists_unlinks_hardlinks_rebuilds_and_caches_by_src_sig(self) -> None:
+        import os
+        # Set up gitignored tg-contracts/dist in repo + a fake tsc in node_modules/.bin/tsc
+        (self.repo / ".gitignore").write_text("node_modules/\ntg-contracts/dist/\n", encoding="utf-8")
+        pkg = self.repo / "tg-contracts"
+        (pkg / "src").mkdir(parents=True, exist_ok=True)
+        (pkg / "tsconfig.build.json").write_text('{"compilerOptions": {"outDir": "dist"}}\n', encoding="utf-8")
+        (pkg / "src" / "index.ts").write_text("export const v = 1;\n", encoding="utf-8")
+        base2 = wt.commit_all(self.repo, "add tg-contracts")
+        assert base2 is not None
+        _git(self.repo, "push", "-q", "origin", "main")
+
+        # Seed a stale hardlink source dist in repo (simulating JBI_DEPS_SOURCE)
+        (pkg / "dist").mkdir(parents=True, exist_ok=True)
+        stale_file = pkg / "dist" / "index.d.ts"
+        stale_file.write_text("export declare const v = 0;\n", encoding="utf-8")
+
+        worktree = wt.create_worktree(self.repo, "T-DIST", base2, self.tmp / "wts-dist")
+        wt_dist = worktree / "tg-contracts" / "dist"
+        wt_dist.mkdir(parents=True, exist_ok=True)
+        os.link(stale_file, wt_dist / "index.d.ts")
+
+        bin_dir = worktree / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        fake_tsc = bin_dir / "tsc"
+        count_file = self.tmp / "tsc-runs.txt"
+        fake_tsc.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            f"cf = Path({str(count_file)!r})\n"
+            "cf.write_text((cf.read_text() if cf.exists() else '') + 'run\\n')\n"
+            "Path('dist').mkdir(exist_ok=True)\n"
+            "src = Path('src/index.ts').read_text()\n"
+            "Path('dist/index.d.ts').write_text('// compiled: ' + src)\n",
+            encoding="utf-8",
+        )
+        fake_tsc.chmod(0o755)
+
+        rebuilt1 = wt.refresh_linked_workspace_dists(worktree)
+        self.assertEqual(rebuilt1, ["tg-contracts/dist"])
+        # Source repo stale file MUST NOT be mutated via hardlink!
+        self.assertEqual(stale_file.read_text(encoding="utf-8"), "export declare const v = 0;\n")
+        self.assertIn("export const v = 1;", (wt_dist / "index.d.ts").read_text(encoding="utf-8"))
+        self.assertTrue((wt_dist / ".jbi-linked-deps").is_file())
+        self.assertEqual(wt.dirty_paths(worktree), [])
+
+        # Second call with unchanged src is a cache hit (0 extra tsc invocations)
+        rebuilt2 = wt.refresh_linked_workspace_dists(worktree)
+        self.assertEqual(rebuilt2, [])
+        self.assertEqual(len(count_file.read_text().splitlines()), 1)
+
+        # Modifying src invalidates signature and rebuilds dist
+        (worktree / "tg-contracts" / "src" / "index.ts").write_text("export const v = 2;\n", encoding="utf-8")
+        rebuilt3 = wt.refresh_linked_workspace_dists(worktree)
+        self.assertEqual(rebuilt3, ["tg-contracts/dist"])
+        self.assertIn("export const v = 2;", (wt_dist / "index.d.ts").read_text(encoding="utf-8"))
+        self.assertEqual(len(count_file.read_text().splitlines()), 2)
+
     def test_sibling_lease_wait_yields_without_burning_attempts_then_widens_after_release(self) -> None:
         census_rel = "tangram-backend/nest-backend/scripts/e01-census.mjs"
         census_file = self.repo / census_rel
