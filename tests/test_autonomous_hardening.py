@@ -567,6 +567,78 @@ class LeaseAutoWidenAndSiblingWaitTests(unittest.TestCase):
         )
         self.assertNotIn("package.json", gap_extracted)
 
+        # Non-existent new *.p02-rows.ts / MISSING_LEASE files inside existing directories widen cleanly,
+        # while hallucinated parent directories and protected package.json stay blocked.
+        (self.repo / "src/native-chart").mkdir(parents=True, exist_ok=True)
+        new_file_detail = (
+            "MISSING_LEASE: src/native-chart/native-chart.p02-rows.ts and src/native-chart/__tests__/new-rows.spec.ts\n"
+            "MISSING_LEASE: nonexistent-folder/fake.p02-rows.ts and src/native-chart/package.json\n"
+        )
+        new_extracted = supervisor._extract_widenable_paths(new_file_detail, self.repo, ["src/owned.ts"], repo=self.repo)
+        self.assertEqual(
+            set(new_extracted),
+            {"src/native-chart/native-chart.p02-rows.ts", "src/native-chart/__tests__/new-rows.spec.ts"},
+        )
+
+    def test_initial_lease_conflict_withheld_by_admit_and_waits_without_failing(self) -> None:
+        shared_dir = "src/shared/object-store/__tests__"
+        shared_file = f"{shared_dir}/writer-classification.audit.spec.ts"
+        target = self.repo / shared_file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("export {};\n", encoding="utf-8")
+        base2 = wt.commit_all(self.repo, "add shared spec")
+        assert base2 is not None
+        _git(self.repo, "push", "-q", "origin", "main")
+
+        sup, store = _make_supervisor(
+            self.tmp,
+            self.repo,
+            [
+                {"id": "T1", "title": "T1", "goal": "G1", "deps": [], "owns": [shared_file], "acceptance": "true"},
+                {"id": "T2", "title": "T2", "goal": "G2", "deps": [], "owns": [f"{shared_dir}/**"], "acceptance": "true"},
+            ],
+            rigor_level="vibe",
+            name="initial-lease-wait",
+        )
+        self.addCleanup(store.close)
+        self.addCleanup(sup.tracking.close)
+        sup.sibling_lease_poll_interval = 0.05
+
+        wt1 = wt.create_worktree(self.repo, "T1", base2, sup.run_dir / "worktrees")
+        wt.pin_git_metadata(wt1, self.repo)
+        sup._task_lease("T1", wt1)
+        sup.tracking.record_commit("T1", base2)
+        # Even when T1 leaves _running (e.g., status == "request"), its unreleased lease blocks _admit for T2.
+        sup._task_update("T1", status="request")
+        sup._admit()
+        self.assertNotIn("T2", sup._running)
+
+        # And if _run_task_body("T2") runs directly while T1 holds the overlapping lease, T2 waits instead of failing.
+        def fake_stage(task_doc, stage, level, worktree, findings):
+            if stage.role == "merge":
+                store.commit("task.merged", Changes().set("plan", "tasks", "T2", "status", "merged"), {"task": "T2"})
+                return True, "merged", None
+            return True, "ok", "sim-s"
+
+        sup._run_stage = fake_stage
+
+        def release_t1() -> None:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                logs = [e.get("text", "") for e in (store.read("/timeline") or [])]
+                if any("waiting on sibling lease from T1" in ln for ln in logs):
+                    break
+                time.sleep(0.02)
+            sup.tracking.release("T1", reason="abandon", abandon=True, repository=self.repo)
+            sup.wake()
+
+        t_rel = threading.Thread(target=release_t1, daemon=True)
+        t_rel.start()
+        sup._run_task_body("T2")
+        t_rel.join(timeout=5)
+        self.assertEqual(store.read("/plan/tasks/T2/status"), "merged")
+        self.assertNotEqual(store.read("/plan/tasks/T2/status"), "failed")
+
     def test_retry_after_25_attempts_anchors_fresh_circuit_breaker_window(self) -> None:
         sup, store = _make_supervisor(
             self.tmp,

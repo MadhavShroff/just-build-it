@@ -198,11 +198,15 @@ SAFE_WIDENABLE_PREFIXES = (
     "tangram-backend/nest-backend/src/database/",
 )
 _PATH_TOKEN_RE = re.compile(
-    r"[A-Za-z0-9_./@\[\]()-]+/[A-Za-z0-9_./@\[\]()-]+|[A-Za-z0-9_.-]+\.(?:spec|test|e2e-spec)\.ts\b"
+    r"[A-Za-z0-9_./@\[\]()-]+/[A-Za-z0-9_./@\[\]()-]+|[A-Za-z0-9_.-]+\.(?:spec|test|e2e-spec|p02-rows|module)\.ts\b"
 )
 _LINE_LEASE_GAP_RE = re.compile(
-    r"(?:\[BLOCKED\]\[(?:LEASE|HIGH)\]|LEASE GAP:|refused the write|does not own|lease excludes|Read-only file system|EROFS)",
+    r"(?:\[BLOCKED\]\[(?:LEASE|HIGH)\]|LEASE GAP:|MISSING_LEASE:|refused the write|does not own|lease excludes|outside (?:the )?owns\b|unleased\b|Read-only file system|EROFS)",
     re.I,
+)
+_CREATABLE_SOURCE_SUFFIXES = (
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json",
+    ".py", ".sql", ".md", ".css", ".scss", ".yaml", ".yml",
 )
 
 
@@ -235,16 +239,39 @@ def _is_safe_widenable_path(rel: str) -> bool:
     name = parts[-1]
     if "__tests__" in parts[:-1] or "test" in parts[:-1]:
         return True
-    if name.endswith((".spec.ts", ".test.ts", ".e2e-spec.ts", ".module.ts")):
+    if name.endswith((".spec.ts", ".test.ts", ".e2e-spec.ts", ".module.ts", ".p02-rows.ts")):
         return True
     if clean in SAFE_WIDENABLE_EXACT or any(clean.startswith(p) for p in SAFE_WIDENABLE_PREFIXES):
         return True
     return False
 
 
+def _is_widenable_worktree_target(worktree: Path, norm: str) -> bool:
+    """True for an existing non-symlink file, or a non-existent source/test file in an existing directory."""
+    target = worktree / norm
+    try:
+        if target.is_symlink():
+            return False
+        if target.is_file():
+            return True
+        if target.exists() or not norm.endswith(_CREATABLE_SOURCE_SUFFIXES):
+            return False
+        parent = target.parent
+        if parent.is_symlink():
+            return False
+        if parent.is_dir():
+            return True
+        if parent.name in ("__tests__", "test") and not parent.exists():
+            grandparent = parent.parent
+            return grandparent.is_dir() and not grandparent.is_symlink()
+        return False
+    except OSError:
+        return False
+
+
 def _extract_widenable_paths(detail: str, worktree: Path, current_owns: Iterable[str], *,
                              repo: Path | None = None) -> list[str]:
-    """Extract existing, unowned, safe-widenable repo-relative file paths mentioned in `detail`."""
+    """Extract unowned, safe-widenable repo-relative file paths mentioned in `detail`."""
     text = str(detail or "")
     if not text or not worktree.is_dir():
         return []
@@ -286,11 +313,7 @@ def _extract_widenable_paths(detail: str, worktree: Path, current_owns: Iterable
                     continue
                 if wt.path_owned(norm, owns_list):
                     continue
-                target = worktree / norm
-                try:
-                    if not target.is_file() or target.is_symlink():
-                        continue
-                except OSError:
+                if not _is_widenable_worktree_target(worktree, norm):
                     continue
                 seen.add(norm)
                 found.append(norm)
@@ -1067,10 +1090,21 @@ class Supervisor:
             if admit_err:
                 return
             running = [t for t, th in self._running.items() if th.is_alive()]
+            live_lease_tasks = [
+                str(row["task_id"])
+                for row in self.tracking.fleet()["leases"]
+                if row.get("released_at") is None and str(row.get("task_id") or "") in plan["tasks"]
+            ]
+            active_holders = list(dict.fromkeys([*running, *live_lease_tasks]))
             for tid in waves.prioritize_ready(plan, config=config):
                 if len(running) >= config["max_sessions"]:
                     break
-                if tid in running or waves.owns_conflict(plan, tid, running):
+                others = [h for h in active_holders if h != tid]
+                if (
+                    tid in running
+                    or waves.owns_conflict(plan, tid, others)
+                    or self._initial_lease_conflicts(tid, plan["tasks"][tid].get("owns") or [])
+                ):
                     continue
                 # A task that waits for a pinned model is offered again on every
                 # pump. Skip it here while the pin still blocks, so a wait costs no
@@ -1161,7 +1195,8 @@ class Supervisor:
         wt.pin_git_metadata(worktree, self.repo)
         setup_cmds = self.store.read("/config/worktree_setup_commands") or ()
         wt.prepare_worktree(worktree, repo=self.repo, setup_commands=setup_cmds, cache_key=base)
-        self._task_lease(tid, worktree)
+        if not self._acquire_task_lease_or_wait(tid, worktree):
+            return
         head_now = wt.head(worktree, "HEAD")
         if head_now:
             self.tracking.record_commit(tid, head_now)
@@ -1593,6 +1628,46 @@ class Supervisor:
             or self.branch
             or self.base_branch
         )
+
+    def _initial_lease_conflicts(self, tid: str, owns: Iterable[str]) -> list[tuple[str, str]]:
+        """Return `[(path, holder_tid), ...]` for any live unreleased sibling lease overlapping `owns`."""
+        live_leases = [
+            row for row in self.tracking.fleet()["leases"]
+            if row.get("released_at") is None and row.get("task_id") != tid
+        ]
+        conflicts: list[tuple[str, str]] = []
+        for raw in owns:
+            try:
+                norm = "*" if str(raw).strip() == "*" else tracking_mod.normalize_path(raw)
+            except Exception:
+                continue
+            for lease in live_leases:
+                if any(tracking_mod.paths_overlap(norm, held) for held in (lease.get("owns") or [])):
+                    conflicts.append((norm, str(lease["task_id"])))
+                    break
+        return conflicts
+
+    def _acquire_task_lease_or_wait(self, tid: str, worktree: Path) -> bool:
+        """Acquire `tid`'s initial task lease, waiting cleanly if a sibling lease overlaps."""
+        logged: set[tuple[str, str]] = set()
+        while not self._stopping:
+            if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
+                return False
+            try:
+                self._task_lease(tid, worktree)
+                return True
+            except tracking_mod.LeaseError:
+                owns = list(self.store.read(f"/plan/tasks/{tid}/owns") or [])
+                conflicts = self._initial_lease_conflicts(tid, owns)
+                if not conflicts:
+                    raise
+                for item in conflicts:
+                    if item not in logged:
+                        logged.add(item)
+                        path, other_tid = item
+                        self.store.log("lease", f"waiting on sibling lease from {other_tid} for {path}", task=tid)
+                self.store.wait(self.store.seq, self.sibling_lease_poll_interval)
+        return False
 
     def _widen_unleased_or_collect_conflicts(
         self, tid: str, candidates: Iterable[str]
