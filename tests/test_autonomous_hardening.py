@@ -572,6 +572,21 @@ class LeaseAutoWidenAndSiblingWaitTests(unittest.TestCase):
         self.assertEqual(t_final["attempts"], 26)
         self.assertNotEqual(t_final["status"], "request")
 
+    def test_restore_worktree_reattaches_when_task_branch_matches_expected_head_on_detached_tree(self) -> None:
+        wt_root = self.tmp / "wts-restore"
+        worktree = wt.create_worktree(self.repo, "T9", self.base, wt_root)
+        (worktree / "src").mkdir(parents=True, exist_ok=True)
+        (worktree / "src" / "t9.ts").write_text("export const x = 9;\n", encoding="utf-8")
+        tip = wt.commit_all(worktree, "T9 tip")
+        assert tip is not None
+        # Detach the worktree to base while leaving refs/heads/jbi/T9 at tip.
+        wt.git(worktree, "checkout", "--detach", self.base)
+        self.assertIsNone(wt.current_branch_or_none(worktree))
+        restored = wt.restore_worktree(self.repo, "T9", self.base, wt_root, expected_head=tip)
+        self.assertEqual(restored, worktree)
+        self.assertEqual(wt.current_branch_or_none(restored), "jbi/T9")
+        self.assertEqual(wt.head(restored, "HEAD"), tip)
+
     def test_sibling_lease_wait_yields_without_burning_attempts_then_widens_after_release(self) -> None:
         census_rel = "tangram-backend/nest-backend/scripts/e01-census.mjs"
         census_file = self.repo / census_rel

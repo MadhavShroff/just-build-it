@@ -309,6 +309,18 @@ def restore_worktree(repo: Path, task: str, base: str, root: Path, expected_head
             return create_worktree(repo, task, base, root)
     if current_branch_or_none(path) == branch:
         return path
+    if expected_head is not None and head(repo, branch) == expected_head:
+        if (path / ".git").exists() and dirty_paths(path):
+            raise GitError(f"task {task} has dirty or untracked work; branch-checkout refused")
+        if not (path / ".git").exists():
+            git(repo, "worktree", "prune", check=False)
+            if path.exists():
+                raise GitError(f"task {task} has files but no worktree metadata")
+            git(repo, "worktree", "add", "-q", str(path), branch)
+        else:
+            git(path, "checkout", branch)
+        pin_git_metadata(path, Path(repo))
+        return path
     if (expected_head is None and (path / ".git").exists() and current_branch_or_none(path) is None
             and head(path, "HEAD") == base and not dirty_paths(path)):
         return create_worktree(repo, task, base, root)
