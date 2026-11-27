@@ -284,6 +284,30 @@ class RichFailureExtractionTests(unittest.TestCase):
         self.assertIn("FAIL tangram-backend/nest-backend/src/projects/project.spec.ts", err_msg)
         self.assertIn("e01-census: 1 unreviewed store detected", err_msg)
 
+    def test_extract_evidence_failures_skips_nest_console_and_p02_sentinel_noise(self) -> None:
+        ev_dir = self.tmp / "ci-evidence-gb"
+        ev_dir.mkdir(parents=True)
+        noisy_lines = [
+            "\x1b[31m[Nest] 123 - ERROR [SnsSignature] SNS signing certificate refused\x1b[39m"
+            for _ in range(150)
+        ] + [
+            "FAIL ../../../../../tmp/p02-census-results-abc/failed.body.ts",
+            "  ● Console",
+            "PASS unit src/ok.spec.ts",
+            "FAIL integration src/platform-direct/native/__tests__/native-journeys.http.integration.spec.ts (14.8 s)",
+            "  ● Native HTTP journeys › 1. creates a typed Table",
+            "    expect(received).toMatchObject(expected)",
+            "    - \"userId\": \"journey-owner\"",
+            "      at Object.toMatchObject (native-journeys.http.integration.spec.ts:638:30)",
+        ]
+        (ev_dir / "run.log").write_text("\n".join(noisy_lines) + "\n", encoding="utf-8")
+        got = ci_adapter.extract_evidence_failures(str(ev_dir), max_lines=80)
+        joined = "\n".join(got)
+        self.assertNotIn("[Nest]", joined)
+        self.assertNotIn("p02-census-results", joined)
+        self.assertIn("FAIL integration src/platform-direct/native/__tests__/native-journeys.http.integration.spec.ts", joined)
+        self.assertIn("- \"userId\": \"journey-owner\"", joined)
+
 
 class OriginBaseAutoMergeTests(unittest.TestCase):
     """Fix 3: _sync_with_origin_base before retry and before handover in _merge."""
