@@ -9,6 +9,7 @@ A refusal preserves the lease and uncommitted work.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import math
@@ -22,8 +23,21 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
-from . import agents, briefs, ci_adapter as ci_mod, guards, models, providers, rigor, taskkey, waves, worktrees as wt
+from . import (
+    agents,
+    briefs,
+    ci_adapter as ci_mod,
+    guards,
+    models,
+    providers,
+    rigor,
+    taskkey,
+    tracking as tracking_mod,
+    waves,
+    worktrees as wt,
+)
 from .contracts import Hooks
 from .lanes import MergeJob
 from .shim import Groups, alive, process_start, run_command
@@ -59,6 +73,209 @@ def _transient_provider_error(detail: str) -> bool:
     """True when a dispatch failed on provider rate-limiting or overload rather than task code."""
     lower = str(detail).lower()
     return any(token in lower for token in TRANSIENT_PROVIDER_TOKENS)
+
+
+SUMMARY_FAILURE_MARKERS: tuple[str, ...] = (
+    "FAIL ",
+    "● ",
+    "Error",
+    "Expected",
+    "Received",
+    "TS2",
+    "TS1",
+    "TS7",
+    "unreviewed",
+    "drifted",
+    "refused",
+    " conflict",
+    "at Object.",
+    "at src/",
+    "at test/",
+    "e01-census:",
+    "Blocked by lease",
+    "does not own",
+    "modified unowned path",
+)
+_SUMMARY_TS_RE = re.compile(r"\bTS\d+:")
+
+
+def _is_summary_failure_line(line: str) -> bool:
+    return any(marker in line for marker in SUMMARY_FAILURE_MARKERS) or bool(_SUMMARY_TS_RE.search(line))
+
+
+def _summarize_findings(detail: str, max_lines: int = 100) -> list[str]:
+    """Extract up to `max_lines` of head, failure-marker context, and tail lines in order."""
+    if max_lines <= 0:
+        return []
+    raw_lines = str(detail or "").splitlines()
+    n = len(raw_lines)
+    if n <= max_lines:
+        return raw_lines
+    edge = 15 if max_lines >= 35 else max(1, max_lines // 3)
+    head_indices = set(range(0, min(edge, n)))
+    tail_indices = set(range(max(0, n - edge), n))
+    kept = head_indices | tail_indices
+    budget = max(0, max_lines - len(kept))
+    if budget > 0:
+        matches = [i for i, line in enumerate(raw_lines) if _is_summary_failure_line(line)]
+        with_context = sorted({
+            j for i in matches for j in range(max(0, i - 2), min(n, i + 3))
+            if j not in kept
+        })
+        if len(with_context) <= budget:
+            kept.update(with_context)
+        else:
+            chosen_mid: list[int] = []
+            chosen_set: set[int] = set()
+            for i in matches:
+                if i not in kept and i not in chosen_set:
+                    chosen_mid.append(i)
+                    chosen_set.add(i)
+                    if len(chosen_mid) >= budget:
+                        break
+            for delta in (-1, 1, -2, 2):
+                if len(chosen_mid) >= budget:
+                    break
+                for i in matches:
+                    j = i + delta
+                    if 0 <= j < n and j not in kept and j not in chosen_set:
+                        chosen_mid.append(j)
+                        chosen_set.add(j)
+                        if len(chosen_mid) >= budget:
+                            break
+            kept.update(chosen_mid)
+    return [raw_lines[i] for i in sorted(kept)][:max_lines]
+
+
+def _consecutive_stage_stalls(level: str, history: list[dict]) -> int:
+    """Derive consecutive non-advancing failure count from `attempt_history`."""
+    if not history:
+        return 0
+    stall = 0
+    prev_idx: int | None = None
+    for entry in history:
+        sname = str((entry or {}).get("stage") or "")
+        idx = rigor.stage_index(level, sname)
+        if prev_idx is not None and idx >= 0 and prev_idx >= 0 and idx > prev_idx:
+            stall = 1
+        else:
+            stall += 1
+        prev_idx = idx
+    return stall
+
+
+def _compute_stage_stall(level: str, prev_history: list[dict], prev_stall: object,
+                         current_stage: str) -> int:
+    """Compute updated consecutive stall count, resetting to 1 when reaching a strictly later stage."""
+    if isinstance(prev_stall, int) and not isinstance(prev_stall, bool) and prev_stall >= 0:
+        base_stall = prev_stall
+    else:
+        base_stall = _consecutive_stage_stalls(level, prev_history)
+    if base_stall == 0 or not prev_history:
+        return 1
+    prev_stage = str((prev_history[-1] or {}).get("stage") or "")
+    prev_idx = rigor.stage_index(level, prev_stage)
+    cur_idx = rigor.stage_index(level, current_stage)
+    if prev_idx >= 0 and cur_idx > prev_idx:
+        return 1
+    return base_stall + 1
+
+
+PROTECTED_INFRA_EXACT = frozenset({"scripts/ci", ".git", ".claude"})
+PROTECTED_INFRA_PREFIXES = (".git/", ".claude/", "scripts/ci-runner/", "scripts/hooks/")
+SAFE_WIDENABLE_EXACT = frozenset({
+    "tangram-backend/nest-backend/scripts/e01-census.mjs",
+    "tangram-backend/nest-backend/src/mikro-orm.config.ts",
+    "tangram-backend/nest-backend/docs/runbooks/a02-auth-deployment.rc.json",
+})
+SAFE_WIDENABLE_PREFIXES = (
+    "tangram-backend/nest-backend/src/projects/storage/",
+    "tangram-backend/nest-backend/src/memory/privacy/",
+    "tangram-backend/nest-backend/src/shared/privacy/",
+    "tangram-backend/nest-backend/src/bootstrap/",
+    "tangram-backend/nest-backend/src/database/",
+)
+_PATH_TOKEN_RE = re.compile(
+    r"[A-Za-z0-9_./@\[\]-]+/[A-Za-z0-9_./@\[\]-]+|[A-Za-z0-9_.-]+\.(?:spec|test|e2e-spec)\.ts\b"
+)
+
+
+def _is_protected_infra_path(rel: str) -> bool:
+    """True when `rel` names a protected repository or CI infrastructure path that must never widen."""
+    try:
+        clean = tracking_mod.normalize_path(rel)
+    except Exception:
+        return True
+    if clean in PROTECTED_INFRA_EXACT or any(clean.startswith(p) for p in PROTECTED_INFRA_PREFIXES):
+        return True
+    for part in clean.split("/"):
+        if part.startswith(".env") or fnmatch.fnmatchcase(part, "*.env*"):
+            return True
+    return False
+
+
+def _is_safe_widenable_path(rel: str) -> bool:
+    """True when `rel` matches safe widenable test or shared census/registry patterns and is not protected."""
+    try:
+        clean = tracking_mod.normalize_path(rel)
+    except Exception:
+        return False
+    if _is_protected_infra_path(clean):
+        return False
+    parts = clean.split("/")
+    name = parts[-1]
+    if "__tests__" in parts[:-1] or "test" in parts[:-1]:
+        return True
+    if name.endswith((".spec.ts", ".test.ts", ".e2e-spec.ts")):
+        return True
+    if clean in SAFE_WIDENABLE_EXACT or any(clean.startswith(p) for p in SAFE_WIDENABLE_PREFIXES):
+        return True
+    return False
+
+
+def _extract_widenable_paths(detail: str, worktree: Path, current_owns: Iterable[str], *,
+                             repo: Path | None = None) -> list[str]:
+    """Extract existing, unowned, safe-widenable repo-relative file paths mentioned in `detail`."""
+    text = str(detail or "")
+    if not text or not worktree.is_dir():
+        return []
+    wt_prefix = str(Path(worktree).resolve()) + "/"
+    text = text.replace(wt_prefix, "")
+    if repo is not None:
+        repo_prefix = str(Path(repo).resolve()) + "/"
+        text = text.replace(repo_prefix, "")
+    owns_list = list(current_owns)
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw_match in _PATH_TOKEN_RE.findall(text):
+        variants = [raw_match]
+        stripped_brackets = raw_match.strip("[]")
+        if stripped_brackets and stripped_brackets != raw_match:
+            variants.append(stripped_brackets)
+        for cand in variants:
+            cleaned = cand.strip().rstrip(".,;:")
+            while cleaned.startswith("./"):
+                cleaned = cleaned[2:]
+            if not cleaned:
+                continue
+            try:
+                norm = tracking_mod.normalize_path(cleaned)
+            except Exception:
+                continue
+            if norm in seen or _is_protected_infra_path(norm) or not _is_safe_widenable_path(norm):
+                continue
+            if wt.path_owned(norm, owns_list):
+                continue
+            target = worktree / norm
+            try:
+                if not target.is_file() or target.is_symlink():
+                    continue
+            except OSError:
+                continue
+            seen.add(norm)
+            found.append(norm)
+            break
+    return found
 STANDDOWN_WAIT = 20.0
 TICK = 1.0
 CLOSE_WAIT = 10.0                 # a window close is verified within this time, not assumed
@@ -259,8 +476,11 @@ class Supervisor:
         self._handovers: dict[str, ci_mod.HandoverResult] = {}
         self._handover_lock = threading.Lock()
         self.ci_poll_interval = 1.0
+        self.sibling_lease_poll_interval = 1.0
         self._ci_lock = threading.Lock()
         self.session_dispatches: dict[str, int] = {}
+
+    _summarize_findings = staticmethod(_summarize_findings)
 
     @property
     def repo(self) -> Path:
@@ -929,12 +1149,24 @@ class Supervisor:
         stage_name: str | None = task.get("resume_after")
         permanent_reroutes = 0
         transient_reroutes = 0
+        last_synced_attempt = -1
         while not self._stopping or self._stopping == "finish":
             task = self.store.read(f"/plan/tasks/{tid}")
             if task.get("status") == "paused":     # stop after the current stage; keep progress
                 self._task_update(tid, resume_after=stage_name)
                 return
             level, profile = rigor.effective(task, self.store.read("/config"))
+            cur_attempts = int(task.get("attempts", 0) or 0)
+            if cur_attempts > 0 and cur_attempts != last_synced_attempt:
+                last_synced_attempt = cur_attempts
+                synced, sync_findings = self._sync_with_origin_base(
+                    tid, worktree, self._sync_base_branch(level)
+                )
+                if not synced:
+                    findings = [*sync_findings, *[f for f in findings if f not in sync_findings]][:100]
+                    stage_name = None
+                else:
+                    task = self.store.read(f"/plan/tasks/{tid}") or task
             stage = rigor.next_stage(level, stage_name)
             if stage is None and tid in self._handovers:
                 if self._merge(tid, level, worktree):
@@ -995,14 +1227,38 @@ class Supervisor:
                 # burning the task's attempt budget or halting on a request.
                 transient_reroutes += 1
                 continue
-            attempts = task.get("attempts", 0) + 1
-            raw_lines = detail.splitlines()
-            findings = raw_lines if len(raw_lines) <= 20 else [*raw_lines[:10], *raw_lines[-10:]]
-            history = [*(task.get("attempt_history") or []), {"stage": stage.name, "findings": findings}]
-            self._task_update(tid, attempts=attempts, findings=findings, attempt_history=history[-20:],
+            candidates = _extract_widenable_paths(
+                detail, worktree, (self.store.read(f"/plan/tasks/{tid}/owns") or []), repo=self.repo
+            )
+            if candidates:
+                _widened, sibling_conflicts = self._widen_unleased_or_collect_conflicts(tid, candidates)
+                if sibling_conflicts:
+                    if not self._wait_for_sibling_leases(tid, sibling_conflicts):
+                        if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
+                            self._task_update(tid, resume_after=None)
+                        return
+                    synced, sync_findings = self._sync_with_origin_base(
+                        tid, worktree, self._sync_base_branch(level)
+                    )
+                    findings = _summarize_findings(detail)
+                    if not synced:
+                        findings = [*sync_findings, *[f for f in findings if f not in sync_findings]][:100]
+                    self._task_update(tid, findings=findings, resume_after=None)
+                    stage_name = None
+                    continue
+            latest_task = self.store.read(f"/plan/tasks/{tid}") or task
+            attempts = int(latest_task.get("attempts", 0) or 0) + 1
+            findings = _summarize_findings(detail)
+            prev_history = list(latest_task.get("attempt_history") or [])
+            stage_stall_count = _compute_stage_stall(
+                level, prev_history, latest_task.get("stage_stall_count"), stage.name
+            )
+            history = [*prev_history, {"stage": stage.name, "findings": findings}]
+            self._task_update(tid, attempts=attempts, stage_stall_count=stage_stall_count,
+                              findings=findings, attempt_history=history[-20:],
                               resume_after=None)
             stage_name = None
-            if attempts >= rigor.DECISION_AFTER:
+            if stage_stall_count >= rigor.DECISION_AFTER or attempts >= rigor.MAX_CUMULATIVE_ATTEMPTS:
                 self._open_request(tid, attempts, findings)
                 return
             if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
@@ -1047,6 +1303,26 @@ class Supervisor:
         taskkey.remember(self._task_cache, key, stage, task=tid, worktree=worktree,
                          ok=ok, detail=detail, model=model)
 
+    def _run_acceptance_command(self, task: dict, worktree: Path) -> tuple[bool, str]:
+        tid = task["id"]
+        wt.purge_tsbuildinfo(worktree)
+        self._task_lease(tid, worktree)
+        acc_timeout = float(rigor.task_timeouts(task).get("acceptance_timeout_s") or ACCEPTANCE_TIMEOUT)
+        sid = f"s-{tid}-acceptance-{task.get('attempts', 0) + 1}"
+        self._stage_dispatch(sid, tid, worktree, "acceptance", attempt=task.get("attempts", 0))
+        try:
+            from claude_mux_lite.sandbox import acceptance_argv
+            acc_argv = acceptance_argv(task["acceptance"], worktree)
+            result = run_command(acc_argv, cwd=worktree, env=agents.child_env(None),
+                                 timeout=acc_timeout, parent_pid=self.parent_pid, groups=self.groups)
+        finally:
+            wt.discard_changes(worktree)
+            did = self.active_dispatch.pop(sid, None)
+            if did is not None:
+                self.tracking.finish_dispatch(did, verdict="ended")
+        code, out = result.returncode, result.output
+        return code == 0, f"exit {'timeout' if code is None else code}\n{out[-12000:]}"
+
     def _run_stage(self, task: dict, stage: rigor.Stage, level: str, worktree: Path,
                    findings: list[str]) -> tuple[bool, str, str | None]:
         tid = task["id"]
@@ -1056,24 +1332,8 @@ class Supervisor:
         else:
             self._task_update(tid, "task.stage", stage=stage.name)
         if stage.role == "acceptance":
-            wt.purge_tsbuildinfo(worktree)
-            self._task_lease(tid, worktree)
-            acc_timeout = float(rigor.task_timeouts(task).get("acceptance_timeout_s") or ACCEPTANCE_TIMEOUT)
-            sid = f"s-{tid}-acceptance-{task.get('attempts', 0) + 1}"
-            self._stage_dispatch(sid, tid, worktree,
-                                 "acceptance", attempt=task.get("attempts", 0))
-            try:
-                from claude_mux_lite.sandbox import acceptance_argv
-                acc_argv = acceptance_argv(task["acceptance"], worktree)
-                result = run_command(acc_argv, cwd=worktree, env=agents.child_env(None),
-                                     timeout=acc_timeout, parent_pid=self.parent_pid, groups=self.groups)
-            finally:
-                wt.discard_changes(worktree)
-                did = self.active_dispatch.pop(sid, None)
-                if did is not None:
-                    self.tracking.finish_dispatch(did, verdict="ended")
-            code, out = result.returncode, result.output
-            return code == 0, f"exit {'timeout' if code is None else code}\n{out[-2000:]}", None
+            ok, detail = self._run_acceptance_command(task, worktree)
+            return ok, detail, None
         if stage.role == "merge":
             ok = self._merge(tid, level, worktree)
             notes = self._merge_notes.pop(tid, None)
@@ -1294,6 +1554,180 @@ class Supervisor:
             self.cooldowns.mark(lane_key, 120.0)
             self.store.log("cascade", f"{tid}: {lane_key} cooled after dispatch error", task=tid)
 
+    # ---- lease widening and base sync -------------------------------------------------
+
+    def _sync_base_branch(self, level: str | None = None) -> str:
+        if level == "wave-epic":
+            epic = self.store.read("/config/epic_branch")
+            if epic:
+                return str(epic)
+        return str(
+            self.store.read("/bootstrap/branch")
+            or self.store.read("/bootstrap/base_branch")
+            or self.branch
+            or self.base_branch
+        )
+
+    def _widen_unleased_or_collect_conflicts(
+        self, tid: str, candidates: Iterable[str]
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        """Widen `owns` for unleased paths and return `(widened, [(path, holder_tid), ...])`."""
+        with self._lock:
+            current_owns = list(self.store.read(f"/plan/tasks/{tid}/owns") or [])
+            needed: list[str] = []
+            for raw in candidates:
+                try:
+                    norm = tracking_mod.normalize_path(raw)
+                except Exception:
+                    continue
+                if _is_protected_infra_path(norm) or wt.path_owned(norm, current_owns):
+                    continue
+                if norm not in needed:
+                    needed.append(norm)
+            if not needed:
+                return [], []
+            live_leases = [
+                row for row in self.tracking.fleet()["leases"]
+                if row.get("released_at") is None and row.get("task_id") != tid
+            ]
+            free_paths: list[str] = []
+            conflicts: list[tuple[str, str]] = []
+            for path in needed:
+                holder: str | None = None
+                for lease in live_leases:
+                    if any(tracking_mod.paths_overlap(path, held) for held in (lease.get("owns") or [])):
+                        holder = str(lease["task_id"])
+                        break
+                if holder is not None:
+                    conflicts.append((path, holder))
+                else:
+                    free_paths.append(path)
+            widened: list[str] = []
+            if free_paths:
+                combined = tracking_mod.normalize_owns([*current_owns, *free_paths])
+                try:
+                    if self.tracking.get_task(tid) is not None:
+                        combined = self.tracking.widen_lease(tid, combined)["owns"]
+                except tracking_mod.LeaseError:
+                    refreshed = [
+                        row for row in self.tracking.fleet()["leases"]
+                        if row.get("released_at") is None and row.get("task_id") != tid
+                    ]
+                    for path in free_paths:
+                        for lease in refreshed:
+                            if any(tracking_mod.paths_overlap(path, held) for held in (lease.get("owns") or [])):
+                                conflicts.append((path, str(lease["task_id"])))
+                                break
+                else:
+                    widened = list(free_paths)
+                    if self.store.read(f"/plan/tasks/{tid}") is not None:
+                        self.store.commit(
+                            "task.override",
+                            Changes().replace("plan", "tasks", tid, "owns", combined),
+                            {"task": tid},
+                        )
+                    self.store.log("lease", f"{tid}: auto-widened owns with {', '.join(widened)}", task=tid)
+            return widened, conflicts
+
+    def _wait_for_sibling_leases(self, tid: str, conflicts: list[tuple[str, str]]) -> bool:
+        """Sleep until sibling task leases holding `conflicts` release, then widen `tid`'s lease."""
+        for path, other_tid in conflicts:
+            self.store.log("lease", f"waiting on sibling lease from {other_tid} for {path}", task=tid)
+        wanted_paths = [path for path, _other in conflicts]
+        while not self._stopping:
+            if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
+                return False
+            live_leases = [
+                row for row in self.tracking.fleet()["leases"]
+                if row.get("released_at") is None and row.get("task_id") != tid
+            ]
+            still_held = [
+                path for path in wanted_paths
+                if any(
+                    tracking_mod.paths_overlap(path, held)
+                    for lease in live_leases
+                    for held in (lease.get("owns") or [])
+                )
+            ]
+            if not still_held:
+                _widened, remaining = self._widen_unleased_or_collect_conflicts(tid, wanted_paths)
+                if not remaining:
+                    return True
+                for path, other_tid in remaining:
+                    self.store.log("lease", f"waiting on sibling lease from {other_tid} for {path}", task=tid)
+                wanted_paths = [path for path, _other in remaining]
+            self.store.wait(self.store.seq, self.sibling_lease_poll_interval)
+        return False
+
+    def _sync_with_origin_base(self, tid: str, worktree: Path, base_branch: str) -> tuple[bool, list[str]]:
+        """Fetch `origin <base_branch>` and merge into `worktree` when `origin/<base_branch>` advanced."""
+        if bool(self.store.read("/config/dry_run")) or not (worktree / ".git").exists():
+            return True, []
+        fetch_proc = subprocess.run(
+            ["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-c", "protocol.file.allow=always",
+             "-C", str(worktree), "fetch", "--quiet", "origin",
+             f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, env=wt._host_env(),
+        )
+        if fetch_proc.returncode != 0:
+            return True, []
+        origin_ref = f"origin/{base_branch}"
+        origin_sha = wt.head(worktree, origin_ref)
+        head_sha = wt.head(worktree, "HEAD")
+        if not origin_sha or not head_sha:
+            return True, []
+        if wt.is_ancestor(worktree, origin_sha, head_sha):
+            return True, []
+        pinned = wt._RUNTIME_GIT.get(Path(worktree).resolve())
+        if pinned is not None:
+            merge_proc = wt.trusted_git(
+                *pinned, Path(worktree).resolve(),
+                "merge", "--no-edit", origin_ref,
+                check=False, result=True,
+            )
+        else:
+            merge_proc = subprocess.run(
+                ["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-c", "commit.gpgSign=false",
+                 "-C", str(worktree), "merge", "--no-edit", origin_ref],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, env=wt._host_env(),
+            )
+        if merge_proc.returncode == 0:
+            wt.purge_tsbuildinfo(worktree)
+            new_head = wt.head(worktree, "HEAD")
+            if new_head:
+                if self.store.read(f"/plan/tasks/{tid}") is not None:
+                    self._task_update(tid, commit=new_head)
+                if self.tracking.get_task(tid) is not None:
+                    self.tracking.record_commit(tid, new_head)
+            self.store.log(
+                "git",
+                f"{tid}: synced {origin_ref} ({origin_sha[:10]}) into worktree at {(new_head or '')[:10]}",
+                task=tid,
+            )
+            return True, []
+        raw_conflicted = wt.git(worktree, "diff", "--name-only", "--diff-filter=U", check=False)
+        conflicted = [p.strip() for p in raw_conflicted.splitlines() if p.strip()]
+        wt.git(worktree, "merge", "--abort", check=False)
+        if conflicted:
+            widen_candidates: list[str] = []
+            for p in conflicted:
+                try:
+                    norm = tracking_mod.normalize_path(p)
+                except Exception:
+                    continue
+                if not _is_protected_infra_path(norm):
+                    widen_candidates.append(norm)
+            if widen_candidates:
+                self._widen_unleased_or_collect_conflicts(tid, widen_candidates)
+        files_text = ", ".join(conflicted) if conflicted else "(unknown files)"
+        msg = (
+            f"origin/{base_branch} advanced and conflicts on: {files_text}. "
+            f"Run 'git fetch origin {base_branch} && git merge origin/{base_branch}' "
+            f"inside your worktree, resolve conflicts, update any store/census pins, and commit."
+        )
+        self.store.log("git", f"{tid}: {msg}", task=tid)
+        return False, [msg]
+
     # ---- merging ---------------------------------------------------------------------
 
     def _merge(self, tid: str, level: str, worktree: Path) -> bool:
@@ -1309,6 +1743,7 @@ class Supervisor:
         self._merge_done[tid] = done
         self._merge_ok.pop(tid, None)
         target_branch = self.store.read("/config/epic_branch") if level == "wave-epic" else None
+        merge_base = target_branch or self._sync_base_branch(level)
         job = MergeJob(tid, f"jbi/{tid}", level, worktree, target_branch=target_branch)
         handover: ci_mod.HandoverResult | None = None
         try:
@@ -1330,7 +1765,7 @@ class Supervisor:
                     original = self.tracking.get_task(tid) or {}
                     existing = [row for row in self.tracking.pending_ci(tid)
                                 if row["head_sha"] == task.get("commit")]
-                    if original.get("state") == "merging" and len(existing) == 1:
+                    if len(existing) == 1:
                         row = existing[0]
                         handover = ci_mod.HandoverResult(tid, f"jbi/{tid}", row["pr_number"], row["head_sha"],
                                                          row["service_reply"], row["base_commit"])
@@ -1344,10 +1779,32 @@ class Supervisor:
                                                              row["service_reply"], row["base_commit"])
                     if handover is not None:
                         self._handovers[tid] = handover
-                if handover is None:
-                    handover = self.ci_adapter.handover(self.repo, task, base=target_branch or self.branch,
-                                                       tracking=self.tracking)
-                    self._handovers[tid] = handover
+            if handover is None:
+                head_before = wt.head(worktree, "HEAD")
+                synced, sync_findings = self._sync_with_origin_base(tid, worktree, merge_base)
+                if not synced:
+                    self._merge_failed(job, sync_findings)
+                    return False
+                head_after = wt.head(worktree, "HEAD")
+                if head_after and head_after != head_before:
+                    task_for_acc = self.store.read(f"/plan/tasks/{tid}") or {}
+                    if str(task_for_acc.get("acceptance") or "").strip():
+                        acc_ok, acc_detail = self._run_acceptance_command(task_for_acc, worktree)
+                        if not acc_ok:
+                            self._merge_failed(job, _summarize_findings(acc_detail))
+                            return False
+                with self._handover_lock:
+                    task = self.store.read(f"/plan/tasks/{tid}")
+                    expected_head = wt.head(worktree, "HEAD") or task.get("commit")
+                    if expected_head and task.get("commit") != expected_head:
+                        self._task_update(tid, commit=expected_head)
+                        task = self.store.read(f"/plan/tasks/{tid}")
+                    handover = self._handovers.get(tid)
+                    if handover is None or (expected_head and handover.head_sha != expected_head):
+                        handover = self.ci_adapter.handover(self.repo, task, base=merge_base,
+                                                            tracking=self.tracking)
+                        self._handovers[tid] = handover
+            with self._handover_lock:
                 self._task_update(tid, status="merging", pr_number=handover.pr_number,
                                   commit=handover.head_sha)
             while not done.is_set() and self._stopping not in ("quit", "kill", "standdown"):
@@ -1371,7 +1828,8 @@ class Supervisor:
             bound = self._handovers.pop(tid, None)
             if bound is not None and (self.tracking.get_task(tid) or {}).get("state") != "merged":
                 self._record_ci_failure(bound, str(error))
-            self._merge_failed(job, [str(error)])
+            err_lines = [ln for ln in str(error).splitlines() if ln.strip()] or [str(error)]
+            self._merge_failed(job, err_lines)
         return self._merge_ok.pop(tid, False)
 
     def _record_ci_failure(self, handover: ci_mod.HandoverResult, detail: str) -> None:
@@ -1503,8 +1961,18 @@ class Supervisor:
                     job=str(notice.get("job_id") or notice.get("job") or "") or None,
                     tracking=self.tracking,
                 )
-            except ci_mod.CIAdapterError:
-                self._merge_failed(job, ci_mod.format_failure_findings(notice))
+            except ci_mod.CIAdapterError as error:
+                notes = ci_mod.format_failure_findings(notice)
+                if ci_mod._count_failure_lines("\n".join(notes)) < 10:
+                    seen = set(notes)
+                    for extra in str(error).splitlines():
+                        stripped = extra.rstrip()
+                        if stripped and stripped not in seen and ci_mod._is_ci_failure_line(stripped):
+                            seen.add(stripped)
+                            notes.append(stripped)
+                            if len(notes) >= 100:
+                                break
+                self._merge_failed(job, notes)
             else:
                 self._finish_verified_merge(job, handover, evidence["squash_sha"])
 
@@ -1572,8 +2040,9 @@ class Supervisor:
             # Continue from the stage after the last completed one, with the same attempts.
             self._task_update(task, status="ready")
         else:
-            # Retry: back to implement. Attempts and attempt_history stay for escalation.
-            self._task_update(task, status="ready", stage=None, resume_after=None)
+            # Retry: back to implement. Attempts and attempt_history stay for escalation;
+            # consecutive stage_stall_count resets so the user's retry gets a fresh stall window.
+            self._task_update(task, status="ready", stage=None, resume_after=None, stage_stall_count=0)
         self.wake()
 
     # ---- stop modes ------------------------------------------------------------------

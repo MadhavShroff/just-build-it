@@ -263,7 +263,16 @@ def initial_state(run_id: str, created: str, *, name: str, mode: str, target: st
         "run": {"id": run_id, "name": name, "phase": "intake", "mode": mode, "target": target,
                 "created": created, "stopping": None, "busy": None, "tmux": tmux},
         "config": {"rigor": "high", "profile": "balanced", "max_sessions": max_sessions, "lanes": lanes},
-        "accounts": {},
+        "accounts": {
+            "simulator": {
+                "label": "Offline simulator",
+                "enabled": False,
+                "status": "unknown",
+                "detail": "",
+                "checked": None,
+                "models": [],
+            }
+        },
         "intake": {"detail": "guided", "messages": []},
         "plan": {"revision": 0, "rough_prd": "", "prd": {}, "tasks": {}, "order": [], "waves": []},
         "stack": {"layers": [], "summary": "", "accepted": False},

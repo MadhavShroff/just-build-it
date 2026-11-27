@@ -352,14 +352,46 @@ class CIAdapter:
         if reply["type"] != "data":
             raise CIAdapterError(f"job {job} returned type {reply['type']}, not data")
         if f"#{number}@{head[:9]}" not in text:
-            if not (re.search(r"verdict\s+GREEN\b", text) and re.search(rf"#{number}->([0-9a-f]{{7,40}})\b", text)):
+            hotfix_merged = re.search(rf"#{number}->([0-9a-f]{{7,40}})\b", text)
+            hotfix_ok = False
+            if re.search(r"verdict\s+GREEN\b", text) and hotfix_merged:
+                self._fetch_base(repo, result)
+                try:
+                    resolved = self._exec(
+                        ["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(repo), "rev-parse", "--verify",
+                         f"{hotfix_merged.group(1)}^{{commit}}"],
+                        repo,
+                    )
+                    hotfix_ok = _full_sha(resolved)
+                except CIAdapterError:
+                    hotfix_ok = False
+            if not hotfix_ok:
                 raise CIAdapterError(f"job {job} does not name PR #{number} at head {head[:9]}")
         if not re.search(r"verdict\s+GREEN\b", text):
-            raise CIAdapterError(f"job {job} has no green verdict")
+            detail_lines = [f"job {job} has no green verdict"]
+            for line in text.splitlines():
+                stripped = line.rstrip()
+                if stripped:
+                    detail_lines.append(stripped)
+            ev_ref = reply.get("evidence_url") or reply.get("evidence")
+            if not ev_ref:
+                ev_match = _EVIDENCE_LINE_RE.search(text)
+                if ev_match:
+                    ev_ref = ev_match.group(1)
+            if ev_ref and _count_failure_lines(text) < 10:
+                seen = set(detail_lines)
+                for extra in extract_evidence_failures(ev_ref, max_lines=80):
+                    if extra not in seen:
+                        seen.add(extra)
+                        detail_lines.append(extra)
+            raise CIAdapterError("\n".join(detail_lines))
         merged = re.search(rf"#{number}->([0-9a-f]{{7,40}})\b", text)
         if not merged:
             if PR_JOB_RE.match(job):
-                return self._confirm_symbolic_merge(repo, result, job, tracking)
+                try:
+                    return self._confirm_symbolic_merge(repo, result, job, tracking)
+                except CIAdapterError:
+                    raise CIAdapterError(f"job {job} has no merge record for PR #{number}") from None
             raise CIAdapterError(f"job {job} has no merge record for PR #{number}")
         self._fetch_base(repo, result)
         squash = self._exec(["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(repo), "rev-parse", "--verify",
@@ -374,6 +406,86 @@ class CIAdapter:
                                green_run=str(job), squash_sha=squash, state="green")
             tracking.record_merge(result.task, number, head, squash, str(job))
         return evidence
+
+
+_FAILURE_LINE_MARKERS: tuple[str, ...] = (
+    "FAIL ",
+    "● ",
+    "Error",
+    "Expected",
+    "Received",
+    "e01-census:",
+    "unreviewed",
+    "drifted",
+    "refused",
+    " conflict",
+)
+_TS_ERROR_RE = re.compile(r"\bTS\d+:")
+_EVIDENCE_LINE_RE = re.compile(r"^\s*evidence(?:_url)?\s*[:=]?\s*(\S+)\s*$", re.M)
+_MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
+
+
+def _is_ci_failure_line(line: str) -> bool:
+    return any(tok in line for tok in _FAILURE_LINE_MARKERS) or bool(_TS_ERROR_RE.search(line))
+
+
+def _count_failure_lines(text: str) -> int:
+    return sum(1 for line in str(text or "").splitlines() if _is_ci_failure_line(line))
+
+
+def _resolve_evidence_run_log(evidence_ref: Any) -> Path | None:
+    if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+        return None
+    clean = evidence_ref.strip()
+    if clean.startswith("file://"):
+        clean = clean[len("file://"):]
+    if "://" in clean:
+        return None
+    candidate = Path(clean)
+    try:
+        if candidate.is_dir():
+            log_file = candidate / "run.log"
+        elif candidate.is_file() and candidate.name == "run.log":
+            log_file = candidate
+        else:
+            return None
+        return log_file if log_file.is_file() else None
+    except OSError:
+        return None
+
+
+def extract_evidence_failures(evidence_ref: Any, *, max_lines: int = 80) -> list[str]:
+    """Read up to `max_lines` relevant failure lines from `<evidence_dir>/run.log`."""
+    log_file = _resolve_evidence_run_log(evidence_ref)
+    if log_file is None or max_lines <= 0:
+        return []
+    try:
+        with log_file.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - _MAX_EVIDENCE_BYTES))
+            raw = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    raw_lines = [ln.rstrip() for ln in raw.splitlines()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for idx, line in enumerate(raw_lines):
+        if not line.strip() or not _is_ci_failure_line(line):
+            continue
+        for pos in (idx, idx + 1):
+            if pos >= len(raw_lines):
+                continue
+            cand = raw_lines[pos]
+            if not cand.strip() or cand in seen:
+                continue
+            if pos > idx and not any(k in cand for k in ("Expected", "Received", "at ", "Error", "FAIL ", "● ", "e01-census:")):
+                continue
+            seen.add(cand)
+            out.append(cand)
+            if len(out) >= max_lines:
+                return out
+    return out
 
 
 def format_failure_findings(notice: dict[str, Any]) -> list[str]:
@@ -392,18 +504,24 @@ def format_failure_findings(notice: dict[str, Any]) -> list[str]:
     gates = notice.get("failed_gates") or []
     if gates:
         lines.append("failed_gates: " + ", ".join(str(g) for g in gates))
-    evidence = notice.get("evidence_url")
+    evidence = notice.get("evidence_url") or notice.get("evidence")
     if evidence:
         lines.append(f"evidence_url: {evidence}")
     if notice.get("retry_allowed") is False:
         lines.append("retry_allowed: false")
-    excerpt = str(notice.get("first_failure_excerpt") or "").strip()
+    excerpt = str(notice.get("first_failure_excerpt") or notice.get("detail") or "").strip()
     if excerpt:
         for line in excerpt.splitlines():
             stripped = line.rstrip()
             if stripped:
                 lines.append(stripped)
-    return lines[:20]
+    if evidence and _count_failure_lines(excerpt) < 10:
+        seen = set(lines)
+        for extra in extract_evidence_failures(evidence, max_lines=80):
+            if extra not in seen:
+                seen.add(extra)
+                lines.append(extra)
+    return lines[:100]
 
 
 def match_task(plan: dict[str, Any], notice: dict[str, Any]) -> str:

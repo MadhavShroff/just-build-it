@@ -680,6 +680,30 @@ class Tracking:
             db.execute("UPDATE leases SET owns=? WHERE task_id=? AND released_at IS NULL", (raw_owns, task_id))
             return self._task(task_id, db)
 
+    def widen_lease(self, task_id: str, new_owns: Iterable[str]) -> dict:
+        """Widen the owned path set of `task_id` and its live lease after checking sibling leases."""
+        _check_id(task_id, "task")
+        added = normalize_owns(new_owns)
+        stamp = _now()
+        with self._tx() as db:
+            task = self._task(task_id, db)
+            if task["state"] == "merged":
+                raise LeaseError(f"task {task_id} is merged and keeps its owned paths")
+            combined = normalize_owns([*task["owns"], *added])
+            for held in db.execute("SELECT * FROM leases WHERE released_at IS NULL AND task_id<>?",
+                                   (task_id,)).fetchall():
+                for want in combined:
+                    for old in json.loads(held["owns"]):
+                        if paths_overlap(want, old):
+                            raise LeaseError(
+                                f"lease conflict: task {task_id} asks for {want!r}, "
+                                f"which overlaps {old!r} held by task {held['task_id']}")
+            raw_owns = json.dumps(combined)
+            db.execute("UPDATE tasks SET owns=?, updated_at=? WHERE id=?", (raw_owns, stamp, task_id))
+            db.execute("UPDATE leases SET owns=? WHERE task_id=? AND released_at IS NULL", (raw_owns, task_id))
+            lease = self._live_lease(task_id, db)
+            return lease if lease is not None else self._task(task_id, db)
+
     def renew_dispatch(self, task_id: str, *, model: str | None = None,
                        brief_digest: str | None = None, verdict: str | None = None,
                        receipt: str | None = None, continuation: bool = True) -> dict:

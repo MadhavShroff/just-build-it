@@ -122,11 +122,21 @@ PROFILES: dict[str, dict] = {
 }
 
 ESCALATE_AFTER = 2      # failed attempts before the implementer moves up one tier
-DECISION_AFTER = 4      # failed attempts before the task asks the user
+DECISION_AFTER = 5      # consecutive non-advancing failed attempts before asking the user
+MAX_CUMULATIVE_ATTEMPTS = 25   # hard circuit breaker across all pipeline stages
 
 
 def pipeline(level: str) -> tuple[Stage, ...]:
     return PIPELINES[level]
+
+
+def stage_index(level: str, name: str) -> int:
+    """Return the 0-based index of `name` in `PIPELINES[level]`, or -1 when absent."""
+    stages = PIPELINES.get(level) or ()
+    for idx, item in enumerate(stages):
+        if item.name == name:
+            return idx
+    return -1
 
 
 def next_stage(level: str, current: str | None) -> Stage | None:
