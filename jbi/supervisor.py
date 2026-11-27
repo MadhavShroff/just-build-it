@@ -181,8 +181,10 @@ def _compute_stage_stall(level: str, prev_history: list[dict], prev_stall: objec
     return base_stall + 1
 
 
-PROTECTED_INFRA_EXACT = frozenset({"scripts/ci", ".git", ".claude"})
-PROTECTED_INFRA_PREFIXES = (".git/", ".claude/", "scripts/ci-runner/", "scripts/hooks/")
+PROTECTED_INFRA_EXACT = frozenset({
+    "scripts/ci", ".git", ".claude", ".github", "package.json", "yarn.lock", "package-lock.json",
+})
+PROTECTED_INFRA_PREFIXES = (".git/", ".claude/", ".github/", "scripts/ci-runner/", "scripts/hooks/")
 SAFE_WIDENABLE_EXACT = frozenset({
     "tangram-backend/nest-backend/scripts/e01-census.mjs",
     "tangram-backend/nest-backend/src/mikro-orm.config.ts",
@@ -196,7 +198,11 @@ SAFE_WIDENABLE_PREFIXES = (
     "tangram-backend/nest-backend/src/database/",
 )
 _PATH_TOKEN_RE = re.compile(
-    r"[A-Za-z0-9_./@\[\]-]+/[A-Za-z0-9_./@\[\]-]+|[A-Za-z0-9_.-]+\.(?:spec|test|e2e-spec)\.ts\b"
+    r"[A-Za-z0-9_./@\[\]()-]+/[A-Za-z0-9_./@\[\]()-]+|[A-Za-z0-9_.-]+\.(?:spec|test|e2e-spec)\.ts\b"
+)
+_LINE_LEASE_GAP_RE = re.compile(
+    r"(?:\[BLOCKED\]\[(?:LEASE|HIGH)\]|LEASE GAP:|refused the write|does not own|lease excludes|Read-only file system|EROFS)",
+    re.I,
 )
 
 
@@ -208,14 +214,17 @@ def _is_protected_infra_path(rel: str) -> bool:
         return True
     if clean in PROTECTED_INFRA_EXACT or any(clean.startswith(p) for p in PROTECTED_INFRA_PREFIXES):
         return True
-    for part in clean.split("/"):
+    parts = clean.split("/")
+    if parts[-1] in ("package.json", "yarn.lock", "package-lock.json"):
+        return True
+    for part in parts:
         if part.startswith(".env") or fnmatch.fnmatchcase(part, "*.env*"):
             return True
     return False
 
 
 def _is_safe_widenable_path(rel: str) -> bool:
-    """True when `rel` matches safe widenable test or shared census/registry patterns and is not protected."""
+    """True when `rel` matches safe widenable test, module-wiring, or census patterns and is not protected."""
     try:
         clean = tracking_mod.normalize_path(rel)
     except Exception:
@@ -226,7 +235,7 @@ def _is_safe_widenable_path(rel: str) -> bool:
     name = parts[-1]
     if "__tests__" in parts[:-1] or "test" in parts[:-1]:
         return True
-    if name.endswith((".spec.ts", ".test.ts", ".e2e-spec.ts")):
+    if name.endswith((".spec.ts", ".test.ts", ".e2e-spec.ts", ".module.ts")):
         return True
     if clean in SAFE_WIDENABLE_EXACT or any(clean.startswith(p) for p in SAFE_WIDENABLE_PREFIXES):
         return True
@@ -247,34 +256,45 @@ def _extract_widenable_paths(detail: str, worktree: Path, current_owns: Iterable
     owns_list = list(current_owns)
     found: list[str] = []
     seen: set[str] = set()
-    for raw_match in _PATH_TOKEN_RE.findall(text):
-        variants = [raw_match]
-        stripped_brackets = raw_match.strip("[]")
-        if stripped_brackets and stripped_brackets != raw_match:
-            variants.append(stripped_brackets)
-        for cand in variants:
-            cleaned = cand.strip().rstrip(".,;:")
-            while cleaned.startswith("./"):
-                cleaned = cleaned[2:]
-            if not cleaned:
-                continue
-            try:
-                norm = tracking_mod.normalize_path(cleaned)
-            except Exception:
-                continue
-            if norm in seen or _is_protected_infra_path(norm) or not _is_safe_widenable_path(norm):
-                continue
-            if wt.path_owned(norm, owns_list):
-                continue
-            target = worktree / norm
-            try:
-                if not target.is_file() or target.is_symlink():
+    for line in text.splitlines():
+        explicit_lease_gap = bool(_LINE_LEASE_GAP_RE.search(line))
+        for raw_match in _PATH_TOKEN_RE.findall(line):
+            variants = [raw_match]
+            stripped_brackets = raw_match.strip("[]")
+            if stripped_brackets and stripped_brackets != raw_match:
+                variants.append(stripped_brackets)
+            stripped_parens = raw_match.strip(".,;:")
+            if stripped_parens.startswith("(") and stripped_parens.endswith(")"):
+                variants.append(stripped_parens[1:-1])
+            for cand in variants:
+                cleaned = cand.strip().rstrip(".,;:")
+                while cleaned.endswith(")") and cleaned.count(")") > cleaned.count("("):
+                    cleaned = cleaned[:-1].rstrip(".,;:")
+                while cleaned.startswith("(") and cleaned.count("(") > cleaned.count(")"):
+                    cleaned = cleaned[1:]
+                while cleaned.startswith("./"):
+                    cleaned = cleaned[2:]
+                if not cleaned:
                     continue
-            except OSError:
-                continue
-            seen.add(norm)
-            found.append(norm)
-            break
+                try:
+                    norm = tracking_mod.normalize_path(cleaned)
+                except Exception:
+                    continue
+                if norm in seen or _is_protected_infra_path(norm):
+                    continue
+                if not explicit_lease_gap and not _is_safe_widenable_path(norm):
+                    continue
+                if wt.path_owned(norm, owns_list):
+                    continue
+                target = worktree / norm
+                try:
+                    if not target.is_file() or target.is_symlink():
+                        continue
+                except OSError:
+                    continue
+                seen.add(norm)
+                found.append(norm)
+                break
     return found
 STANDDOWN_WAIT = 20.0
 TICK = 1.0
@@ -1246,8 +1266,14 @@ class Supervisor:
                     self._task_update(tid, findings=findings, resume_after=None)
                     stage_name = None
                     continue
+                if _widened:
+                    findings = _summarize_findings(detail)
+                    self._task_update(tid, findings=findings, resume_after=None)
+                    stage_name = None
+                    continue
             latest_task = self.store.read(f"/plan/tasks/{tid}") or task
             attempts = int(latest_task.get("attempts", 0) or 0) + 1
+            anchor = int(latest_task.get("retry_attempts_anchor", 0) or 0)
             findings = _summarize_findings(detail)
             prev_history = list(latest_task.get("attempt_history") or [])
             stage_stall_count = _compute_stage_stall(
@@ -1258,7 +1284,7 @@ class Supervisor:
                               findings=findings, attempt_history=history[-20:],
                               resume_after=None)
             stage_name = None
-            if stage_stall_count >= rigor.DECISION_AFTER or attempts >= rigor.MAX_CUMULATIVE_ATTEMPTS:
+            if stage_stall_count >= rigor.DECISION_AFTER or (attempts - anchor) >= rigor.MAX_CUMULATIVE_ATTEMPTS:
                 self._open_request(tid, attempts, findings)
                 return
             if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
@@ -2093,8 +2119,10 @@ class Supervisor:
             self._task_update(task, status="ready")
         else:
             # Retry: back to implement. Attempts and attempt_history stay for escalation;
-            # consecutive stage_stall_count resets so the user's retry gets a fresh stall window.
-            self._task_update(task, status="ready", stage=None, resume_after=None, stage_stall_count=0)
+            # consecutive stage_stall_count and retry_attempts_anchor reset so a user retry gets a fresh window.
+            cur_attempts = int((self.store.read(f"/plan/tasks/{task}") or {}).get("attempts", 0) or 0)
+            self._task_update(task, status="ready", stage=None, resume_after=None,
+                              stage_stall_count=0, retry_attempts_anchor=cur_attempts)
         self.wake()
 
     # ---- stop modes ------------------------------------------------------------------

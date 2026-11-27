@@ -526,6 +526,52 @@ class LeaseAutoWidenAndSiblingWaitTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, extracted)
 
+        # Explicit LEASE GAP / [BLOCKED][LEASE] lines widen non-protected existing callers + *.module.ts,
+        # while still blocking protected infra and package.json/yarn.lock.
+        for extra_rel in ("src/auth/auth.module.ts", "tangram-ui/app/(app)/layout.tsx", "package.json"):
+            p = self.repo / extra_rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("// stub\n", encoding="utf-8")
+        gap_detail = (
+            "FAIL src/auth/auth.module.ts\n"
+            "- [BLOCKED][LEASE] lease excludes src/feature/prod-impl.ts and (tangram-ui/app/(app)/layout.tsx) and package.json."
+        )
+        gap_extracted = supervisor._extract_widenable_paths(gap_detail, self.repo, ["src/owned.ts"], repo=self.repo)
+        self.assertEqual(
+            set(gap_extracted),
+            {"src/auth/auth.module.ts", "src/feature/prod-impl.ts", "tangram-ui/app/(app)/layout.tsx"},
+        )
+        self.assertNotIn("package.json", gap_extracted)
+
+    def test_retry_after_25_attempts_anchors_fresh_circuit_breaker_window(self) -> None:
+        sup, store = _make_supervisor(
+            self.tmp,
+            self.repo,
+            [{"id": "T1", "title": "T1", "goal": "G", "deps": [], "owns": ["src/t1.ts"], "acceptance": "true"}],
+            rigor_level="vibe",
+            name="retry-anchor",
+        )
+        self.addCleanup(store.close)
+        self.addCleanup(sup.tracking.close)
+        sup._task_update("T1", status="request", attempts=25, stage_stall_count=5)
+        sup.control("T1", "retry")
+        t_after = store.read("/plan/tasks/T1")
+        self.assertEqual(t_after["retry_attempts_anchor"], 25)
+        self.assertEqual(t_after["stage_stall_count"], 0)
+        n = {"i": 0}
+
+        def fake_stage(task_doc, stage, level, worktree, findings):
+            if stage.role == "implement" and n["i"] == 0:
+                n["i"] += 1
+                return False, "one transient implement error", "sim-s"
+            return True, "ok", "sim-s"
+
+        sup._run_stage = fake_stage
+        sup._run_task_body("T1")
+        t_final = store.read("/plan/tasks/T1")
+        self.assertEqual(t_final["attempts"], 26)
+        self.assertNotEqual(t_final["status"], "request")
+
     def test_sibling_lease_wait_yields_without_burning_attempts_then_widens_after_release(self) -> None:
         census_rel = "tangram-backend/nest-backend/scripts/e01-census.mjs"
         census_file = self.repo / census_rel
