@@ -170,12 +170,24 @@ def _parse_model_ids(text: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+AGY_PROBE_RETRIES = 3
+AGY_PROBE_RETRY_DELAY = 3.0
+
+
 def _probe_agy(_: str) -> ProbeResult:
-    done = _run(["agy", "models"])
-    ids = _parse_model_ids(done.stdout) if done.returncode == 0 else []
-    if not ids:
-        return ProbeResult("failed", "agy lists no models. Sign in with the agy app.")
-    return ProbeResult("ok", f"{len(ids)} models listed", ids)
+    for attempt in range(AGY_PROBE_RETRIES + 1):
+        if attempt > 0:
+            time.sleep(AGY_PROBE_RETRY_DELAY)
+        try:
+            done = _run(["agy", "models"])
+        except subprocess.TimeoutExpired:
+            if attempt >= AGY_PROBE_RETRIES:
+                raise
+            continue
+        ids = _parse_model_ids(done.stdout) if done.returncode == 0 else []
+        if ids:
+            return ProbeResult("ok", f"{len(ids)} models listed", ids)
+    return ProbeResult("failed", "agy lists no models. Sign in with the agy app.")
 
 
 def _base_url() -> str | None:

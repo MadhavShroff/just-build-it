@@ -628,8 +628,8 @@ class Run:
         changes = Changes()
         for name in providers.catalog()["providers"]:
             account = providers.blank_account(name)
-            account["enabled"] = name == "simulator" if offline else (
-                name in (agent_provider, "simulator") or name in named)
+            account["enabled"] = (name == "simulator") if offline else (
+                name == agent_provider or name in named)
             changes.set("accounts", name, account)
         self.store.commit("account.status", changes)
 

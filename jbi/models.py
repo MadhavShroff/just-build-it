@@ -251,6 +251,7 @@ def parse_cascade(spec: str | list[dict]) -> list[dict[str, str]]:
     """
     import json
     known = set(catalog()["providers"])
+    from_json_list = isinstance(spec, list)
     if isinstance(spec, list):
         raw_entries = spec
     else:
@@ -260,6 +261,7 @@ def parse_cascade(spec: str | list[dict]) -> list[dict[str, str]]:
         if text == "founder":
             raw_entries = [dict(entry) for entry in FOUNDER_CASCADE]
         elif text.startswith("["):
+            from_json_list = True
             try:
                 raw_entries = json.loads(text)
             except json.JSONDecodeError as error:
@@ -282,7 +284,7 @@ def parse_cascade(spec: str | list[dict]) -> list[dict[str, str]]:
                     raise ValueError(
                         f"cascade_invalid: entry {item!r} must use 'provider/model' or 'provider:model'"
                     )
-                raw_entries.append({"provider": prov.strip(), "model": mod.strip()})
+                raw_entries.append({"provider": prov.strip().lower(), "model": mod.strip()})
             if not raw_entries:
                 raise ValueError("cascade_invalid: cascade must name at least one provider/model")
 
@@ -290,7 +292,9 @@ def parse_cascade(spec: str | list[dict]) -> list[dict[str, str]]:
     for entry in raw_entries:
         if not isinstance(entry, dict) or not str(entry.get("provider") or "").strip():
             raise ValueError("cascade_invalid: every cascade entry names a provider")
-        provider = str(entry["provider"]).strip().lower()
+        raw_provider = str(entry["provider"]).strip()
+        provider = raw_provider.lower()
+        has_model_key = "model" in entry and entry.get("model") is not None
         model = str(entry.get("model") or "").strip()
         if "morph" in model.casefold() or "morph" in provider.casefold():
             raise ValueError(
@@ -302,8 +306,11 @@ def parse_cascade(spec: str | list[dict]) -> list[dict[str, str]]:
                 f"cascade_invalid: unknown provider {provider!r} (known: {', '.join(sorted(known))})"
             )
         if not model:
+            if from_json_list and not has_model_key:
+                entries.append({"provider": raw_provider})
+                continue
             raise ValueError(f"cascade_invalid: entry for provider {provider!r} needs a model name")
-        entries.append({"provider": provider, "model": model})
+        entries.append({"provider": raw_provider if from_json_list else provider, "model": model})
     return entries
 
 

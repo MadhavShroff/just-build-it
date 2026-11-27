@@ -81,7 +81,21 @@ class Store:
         if self.seq == 0:
             if initial is None:
                 raise ValueError(f"{self.path} holds no run and no initial state was given")
-            self.commit("run.created", [jp.replace("", initial)])
+            init_doc = copy.deepcopy(initial)
+            if isinstance(init_doc.get("accounts"), dict):
+                sim = init_doc["accounts"].get("simulator")
+                if sim is None:
+                    init_doc["accounts"]["simulator"] = {
+                        "label": "Offline simulator",
+                        "enabled": False,
+                        "status": "unknown",
+                        "detail": "",
+                        "checked": None,
+                        "models": [],
+                    }
+                elif isinstance(sim, dict) and "enabled" not in sim:
+                    sim["enabled"] = False
+            self.commit("run.created", [jp.replace("", init_doc)])
 
     @staticmethod
     def _retry_db(fn):

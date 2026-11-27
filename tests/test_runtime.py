@@ -554,11 +554,11 @@ class Failures(RunFixture):
         sup = self.make([task("x")], rigor="vibe")
         sup.start_execution()
         self.assertTrue(wait_for(lambda: self.status("x") == "request", 90))
-        models = [self.store.read(f"/sessions/s-x-implement-{n}/model") for n in range(1, 5)]
-        self.assertEqual(models, ["sim-s", "sim-s", "sim-l", "sim-l"], "tier escalates after 2 FAILs")
-        request = self.store.read("/requests/r-x-4")
+        models = [self.store.read(f"/sessions/s-x-implement-{n}/model") for n in range(1, 6)]
+        self.assertEqual(models, ["sim-s", "sim-s", "sim-l", "sim-l", "sim-xl"], "tier escalates after 2 FAILs")
+        request = self.store.read("/requests/r-x-5")
         self.assertEqual((request["owner"], request["options"]), ("runtime", ["retry", "skip", "pause"]))
-        self.assertEqual(self.store.read("/plan/tasks/x/attempts"), 4)
+        self.assertEqual(self.store.read("/plan/tasks/x/attempts"), 5)
 
 
 class RunChecksNeverMerge(unittest.TestCase):
@@ -1102,7 +1102,8 @@ class ReviewFindings(unittest.TestCase):
         run.store.commit("cfg", Changes().replace("config", "rigor", "vibe"))
 
         url = f"http://127.0.0.1:{run.server.port}/api/v1/preview"
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        headers = {"Authorization": f"Bearer {run.auth.token}"}
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=5) as resp:
             initial = json.loads(resp.read())["preview"]
         self.assertTrue(initial["dry_run"])
         self.assertEqual(initial["total_tasks"], 3)
@@ -1117,7 +1118,7 @@ class ReviewFindings(unittest.TestCase):
         self.assertTrue(wait_for(lambda: run.store.read("/run/phase") == "complete", 60),
                         run.store.read("/plan/tasks"))
 
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=5) as resp:
             final = json.loads(resp.read())["preview"]
         self.assertEqual(final["merged_tasks"], 3)
         self.assertEqual(final["waves_completed"], 2)
