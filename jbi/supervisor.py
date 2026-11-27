@@ -247,14 +247,14 @@ def _is_safe_widenable_path(rel: str) -> bool:
 
 
 def _is_widenable_worktree_target(worktree: Path, norm: str) -> bool:
-    """True for an existing non-symlink file, or a non-existent source/test file in an existing directory."""
+    """True for an existing non-symlink file, or a non-existent source/test file in an existing subdirectory."""
     target = worktree / norm
     try:
         if target.is_symlink():
             return False
         if target.is_file():
             return True
-        if target.exists() or not norm.endswith(_CREATABLE_SOURCE_SUFFIXES):
+        if "/" not in norm or target.exists() or not norm.endswith(_CREATABLE_SOURCE_SUFFIXES):
             return False
         parent = target.parent
         if parent.is_symlink():

@@ -573,6 +573,7 @@ class LeaseAutoWidenAndSiblingWaitTests(unittest.TestCase):
         new_file_detail = (
             "MISSING_LEASE: src/native-chart/native-chart.p02-rows.ts and src/native-chart/__tests__/new-rows.spec.ts\n"
             "MISSING_LEASE: nonexistent-folder/fake.p02-rows.ts and src/native-chart/package.json\n"
+            "Verified: launch-d07.b2.spec.ts and native-chart.module.ts were checked in prose.\n"
         )
         new_extracted = supervisor._extract_widenable_paths(new_file_detail, self.repo, ["src/owned.ts"], repo=self.repo)
         self.assertEqual(
