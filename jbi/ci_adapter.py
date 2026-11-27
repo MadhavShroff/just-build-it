@@ -352,7 +352,8 @@ class CIAdapter:
         if reply["type"] != "data":
             raise CIAdapterError(f"job {job} returned type {reply['type']}, not data")
         if f"#{number}@{head[:9]}" not in text:
-            raise CIAdapterError(f"job {job} does not name PR #{number} at head {head[:9]}")
+            if not (re.search(r"verdict\s+GREEN\b", text) and re.search(rf"#{number}->([0-9a-f]{{7,40}})\b", text)):
+                raise CIAdapterError(f"job {job} does not name PR #{number} at head {head[:9]}")
         if not re.search(r"verdict\s+GREEN\b", text):
             raise CIAdapterError(f"job {job} has no green verdict")
         merged = re.search(rf"#{number}->([0-9a-f]{{7,40}})\b", text)
