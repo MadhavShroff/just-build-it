@@ -1366,6 +1366,7 @@ class Supervisor:
 
     def _run_acceptance_command(self, task: dict, worktree: Path) -> tuple[bool, str]:
         tid = task["id"]
+        wt.refresh_linked_workspace_dists(worktree)
         wt.purge_tsbuildinfo(worktree)
         self._task_lease(tid, worktree)
         acc_timeout = float(rigor.task_timeouts(task).get("acceptance_timeout_s") or ACCEPTANCE_TIMEOUT)
@@ -1793,6 +1794,7 @@ class Supervisor:
                 capture_output=True, text=True, stdin=subprocess.DEVNULL, env=wt._host_env(),
             )
         if merge_proc.returncode == 0:
+            wt.refresh_linked_workspace_dists(worktree)
             wt.purge_tsbuildinfo(worktree)
             new_head = wt.head(worktree, "HEAD")
             if new_head:
