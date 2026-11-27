@@ -339,11 +339,12 @@ class OriginBaseAutoMergeTests(unittest.TestCase):
         self.assertEqual(store.read("/plan/tasks/T1/commit"), merged_head)
         self.assertEqual(sup.tracking.get_task("T1")["head_commit"], merged_head)
 
-    def test_conflict_sync_aborts_merge_widens_owns_and_returns_instructions(self) -> None:
-        # Commit an initial shared file so both sides edit it with a conflict.
+    def test_conflict_sync_commits_conflict_markers_on_host_and_widens_owns(self) -> None:
+        # Commit an initial shared file plus an unowned file so origin advances both.
         (self.repo / "src").mkdir(parents=True, exist_ok=True)
         (self.repo / "src" / "shared.spec.ts").write_text("const v = 0;\n", encoding="utf-8")
-        base2 = wt.commit_all(self.repo, "add shared.spec.ts")
+        (self.repo / "src" / "other.ts").write_text("export const o = 0;\n", encoding="utf-8")
+        base2 = wt.commit_all(self.repo, "add shared.spec.ts and other.ts")
         assert base2 is not None
         _git(self.repo, "push", "-q", "origin", "main")
 
@@ -366,16 +367,26 @@ class OriginBaseAutoMergeTests(unittest.TestCase):
         sup._task_update("T1", commit=task_head)
         sup.tracking.record_commit("T1", task_head)
 
-        self._advance_origin("src/shared.spec.ts", "const v = 'from-origin';\n")
+        self._advance_origin("src/other.ts", "export const o = 99;\n")
+        origin_tip = self._advance_origin("src/shared.spec.ts", "const v = 'from-origin';\n")
         ok, findings = sup._sync_with_origin_base("T1", worktree, "main")
         self.assertFalse(ok)
         self.assertEqual(len(findings), 1)
-        self.assertIn("origin/main advanced and conflicts on: src/shared.spec.ts.", findings[0])
-        self.assertIn("git fetch origin main && git merge origin/main", findings[0])
-        # Merge was cleanly aborted and HEAD preserved
-        self.assertEqual(wt.head(worktree, "HEAD"), task_head)
+        self.assertIn("Host merged origin/main", findings[0])
+        self.assertIn("Do NOT run git fetch or git merge", findings[0])
+        self.assertIn("src/shared.spec.ts", findings[0])
+        # Host merge committed cleanly so bwrap needs neither git fetch nor writes outside owns.
+        merged_head = wt.head(worktree, "HEAD")
+        assert merged_head is not None
+        self.assertNotEqual(merged_head, task_head)
+        self.assertTrue(wt.is_ancestor(worktree, origin_tip, merged_head))
         self.assertEqual(wt.dirty_paths(worktree), [])
-        # Unleased conflicted file was auto-widened into owns and tracking lease
+        # Unowned upstream file landed cleanly on host; conflicted file holds both markers and is widened.
+        self.assertEqual((worktree / "src" / "other.ts").read_text(encoding="utf-8"), "export const o = 99;\n")
+        conflict_text = (worktree / "src" / "shared.spec.ts").read_text(encoding="utf-8")
+        self.assertIn("<<<<<<<", conflict_text)
+        self.assertIn("from-task", conflict_text)
+        self.assertIn("from-origin", conflict_text)
         self.assertIn("src/shared.spec.ts", store.read("/plan/tasks/T1/owns"))
         live_lease = [l for l in sup.tracking.fleet()["leases"] if l["task_id"] == "T1" and l["released_at"] is None][0]
         self.assertIn("src/shared.spec.ts", live_lease["owns"])

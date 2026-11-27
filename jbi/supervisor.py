@@ -1157,7 +1157,7 @@ class Supervisor:
                 return
             level, profile = rigor.effective(task, self.store.read("/config"))
             cur_attempts = int(task.get("attempts", 0) or 0)
-            if cur_attempts > 0 and cur_attempts != last_synced_attempt:
+            if cur_attempts != last_synced_attempt:
                 last_synced_attempt = cur_attempts
                 synced, sync_findings = self._sync_with_origin_base(
                     tid, worktree, self._sync_base_branch(level)
@@ -1707,23 +1707,75 @@ class Supervisor:
             return True, []
         raw_conflicted = wt.git(worktree, "diff", "--name-only", "--diff-filter=U", check=False)
         conflicted = [p.strip() for p in raw_conflicted.splitlines() if p.strip()]
-        wt.git(worktree, "merge", "--abort", check=False)
-        if conflicted:
-            widen_candidates: list[str] = []
-            for p in conflicted:
-                try:
-                    norm = tracking_mod.normalize_path(p)
-                except Exception:
-                    continue
-                if not _is_protected_infra_path(norm):
-                    widen_candidates.append(norm)
-            if widen_candidates:
-                self._widen_unleased_or_collect_conflicts(tid, widen_candidates)
         files_text = ", ".join(conflicted) if conflicted else "(unknown files)"
+        if not conflicted:
+            wt.git(worktree, "merge", "--abort", check=False)
+            msg = f"origin/{base_branch} advanced and merge failed without file conflicts."
+            self.store.log("git", f"{tid}: {msg}", task=tid)
+            return False, [msg]
+        norm_conflicted: list[str] = []
+        protected_hit = False
+        for p in conflicted:
+            try:
+                norm = tracking_mod.normalize_path(p)
+            except Exception:
+                protected_hit = True
+                break
+            if _is_protected_infra_path(norm):
+                protected_hit = True
+                break
+            norm_conflicted.append(norm)
+        if protected_hit:
+            wt.git(worktree, "merge", "--abort", check=False)
+            msg = f"origin/{base_branch} conflicts on protected infrastructure paths: {files_text}."
+            self.store.log("git", f"{tid}: {msg}", task=tid)
+            return False, [msg]
+        _widened, sibling_conflicts = self._widen_unleased_or_collect_conflicts(tid, norm_conflicted)
+        if sibling_conflicts:
+            wt.git(worktree, "merge", "--abort", check=False)
+            if not self._wait_for_sibling_leases(tid, sibling_conflicts):
+                wait_text = ", ".join(f"{p} ({other})" for p, other in sibling_conflicts)
+                return False, [f"waiting on sibling lease before syncing origin/{base_branch}: {wait_text}"]
+            return self._sync_with_origin_base(tid, worktree, base_branch)
+        commit_title = f"chore(jbi): sync origin/{base_branch} with conflict markers in {', '.join(conflicted[:3])}"
+        if pinned is not None:
+            add_proc = wt.trusted_git(
+                *pinned, Path(worktree).resolve(),
+                "add", "--", *conflicted,
+                check=False, result=True,
+            )
+            commit_proc = wt.trusted_git(
+                *pinned, Path(worktree).resolve(),
+                "commit", "--no-verify", "-m", commit_title,
+                check=False, result=True,
+            )
+        else:
+            add_proc = subprocess.run(
+                ["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(worktree), "add", "--", *conflicted],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, env=wt._host_env(),
+            )
+            commit_proc = subprocess.run(
+                ["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-c", "commit.gpgSign=false",
+                 "-C", str(worktree), "commit", "--no-verify", "-m", commit_title],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, env=wt._host_env(),
+            )
+        if add_proc.returncode != 0 or commit_proc.returncode != 0:
+            wt.git(worktree, "merge", "--abort", check=False)
+            msg = f"origin/{base_branch} conflict stage/commit failed on: {files_text}."
+            self.store.log("git", f"{tid}: {msg}", task=tid)
+            return False, [msg]
+        wt.purge_tsbuildinfo(worktree)
+        new_head = wt.head(worktree, "HEAD")
+        if new_head:
+            if self.store.read(f"/plan/tasks/{tid}") is not None:
+                self._task_update(tid, commit=new_head)
+            if self.tracking.get_task(tid) is not None:
+                self.tracking.record_commit(tid, new_head)
         msg = (
-            f"origin/{base_branch} advanced and conflicts on: {files_text}. "
-            f"Run 'git fetch origin {base_branch} && git merge origin/{base_branch}' "
-            f"inside your worktree, resolve conflicts, update any store/census pins, and commit."
+            f"Host merged origin/{base_branch} ({origin_sha[:10]}) into HEAD ({(new_head or '')[:10]}) "
+            f"with conflict markers in owned files: {files_text}. "
+            f"Do NOT run git fetch or git merge; open those files, resolve every <<<<<<< / ======= / >>>>>>> "
+            f"conflict block preserving both branches' changes, update store/census pins, run tests, and commit."
         )
         self.store.log("git", f"{tid}: {msg}", task=tid)
         return False, [msg]
