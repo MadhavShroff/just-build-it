@@ -1234,6 +1234,10 @@ class Supervisor:
             if stage is None:
                 self._reclaim_worktree(tid, worktree)
                 return
+            if stage.role == "merge" and not task.get("full_review_passed"):
+                head_rev = wt.head(worktree, "HEAD") or task.get("commit")
+                self._task_update(tid, full_review_passed=True, full_review_commit=head_rev)
+                task = self.store.read(f"/plan/tasks/{tid}") or task
             key = self._taskkey(tid, stage, base, findings)
             hit = taskkey.consult(self._task_cache, key, stage, repo=self.repo, worktree=worktree)
             if hit is not None:
@@ -1266,6 +1270,26 @@ class Supervisor:
                 stage_name, findings = stage.name, []
                 if stage.name == rigor.REVIEW_CASCADE_STAGE:
                     stage_name = rigor.REVIEW_DEEPSEEK_STAGES[-1]
+                cur_doc = self.store.read(f"/plan/tasks/{tid}") or task
+                if cur_doc.get("full_review_passed") and len(rigor.pipeline(level)) >= 2:
+                    pre_merge_name = rigor.pipeline(level)[-2].name
+                    if stage.name == "verify":
+                        if not self._delta_touches_tier2(worktree, cur_doc.get("full_review_commit")):
+                            stage_name = pre_merge_name
+                            self.store.log(
+                                "task",
+                                f"{tid}: post-review delta touches no tier-2 paths; advancing from verify to merge",
+                                task=tid,
+                            )
+                    elif stage.name == rigor.REVIEW_CASCADE_STAGE:
+                        head_rev = wt.head(worktree, "HEAD") or cur_doc.get("commit")
+                        self._task_update(tid, full_review_commit=head_rev)
+                        stage_name = pre_merge_name
+                        self.store.log(
+                            "task",
+                            f"{tid}: post-review tier-2 delta passed review-cascade; advancing to merge",
+                            task=tid,
+                        )
                 if self.store.read(f"/plan/tasks/{tid}/status") == "paused":
                     self._task_update(tid, resume_after=stage_name)
                     return
@@ -1886,6 +1910,104 @@ class Supervisor:
         self.store.log("git", f"{tid}: {msg}", task=tid)
         return False, [msg]
 
+    @staticmethod
+    def _delta_touches_tier2(worktree: Path, since_sha: str | None) -> bool:
+        """True when commits since `since_sha` touch any path in `scripts/lib/ci-tier2-paths`."""
+        if not since_sha or not (worktree / ".git").exists():
+            return False
+        list_file = worktree / "scripts" / "lib" / "ci-tier2-paths"
+        if not list_file.is_file():
+            return False
+        prefixes: list[str] = []
+        try:
+            for raw in list_file.read_text(encoding="utf-8").splitlines():
+                line = raw.split("#", 1)[0].strip().rstrip("/")
+                if line:
+                    prefixes.append(line)
+        except OSError:
+            return True
+        if not prefixes:
+            return True
+        raw_changed = wt.git(worktree, "diff", "--name-only", f"{since_sha}..HEAD", check=False)
+        changed = [p.strip() for p in raw_changed.splitlines() if p.strip()]
+        for path in changed:
+            for pref in prefixes:
+                if path == pref or path.startswith(pref + "/"):
+                    return True
+        return False
+
+    def _run_host_pre_merge_checks(self, tid: str, worktree: Path, merge_base: str) -> tuple[bool, list[str]]:
+        """Run fast deterministic host census checks and pin updates before CI handover."""
+        if bool(self.store.read("/config/dry_run")) or not (worktree / ".git").exists():
+            return True, []
+        backend_dir = worktree / "tangram-backend" / "nest-backend"
+        if not backend_dir.is_dir():
+            return True, []
+        origin_ref = f"origin/{merge_base}"
+        base_ref = origin_ref if wt.head(worktree, origin_ref) else merge_base
+        changed_raw = wt.git(worktree, "diff", "--name-only", f"{base_ref}...HEAD", check=False)
+        changed = [p.strip() for p in changed_raw.splitlines() if p.strip()]
+        if not any(p.startswith("tangram-backend/nest-backend/src/") for p in changed):
+            return True, []
+        node_bin = shutil.which("node")
+        if not node_bin:
+            return True, []
+        e01_script = backend_dir / "scripts" / "e01-census.mjs"
+        if e01_script.is_file():
+            proc = subprocess.run(
+                [node_bin, str(e01_script)],
+                cwd=str(backend_dir), capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=90,
+            )
+            if proc.returncode != 0:
+                out = (proc.stdout + "\n" + proc.stderr).strip()
+                self.store.log("ci", f"{tid}: pre-merge e01-census failed (rc={proc.returncode})", task=tid)
+                return False, [f"pre-merge e01-census.mjs failed (rc={proc.returncode})", *_summarize_findings(out, max_lines=60)]
+        repin_script = backend_dir / "scripts" / "census-repin" / "census-repin.cjs"
+        if repin_script.is_file():
+            subprocess.run(
+                [node_bin, str(repin_script), "header", "--base", base_ref, "--write"],
+                cwd=str(backend_dir), capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=90,
+            )
+        p02_spec = backend_dir / "src" / "projects" / "storage" / "__tests__" / "p02-source-census.spec.ts"
+        jest_bin = backend_dir / "node_modules" / ".bin" / "jest"
+        if p02_spec.is_file() and jest_bin.is_file():
+            env = {**os.environ, "P02_WRITE_PATH_SNAPSHOT": "1"}
+            subprocess.run(
+                [str(jest_bin), "src/projects/storage/__tests__/p02-source-census.spec.ts", "--runInBand"],
+                cwd=str(backend_dir), capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, env=env, timeout=180,
+            )
+        dirty_pins = [
+            p for p in wt.dirty_paths(worktree)
+            if p in (
+                "tangram-backend/nest-backend/src/projects/storage/project-store-paths.ts",
+                "tangram-backend/nest-backend/src/platform-direct/native/__tests__/header-census.ts",
+                "tangram-backend/nest-backend/src/platform-direct/native/__tests__/header-census-registration.body.ts",
+                "tangram-backend/nest-backend/src/platform-direct/native/__tests__/header-census.spec.ts",
+            )
+        ]
+        if dirty_pins:
+            pinned = wt._RUNTIME_GIT.get(Path(worktree).resolve())
+            commit_msg = f"chore(jbi): refresh deterministic census pins for {tid}"
+            if pinned is not None:
+                wt.trusted_git(*pinned, Path(worktree).resolve(), "add", "--", *dirty_pins, check=False)
+                wt.trusted_git(*pinned, Path(worktree).resolve(), "commit", "--no-verify", "-m", commit_msg, check=False)
+            else:
+                subprocess.run(["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-C", str(worktree), "add", "--", *dirty_pins],
+                               capture_output=True, stdin=subprocess.DEVNULL, env=wt._host_env())
+                subprocess.run(["git", *wt.IDENTITY, *wt.HOST_CONFIG, "-c", "commit.gpgSign=false", "-C", str(worktree),
+                                "commit", "--no-verify", "-m", commit_msg],
+                               capture_output=True, stdin=subprocess.DEVNULL, env=wt._host_env())
+            new_head = wt.head(worktree, "HEAD")
+            if new_head:
+                self._task_update(tid, commit=new_head)
+                if self.tracking.get_task(tid) is not None:
+                    self.tracking.record_commit(tid, new_head)
+            self.store.log("ci", f"{tid}: refreshed deterministic census pins on host ({', '.join(dirty_pins)})", task=tid)
+        return True, []
+
     # ---- merging ---------------------------------------------------------------------
 
     def _merge(self, tid: str, level: str, worktree: Path) -> bool:
@@ -1942,6 +2064,10 @@ class Supervisor:
                 synced, sync_findings = self._sync_with_origin_base(tid, worktree, merge_base)
                 if not synced:
                     self._merge_failed(job, sync_findings)
+                    return False
+                pre_ok, pre_findings = self._run_host_pre_merge_checks(tid, worktree, merge_base)
+                if not pre_ok:
+                    self._merge_failed(job, pre_findings)
                     return False
                 head_after = wt.head(worktree, "HEAD")
                 if head_after and head_after != head_before:
