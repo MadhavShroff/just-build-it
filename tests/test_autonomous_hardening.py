@@ -607,18 +607,27 @@ class LeaseAutoWidenAndSiblingWaitTests(unittest.TestCase):
         )
         self.assertNotIn("package.json", gap_extracted)
 
-        # Non-existent new *.p02-rows.ts / MISSING_LEASE files inside existing directories widen cleanly,
-        # while hallucinated parent directories and protected package.json stay blocked.
+        # Non-existent new *.p02-rows.ts / MISSING_LEASE files inside existing directories and e2e fixtures widen cleanly,
+        # while hallucinated parent directories, root-level missing test/jest-x.json, and protected package.json stay blocked.
         (self.repo / "src/native-chart").mkdir(parents=True, exist_ok=True)
+        e2e_fix = self.repo / "tangram-ui/e2e/a01/fixtures/fake-backend.ts"
+        e2e_fix.parent.mkdir(parents=True, exist_ok=True)
+        e2e_fix.write_text("export {};\n", encoding="utf-8")
         new_file_detail = (
             "MISSING_LEASE: src/native-chart/native-chart.p02-rows.ts and src/native-chart/__tests__/new-rows.spec.ts\n"
+            "Neither tangram-ui/e2e/a01/fixtures/fake-backend.ts handles GET /tg-auth/setup.\n"
+            "ok another config's report: refused (not 'test/jest-x.json')\n"
             "MISSING_LEASE: nonexistent-folder/fake.p02-rows.ts and src/native-chart/package.json\n"
             "Verified: launch-d07.b2.spec.ts and native-chart.module.ts were checked in prose.\n"
         )
         new_extracted = supervisor._extract_widenable_paths(new_file_detail, self.repo, ["src/owned.ts"], repo=self.repo)
         self.assertEqual(
             set(new_extracted),
-            {"src/native-chart/native-chart.p02-rows.ts", "src/native-chart/__tests__/new-rows.spec.ts"},
+            {
+                "src/native-chart/native-chart.p02-rows.ts",
+                "src/native-chart/__tests__/new-rows.spec.ts",
+                "tangram-ui/e2e/a01/fixtures/fake-backend.ts",
+            },
         )
 
     def test_initial_lease_conflict_withheld_by_admit_and_waits_without_failing(self) -> None:
