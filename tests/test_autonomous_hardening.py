@@ -308,6 +308,46 @@ class RichFailureExtractionTests(unittest.TestCase):
         self.assertIn("FAIL integration src/platform-direct/native/__tests__/native-journeys.http.integration.spec.ts", joined)
         self.assertIn("- \"userId\": \"journey-owner\"", joined)
 
+        # Numbered [Nest] WARN + Jest "Cannot log after tests are done" in first_failure_excerpt
+        # must be stripped and must NEVER block extracting real FAIL <suite> lines from run.log.
+        ev_dir2 = self.tmp / "ci-evidence-l01-b2"
+        ev_dir2.mkdir(parents=True)
+        (ev_dir2 / "run.log").write_text(
+            "\n".join([
+                "[Nest] 2823842 - WARN [PipelineExecutorService] Pipeline shape1 aborted; failed evaluation",
+                "  ●  Cannot log after tests are done. Did you forget to wait for something async in your test?",
+                "    Attempted to log \"RangeError: Port should be >= 0\"",
+                "  ● Console",
+                "FAIL unit src/projects/storage/__tests__/p02-source-census.spec.ts (60.9 s)",
+                "  ● P02 source census › producer and consumer paths equal the type-checked scan, file for file (M4)",
+                "    Error: expect(received).toEqual(expected)",
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        noisy_excerpt = "\n".join(
+            [
+                f"{2650 + i}: [Nest] 2823842 - WARN [PipelineExecutorService] terminally failed evaluation\n"
+                f"{2651 + i}:   ●  Cannot log after tests are done. Did you forget to wait?\n"
+                f"{2652 + i}:     Attempted to log \"Error: socket closed\""
+                for i in range(0, 36, 3)
+            ]
+        )
+        formatted = "\n".join(
+            ci_adapter.format_failure_findings({
+                "verdict": "red",
+                "job_id": "20261128-005004-l1-gB",
+                "pr_number": 1118,
+                "head_sha": "c" * 40,
+                "failed_gates": ["backend-core", "backend-suite"],
+                "evidence_url": str(ev_dir2),
+                "first_failure_excerpt": noisy_excerpt,
+            })
+        )
+        self.assertNotIn("Cannot log after tests are done", formatted)
+        self.assertNotIn("[Nest]", formatted)
+        self.assertIn("FAIL unit src/projects/storage/__tests__/p02-source-census.spec.ts", formatted)
+        self.assertIn("producer and consumer paths equal the type-checked scan, file for file (M4)", formatted)
+
 
 class OriginBaseAutoMergeTests(unittest.TestCase):
     """Fix 3: _sync_with_origin_base before retry and before handover in _merge."""
