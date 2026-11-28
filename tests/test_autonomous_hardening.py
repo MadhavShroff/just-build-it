@@ -906,6 +906,107 @@ class SimulatorDefaultDisabledAndAgyBootRetryTests(unittest.TestCase):
         self.assertEqual(run_mock2.call_count, 4)
         self.assertEqual(sleep_mock2.call_args_list, [mock.call(3.0), mock.call(3.0), mock.call(3.0)])
 
+    def test_post_full_review_delta_fast_path_and_tier2_routing_and_max_sessions_config(self) -> None:
+        from jbi.engine import Engine
+
+        _origin, repo, base = _make_repo_with_origin(self.tmp)
+        tier2_file = repo / "scripts" / "lib" / "ci-tier2-paths"
+        tier2_file.parent.mkdir(parents=True, exist_ok=True)
+        tier2_file.write_text("src/auth/\n", encoding="utf-8")
+        (repo / "src" / "auth").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "ui").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "auth" / "guard.ts").write_text("export const a = 1;\n", encoding="utf-8")
+        (repo / "src" / "ui" / "view.ts").write_text("export const v = 1;\n", encoding="utf-8")
+        base2 = wt.commit_all(repo, "seed tier2 and ui")
+        assert base2 is not None
+        _git(repo, "push", "-q", "origin", "main")
+
+        sup, store = _make_supervisor(
+            self.tmp,
+            repo,
+            [{"id": "T1", "title": "T1", "goal": "G", "deps": [], "owns": ["src/**"], "acceptance": "true"}],
+            rigor_level="high",
+            name="delta-fast-path",
+        )
+        self.addCleanup(store.close)
+        self.addCleanup(sup.tracking.close)
+
+        # Test run.configure max_sessions
+        store.commit("run.phase", Changes().replace("run", "phase", "execute"))
+        eng = Engine(store, None, runtime=sup)
+        eng.submit({"id": "cfg-ms", "type": "run.configure", "payload": {"max_sessions": 6}})
+        self.assertEqual(store.read("/config/max_sessions"), 6)
+
+        # Pass 1 reaches merge (fails once), pass 2 edits non-tier-2 file -> skips review-cascade/audits,
+        # pass 3 edits tier-2 file -> runs review-cascade then skips audits to merge!
+        seen_stages: list[str] = []
+        merge_calls = {"n": 0}
+        impl_calls = {"n": 0}
+
+        def fake_run_stage(task_doc, stage, level, worktree, findings):
+            seen_stages.append(stage.name)
+            if stage.role == "implement":
+                impl_calls["n"] += 1
+                if impl_calls["n"] == 2:
+                    (worktree / "src" / "ui" / "view.ts").write_text("export const v = 2;\n", encoding="utf-8")
+                    wt.commit_all(worktree, "non-tier2 fix")
+                elif impl_calls["n"] == 3:
+                    (worktree / "src" / "auth" / "guard.ts").write_text("export const a = 2;\n", encoding="utf-8")
+                    wt.commit_all(worktree, "tier2 fix")
+                return True, "ok", "sim-s"
+            if stage.role == "merge":
+                merge_calls["n"] += 1
+                if merge_calls["n"] <= 2:
+                    return False, f"CI red attempt {merge_calls['n']}", None
+                store.commit("task.merged", Changes().set("plan", "tasks", "T1", "status", "merged"), {"task": "T1"})
+                return True, "merged", None
+            return True, "ok", "sim-s"
+
+        sup._run_stage = fake_run_stage
+        sup._run_task_body("T1")
+        self.assertEqual(store.read("/plan/tasks/T1/status"), "merged")
+        self.assertEqual(
+            seen_stages,
+            [
+                # Pass 1: full 8 stages + merge (fails)
+                "implement", "acceptance", "verify", "review-cascade", "security",
+                "test-audit", "methodology-audit", "dry-run", "merge",
+                # Pass 2: non-tier-2 delta -> implement, acceptance, verify, merge (fails)
+                "implement", "acceptance", "verify", "merge",
+                # Pass 3: tier-2 delta -> implement, acceptance, verify, review-cascade, merge (passes)
+                "implement", "acceptance", "verify", "review-cascade", "merge",
+            ],
+        )
+
+    def test_host_pre_merge_checks_fails_fast_on_e01_census_error(self) -> None:
+        _origin, repo, base = _make_repo_with_origin(self.tmp)
+        e01 = repo / "tangram-backend" / "nest-backend" / "scripts" / "e01-census.mjs"
+        e01.parent.mkdir(parents=True, exist_ok=True)
+        e01.write_text("console.error('e01-census: driverDrift detected'); process.exit(1);\n", encoding="utf-8")
+        src_file = repo / "tangram-backend" / "nest-backend" / "src" / "x.ts"
+        src_file.parent.mkdir(parents=True, exist_ok=True)
+        src_file.write_text("export const x = 1;\n", encoding="utf-8")
+        base2 = wt.commit_all(repo, "seed e01")
+        assert base2 is not None
+        _git(repo, "push", "-q", "origin", "main")
+
+        sup, store = _make_supervisor(
+            self.tmp,
+            repo,
+            [{"id": "T1", "title": "T1", "goal": "G", "deps": [], "owns": ["tangram-backend/**"], "acceptance": "true"}],
+            rigor_level="vibe",
+            name="premerge-e01",
+        )
+        self.addCleanup(store.close)
+        self.addCleanup(sup.tracking.close)
+        worktree = wt.create_worktree(repo, "T1", base2, sup.run_dir / "worktrees")
+        (worktree / "tangram-backend" / "nest-backend" / "src" / "x.ts").write_text("export const x = 2;\n", encoding="utf-8")
+        wt.commit_all(worktree, "edit backend src")
+
+        ok, findings = sup._run_host_pre_merge_checks("T1", worktree, "main")
+        self.assertFalse(ok)
+        self.assertIn("driverDrift", "\n".join(findings))
+
 
 if __name__ == "__main__":
     unittest.main()

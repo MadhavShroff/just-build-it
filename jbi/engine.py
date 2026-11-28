@@ -254,6 +254,12 @@ class Engine:
             if self.runtime and callable(getattr(self.runtime, "set_branch", None)):
                 self.runtime.set_branch(payload["branch"])
             parts.append(f"branch {payload['branch']}")
+        if payload.get("max_sessions") is not None:
+            ms = int(payload["max_sessions"])
+            if ms < 1 or ms > 16:
+                raise ProtocolError("payload_invalid", "max_sessions must be between 1 and 16.", field="max_sessions")
+            changes.replace("config", "max_sessions", ms)
+            parts.append(f"max_sessions {ms}")
         self.store.log("config", ", ".join(parts) or "Configuration unchanged",
                        extra=changes, etype="run.config")
         if self.runtime and self.store.read("/run/phase") == "execute":
