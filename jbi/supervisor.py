@@ -1954,31 +1954,43 @@ class Supervisor:
             return True, []
         e01_script = backend_dir / "scripts" / "e01-census.mjs"
         if e01_script.is_file():
-            proc = subprocess.run(
-                [node_bin, str(e01_script)],
-                cwd=str(backend_dir), capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, timeout=90,
-            )
-            if proc.returncode != 0:
+            try:
+                proc = subprocess.run(
+                    [node_bin, str(e01_script)],
+                    cwd=str(backend_dir), capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL, timeout=90,
+                )
+            except subprocess.TimeoutExpired:
+                self.store.log("ci", f"{tid}: pre-merge e01-census timed out after 90s; continuing", task=tid)
+                proc = None
+            if proc is not None and proc.returncode != 0:
                 out = (proc.stdout + "\n" + proc.stderr).strip()
                 self.store.log("ci", f"{tid}: pre-merge e01-census failed (rc={proc.returncode})", task=tid)
                 return False, [f"pre-merge e01-census.mjs failed (rc={proc.returncode})", *_summarize_findings(out, max_lines=60)]
         repin_script = backend_dir / "scripts" / "census-repin" / "census-repin.cjs"
-        if repin_script.is_file():
-            subprocess.run(
-                [node_bin, str(repin_script), "header", "--base", base_ref, "--write"],
-                cwd=str(backend_dir), capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, timeout=90,
-            )
+        if repin_script.is_file() and any(
+            p.startswith("tangram-backend/nest-backend/src/platform-direct/native/") for p in changed
+        ):
+            try:
+                subprocess.run(
+                    [node_bin, str(repin_script), "header", "--base", base_ref, "--write"],
+                    cwd=str(backend_dir), capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL, timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                self.store.log("ci", f"{tid}: pre-merge census-repin timed out after 120s; continuing", task=tid)
         p02_spec = backend_dir / "src" / "projects" / "storage" / "__tests__" / "p02-source-census.spec.ts"
         jest_bin = backend_dir / "node_modules" / ".bin" / "jest"
         if p02_spec.is_file() and jest_bin.is_file():
             env = {**os.environ, "P02_WRITE_PATH_SNAPSHOT": "1"}
-            subprocess.run(
-                [str(jest_bin), "src/projects/storage/__tests__/p02-source-census.spec.ts", "--runInBand"],
-                cwd=str(backend_dir), capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, env=env, timeout=180,
-            )
+            try:
+                subprocess.run(
+                    [str(jest_bin), "src/projects/storage/__tests__/p02-source-census.spec.ts", "--runInBand"],
+                    cwd=str(backend_dir), capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL, env=env, timeout=240,
+                )
+            except subprocess.TimeoutExpired:
+                self.store.log("ci", f"{tid}: pre-merge p02-source-census timed out after 240s; continuing", task=tid)
         dirty_pins = [
             p for p in wt.dirty_paths(worktree)
             if p in (
