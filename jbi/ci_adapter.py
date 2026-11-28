@@ -409,8 +409,12 @@ class CIAdapter:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_PRIMARY_FAILURE_RE = re.compile(
-    r"^(?:FAIL\s+\S|\s*●\s+(?!Console\b))|\bTS\d+:|e01-census:|pre-merge-grant-check:"
+_LINE_NUM_PREFIX_RE = re.compile(r"^\s*\d+:\s*")
+_SUITE_FAILURE_RE = re.compile(
+    r"^\s*FAIL\s+\S|\bTS\d+:|e01-census:|pre-merge-grant-check:"
+)
+_CASE_FAILURE_RE = re.compile(
+    r"^\s*●\s+(?!Console\b)(?!\s*Cannot log after tests are done)"
 )
 _FAILURE_LINE_MARKERS: tuple[str, ...] = (
     "FAIL ",
@@ -434,9 +438,12 @@ def _clean_log_line(line: str) -> str:
 
 
 def _is_ignored_log_noise(line: str) -> bool:
-    stripped = line.lstrip()
+    body = _LINE_NUM_PREFIX_RE.sub("", line).lstrip()
     return (
-        stripped.startswith("[Nest] ")
+        body.startswith("[Nest] ")
+        or body.startswith("● Console")
+        or "Cannot log after tests are done" in body
+        or "Attempted to log " in body
         or "tmp/p02-census-results" in line
     )
 
@@ -489,29 +496,30 @@ def extract_evidence_failures(evidence_ref: Any, *, max_lines: int = 80) -> list
     raw_lines = [_clean_log_line(ln) for ln in raw.splitlines()]
     out: list[str] = []
     seen: set[str] = set()
-    # Pass 1: high-signal Jest/TSC/census failure anchors with bounded diff context,
-    # skipping [Nest] runtime console noise and tmp/p02-census-results sentinel fixtures.
-    for idx, line in enumerate(raw_lines):
-        if not line.strip() or _is_ignored_log_noise(line):
-            continue
-        if not _PRIMARY_FAILURE_RE.search(line):
-            continue
-        added_context = 0
-        for pos in range(idx, min(len(raw_lines), idx + 14)):
-            cand = raw_lines[pos]
-            if not cand.strip() or _is_ignored_log_noise(cand):
+    # Pass 1A: suite-level FAIL / TSC / census / grant anchors first so failing file paths
+    # never get starved by earlier case bullets; Pass 1B: case-level `● ` bullets.
+    for anchor_re in (_SUITE_FAILURE_RE, _CASE_FAILURE_RE):
+        for idx, line in enumerate(raw_lines):
+            if not line.strip() or _is_ignored_log_noise(line):
                 continue
-            if pos > idx and cand.startswith("PASS "):
-                break
-            if cand not in seen:
-                seen.add(cand)
-                out.append(cand)
-                if len(out) >= max_lines:
-                    return out
-            if pos > idx:
-                added_context += 1
-                if added_context >= 5:
+            if not anchor_re.search(line):
+                continue
+            added_context = 0
+            for pos in range(idx, min(len(raw_lines), idx + 14)):
+                cand = raw_lines[pos]
+                if not cand.strip() or _is_ignored_log_noise(cand):
+                    continue
+                if pos > idx and cand.startswith("PASS "):
                     break
+                if cand not in seen:
+                    seen.add(cand)
+                    out.append(cand)
+                    if len(out) >= max_lines:
+                        return out
+                if pos > idx:
+                    added_context += 1
+                    if added_context >= 5:
+                        break
     if len(out) >= 5:
         return out
     # Pass 2 fallback when no Jest/TSC anchors matched (e.g. shell gate error).
@@ -557,10 +565,10 @@ def format_failure_findings(notice: dict[str, Any]) -> list[str]:
     excerpt = str(notice.get("first_failure_excerpt") or notice.get("detail") or "").strip()
     if excerpt:
         for line in excerpt.splitlines():
-            stripped = line.rstrip()
-            if stripped:
+            stripped = _clean_log_line(line)
+            if stripped and not _is_ignored_log_noise(stripped):
                 lines.append(stripped)
-    if evidence and _count_failure_lines(excerpt) < 10:
+    if evidence:
         seen = set(lines)
         for extra in extract_evidence_failures(evidence, max_lines=80):
             if extra not in seen:
