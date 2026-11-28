@@ -201,11 +201,11 @@ _PATH_TOKEN_RE = re.compile(
     r"[A-Za-z0-9_./@\[\]()-]+/[A-Za-z0-9_./@\[\]()-]+|[A-Za-z0-9_.-]+\.(?:spec|test|e2e-spec|p02-rows|module)\.ts\b"
 )
 _LINE_LEASE_GAP_RE = re.compile(
-    r"(?:\[BLOCKED\]\[(?:LEASE|HIGH)\]|LEASE GAP:|MISSING_LEASE:|refused the write|does not own|lease excludes|outside (?:the )?owns\b|unleased\b|Read-only file system|EROFS)",
+    r"(?:\[BLOCKED\]\[(?:LEASE|HIGH)\]|LEASE GAP:|MISSING_LEASE:|blocked on unleased|refused the write|does not own|lease excludes|outside (?:the |this )?(?:current )?(?:owns\b|write[- ]lease\b|lease\b)|unleased\b|Read-only file system|EROFS)",
     re.I,
 )
 _CREATABLE_SOURCE_SUFFIXES = (
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".py", ".sql", ".md", ".css", ".scss", ".yaml", ".yml",
 )
 
@@ -237,7 +237,7 @@ def _is_safe_widenable_path(rel: str) -> bool:
         return False
     parts = clean.split("/")
     name = parts[-1]
-    if "__tests__" in parts[:-1] or "test" in parts[:-1]:
+    if any(seg in ("__tests__", "test", "e2e", "__mocks__") for seg in parts[:-1]):
         return True
     if name.endswith((".spec.ts", ".test.ts", ".e2e-spec.ts", ".module.ts", ".p02-rows.ts")):
         return True
@@ -248,7 +248,8 @@ def _is_safe_widenable_path(rel: str) -> bool:
 
 def _is_widenable_worktree_target(worktree: Path, norm: str) -> bool:
     """True for an existing non-symlink file, or a non-existent source/test file in an existing subdirectory."""
-    target = worktree / norm
+    wt_resolved = worktree.resolve()
+    target = wt_resolved / norm
     try:
         if target.is_symlink():
             return False
@@ -261,9 +262,9 @@ def _is_widenable_worktree_target(worktree: Path, norm: str) -> bool:
             return False
         if parent.is_dir():
             return True
-        if parent.name in ("__tests__", "test") and not parent.exists():
+        if parent.name in ("__tests__", "test", "e2e", "__mocks__") and not parent.exists():
             grandparent = parent.parent
-            return grandparent.is_dir() and not grandparent.is_symlink()
+            return grandparent != wt_resolved and grandparent.is_dir() and not grandparent.is_symlink()
         return False
     except OSError:
         return False
@@ -284,6 +285,8 @@ def _extract_widenable_paths(detail: str, worktree: Path, current_owns: Iterable
     found: list[str] = []
     seen: set[str] = set()
     for line in text.splitlines():
+        if line.lstrip().startswith("ok "):
+            continue
         explicit_lease_gap = bool(_LINE_LEASE_GAP_RE.search(line))
         for raw_match in _PATH_TOKEN_RE.findall(line):
             variants = [raw_match]
