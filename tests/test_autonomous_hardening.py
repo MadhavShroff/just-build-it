@@ -1007,6 +1007,61 @@ class SimulatorDefaultDisabledAndAgyBootRetryTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("driverDrift", "\n".join(findings))
 
+    def test_host_pre_merge_checks_skips_repin_outside_native_and_handles_timeout(self) -> None:
+        _origin, repo, base = _make_repo_with_origin(self.tmp)
+        repin = repo / "tangram-backend" / "nest-backend" / "scripts" / "census-repin" / "census-repin.cjs"
+        repin.parent.mkdir(parents=True, exist_ok=True)
+        repin.write_text("process.exit(0);\n", encoding="utf-8")
+        src_file = repo / "tangram-backend" / "nest-backend" / "src" / "other.ts"
+        src_file.parent.mkdir(parents=True, exist_ok=True)
+        src_file.write_text("export const a = 1;\n", encoding="utf-8")
+        native_file = repo / "tangram-backend" / "nest-backend" / "src" / "platform-direct" / "native" / "n.ts"
+        native_file.parent.mkdir(parents=True, exist_ok=True)
+        native_file.write_text("export const n = 1;\n", encoding="utf-8")
+        base2 = wt.commit_all(repo, "seed repin")
+        assert base2 is not None
+        _git(repo, "push", "-q", "origin", "main")
+
+        sup, store = _make_supervisor(
+            self.tmp,
+            repo,
+            [{"id": "T1", "title": "T1", "goal": "G", "deps": [], "owns": ["tangram-backend/**"], "acceptance": "true"}],
+            rigor_level="vibe",
+            name="premerge-timeout",
+        )
+        self.addCleanup(store.close)
+        self.addCleanup(sup.tracking.close)
+        worktree = wt.create_worktree(repo, "T1", base2, sup.run_dir / "worktrees")
+        (worktree / "tangram-backend" / "nest-backend" / "src" / "other.ts").write_text("export const a = 2;\n", encoding="utf-8")
+        wt.commit_all(worktree, "edit non-native src")
+
+        real_run = subprocess.run
+        repin_calls: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if any("census-repin.cjs" in str(part) for part in cmd):
+                repin_calls.append([str(part) for part in cmd])
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=120)
+            return real_run(cmd, *args, **kwargs)
+
+        # Non-native edit must NOT invoke census-repin.cjs
+        with mock.patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            ok, findings = sup._run_host_pre_merge_checks("T1", worktree, "main")
+        self.assertTrue(ok)
+        self.assertEqual(findings, [])
+        self.assertEqual(repin_calls, [])
+
+        # Native edit invokes census-repin.cjs; TimeoutExpired must be caught cleanly (never crash task)
+        (worktree / "tangram-backend" / "nest-backend" / "src" / "platform-direct" / "native" / "n.ts").write_text(
+            "export const n = 2;\n", encoding="utf-8"
+        )
+        wt.commit_all(worktree, "edit native src")
+        with mock.patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+            ok2, findings2 = sup._run_host_pre_merge_checks("T1", worktree, "main")
+        self.assertTrue(ok2)
+        self.assertEqual(findings2, [])
+        self.assertEqual(len(repin_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
